@@ -1011,114 +1011,7 @@ int dirtybird_main(int argc, char** argv)
     return 1;
     #endif
   }
-fillBlanks:
-{
-  std::string localSymbol;
-  if (miningProfile.coin.coinId == unknownCoin.coinId)
-  {
-    setcolor(CYAN);
-    printf("%s\n", coinPrompt);
-    fflush(stdout);
-    setcolor(BRIGHT_WHITE);
-
-    std::string cmdLine;
-    std::getline(std::cin, cmdLine);
-    if (cmdLine != "" && cmdLine.find_first_not_of(' ') != std::string::npos)
-    {
-      localSymbol = cmdLine;
-      std::transform(localSymbol.begin(), localSymbol.end(), localSymbol.begin(), ::toupper);
-    }
-    else
-    {
-      localSymbol = "DERO";
-      setcolor(BRIGHT_YELLOW);
-      printf("Default value will be used: %s\n\n", "DERO");
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
-    }
-  }
-
-  for(int x = 0; x < COIN_COUNT; x++) {
-    if(boost::iequals(coins[x].coinSymbol, localSymbol)) {
-      miningProfile.coin = coins[x];
-
-      setcolor(BRIGHT_YELLOW);
-      printf(" Set to mine %s\n\n", miningProfile.coin.coinPrettyName.c_str());
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
-    }
-  }
-  if(miningProfile.coin.coinId == unknownCoin.coinId)
-  {
-    setcolor(RED);
-    std::cout << "ERROR: Invalid coin symbol: " << localSymbol << std::endl << std::flush;
-    setcolor(BRIGHT_YELLOW);
-    printf("Supported symbols are:\n");
-    for(int x = 0; x < COIN_COUNT; x++) {
-      printf("%s\n", coins[x].coinSymbol.c_str());
-    }
-    printf("\n");
-    fflush(stdout);
-    setcolor(BRIGHT_WHITE);
-    miningProfile.coin = unknownCoin;
-    goto fillBlanks;
-  }
-
-  // DERO Miner: Stratum optional (not required for DERO)
-
-  int i = 0;
-  std::vector<std::string *> stringParams = {&miningProfile.host, &miningProfile.port, &miningProfile.wallet};
-  std::vector<const char *> stringDefaults = {"", "", ""};  // No defaults - user must provide
-  std::vector<const char *> stringPrompts = {daemonPrompt, portPrompt, walletPrompt};
-  for (std::string *param : stringParams)
-  {
-    if (param->empty())
-    {
-      setcolor(CYAN);
-      printf("%s\n", stringPrompts[i]);
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
-
-      std::string cmdLine;
-      std::getline(std::cin, cmdLine);
-      if (cmdLine != "" && cmdLine.find_first_not_of(' ') != std::string::npos)
-      {
-        *param = cmdLine;
-      }
-      else
-      {
-        *param = stringDefaults[i];
-        setcolor(BRIGHT_YELLOW);
-        printf("Default value will be used: %s\n\n", (*param).c_str());
-        fflush(stdout);
-        setcolor(BRIGHT_WHITE);
-      }
-
-      if (param == &miningProfile.host) {
-        miningProfile.setPoolAddress(miningProfile.host);
-      }
-    }
-    i++;
-  }
-
-
-  switch (miningProfile.coin.miningAlgo)
-  {
-    #if defined(DIRTYBIRD_YESPOWER)
-    case ALGO_YESPOWER:
-      miningProfile.protocol = PROTO_BTC_STRATUM;
-
-      if (miningProfile.coin.coinId == coins[COIN_ADVC].coinId) {
-        current_algo_config = algo_configs[CONFIG_ENDIAN_YESPOWER];
-
-        initADVCParams(&currentYespowerParams);
-        initADVCParams(&devYespowerParams);
-      }
-      break;
-    #endif
-    default:
-      break;
-  }
+  miningProfile.coin = coins[COIN_DERO];
 
   if (threads == 0) {
     threads = processor_count;
@@ -1231,10 +1124,7 @@ fillBlanks:
   // DERO Miner: DIRTYBIRD_SHAIHIVE block removed
 
   printf("\n");
-}
 
-Mining:
-{
   printHashrateOnExit = true;
 
   // Clean startup display (DeroLuna style)
@@ -1351,7 +1241,6 @@ Mining:
   }
 
   return EXIT_SUCCESS;
-}
 }
 
 std::map<int, int> threadToPhysicalCore;

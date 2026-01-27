@@ -1,6 +1,5 @@
 #pragma once
 #include <string>
-#include <algorithm>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -28,64 +27,6 @@ namespace po = boost::program_options;
 static const char *versionString = XSTR(DIRTYBIRD_VERSION);
 static const char *consoleLine = " DIRTYBIRD-MINER ";
 static const char *targetArch = XSTR(CPU_ARCHTARGET);
-
-static const char *DIRTYBIRD = R"(
-                                                            YB&&@5
-                                              :GBB7         &@@@@P
-                          .:^~7J5J.           !@@@@@Y.      #@@@@P
-            ..:~!?Y5GB#&@@@@@@@@@@@5.         ~@@@@@@@B^    #@@@@G
-  ~7J5GB#&&@@@@@@@@@@@@@@@@@@@@@@@@@@P.       ~@@@@@@@@@&7  #@@@@G
-  @@@@@@@@@@@@@@@@@@@&#BG5J7!^5@@@@@@@@G:     ~@@@@@&@@@@@@Y&@@@@B
-  @@@@@&#BGPY?~G@@@@&         7@@@@@@@@@@B^   ^@@@@@:.5@@@@@@@@@@B
-  ::.          7@@@@&         7@@@@@&@@@@@@#~ :@@@@@:   ?&@@@@@@@B
-               7@@@@@         !@@@@& ^B@@@@@@#5@@@@@^     ~#@@@@@#
-               7@@@@@         !@@@@@   :B@@@@@@@@@@@^       :G@@@#
-               !@@@@@         ~@@@@@.    .P@@@@@@@@@~         .Y@&
-               !@@@@@         ~@@@@@.      .5@@@@@@@~            ^
-               ~@@@@@.        ^@@@@@.        .J@@@@@~
-               ~@@@@@.        ^@@@@@.           ?&@@!
-               ~@@@@@.        ^@@@@@.             !&!
-               ^@@@@@.        :@@@@@.
-               ^@@@@@.        :@@@@@:
-               ^@@@@@.         ^G@@@:      ██ ██ █ █   █ ████ ████
-               :@@@@@:           .J&:      █████ █ ██  █ █    █  █
-               :@@@@@:                     █ █ █ █ ███ █ ███  ████
-               :@@@&Y                      █ █ █ █ █ ███ █    █ █
-               .&Y:                        █   █ █ █  ██ ████ █ ██
-)";
-
-static const char *DERO = R"(
-                              @
-                         @@       @@
-                     @@               @@
-                 @                         @
-             @                                 @@
-        @@                    @                    @@
-    @                    @@       @@                    @
-    @                @@       .       @@                @
-    @            @@       ..     ..       @@            @
-    @          @      .               .      @          @
-    @          @   .       @@@@@@@       .   @          @
-    @          @   .    @@@@@@@@@@@@@    .   @          @
-    @          @   .    @@@@@@@@@@@@@    .   @          @
-    @          @   .    @@@@@@@@@@@@@    .   @          @
-    @          @   .     @@@@@@@@@@@     .   @          @
-    @          @    ..     @@@@@@@     ..    @          @
-    @          @@        .@@@@@@@@@.        @@          @
-    @              @@    @@@@@@@@@@@    @@              @
-    @                  @@@@@@@@@@@@@@@                  @
-       @                    @@@@@                    @@
-           @@                                    @
-               @@                           @@
-                   @@                   @@
-                        @@         @@
-                              @
-)";
-
-static const char* coinPrompt = "Enter coin (DERO): ";
-static const char* daemonPrompt = "Node address: ";
-static const char* portPrompt = "Port: ";
-static const char* walletPrompt = "Wallet: ";
 
 static int colorPreTable[] = {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1};
 static int colorTable[] = {30,31,32,33,34,35,36,37,90,91,92,93,94,95,96,97};
@@ -160,27 +101,19 @@ inline po::options_description get_prog_opts() {
     po::options_description g("General", w);
     g.add_options()
         ("help", "Show help")
-        ("broadcast", "HTTP server for stats")
-        ("testnet", "Use testnet params")
         ("daemon-address", po::value<std::string>(), "Node/pool address")
         ("port", po::value<int>(), "Connection port")
         ("wallet", po::value<std::string>(), "Wallet address")
         ("threads", po::value<int>(), "Mining threads (default: 1)")
-        ("report-interval", po::value<int>(), "Status interval (seconds)")
         ("no-lock", "Disable CPU affinity")
         ("p-cores-only", "P-cores only (hybrid CPUs)")
-        ("differential-affinity", po::value<int>()->default_value(0), "Affinity mode: 0=default, 1=P-first, 2=physical, 3=balanced")
-        ("show-affinity", "Show CPU assignments")
-        ("ignore-wallet", "Skip wallet validation");
+        ("differential-affinity", po::value<int>()->default_value(0), "Affinity: 0=default, 1=P-first, 2=physical, 3=balanced")
+        ("quiet", "Quiet mode");
     po::options_description s("Stratum", w);
     s.add_options()
         ("stratum", "Enable stratum mode")
         ("password", po::value<std::string>(), "Stratum password")
         ("worker-name", po::value<std::string>(), "Worker name");
-    po::options_description d("DERO", w);
-    d.add_options()("dero", "Mine DERO (default)");
-    po::options_description t("Testing", w);
-    t.add_options()("test-dero", "Run AstroBWTv3 tests");
     po::options_description a("Advanced", w);
     a.add_options()
         ("tune-warmup", po::value<int>()->default_value(1), "Warmup seconds")
@@ -188,24 +121,12 @@ inline po::options_description get_prog_opts() {
         ("no-tune", po::value<std::string>(), "Skip tuning: branch|lookup|avx2|wolf|aarch64")
         ("mine-time", po::value<int>()->default_value(0), "Mine duration (0=infinite)")
         ("no-spsa", "Disable SPSA")
-        ("verbose-tune", "Verbose tuning output")
-        ("cache-batch", "Cache-batched mining")
-        ("cache-batch-hybrid", "Auto-detect batch mode")
-        ("bench-cache-batch", "Benchmark batch sizes")
-        ("interleaved", "Two-miners-per-thread")
-        ("bench-interleaved", "Benchmark interleaved")
-        ("lockfree", "Lock-free job polling")
-        ("sa-tune", "SA prefetch autotuning")
-        ("sa-prefetch", po::value<std::string>(), "SA prefetch: sa,text,bucket")
-        ("no-sa-tune", "Disable SA tuning")
         ("omp-threads", po::value<int>()->default_value(0), "OpenMP threads (0=auto)");
-    po::options_description db("Debug", w);
-    db.add_options()
-        ("op", po::value<int>(), "Branch op to benchmark")
-        ("len", po::value<int>(), "Benchmark chunk length")
-        ("sabench", "SA benchmark")
-        ("quiet", "Quiet mode");
-    g.add(s); g.add(d); g.add(t); g.add(a); g.add(db);
+    po::options_description t("Testing", w);
+    t.add_options()
+        ("test-dero", "Run AstroBWTv3 tests")
+        ("sabench", "SA benchmark");
+    g.add(s); g.add(a); g.add(t);
     return g;
 }
 

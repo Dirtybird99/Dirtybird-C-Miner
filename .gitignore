@@ -31,9 +31,6 @@ Makefile
 *.tmp
 nul
 
-# Config with sensitive info
-config.json
-
 # OS files
 .DS_Store
 Thumbs.db
