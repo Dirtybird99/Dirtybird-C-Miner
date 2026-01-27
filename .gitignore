@@ -2,6 +2,7 @@
 build/
 build-*/
 _deps/
+CPM-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
