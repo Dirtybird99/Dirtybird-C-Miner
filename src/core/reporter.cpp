@@ -142,7 +142,7 @@ int update_handler(const boost::system::error_code& error)
     // Print status (only after mining has started)
     // =========================================================================
     if (reportCounter >= reportInterval) {
-        
+
         // GPU hashrates
         if (gpuMine) {
             setcolor(BRIGHT_YELLOW);
@@ -160,42 +160,42 @@ int update_handler(const boost::system::error_code& error)
             setcolor(BRIGHT_WHITE);
         }
 
-        // Overall status line
+        // DeroLuna-style status line
+        // Format: HHH:MM:SS Height:N IB:N MB:N Diff:N @ XX.XX KH/s (XX.XX KH/s) >>
         setcolor(BRIGHT_WHITE);
         if (!gpuMine) std::cout << "\r";
         else std::cout << "\n";
 
-        std::cout << std::setw(2) << std::setfill('0') << consoleLine << versionString << " " << std::flush;
+        // Calculate total uptime in HHH:MM:SS format
+        auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - g_start_time).count();
+        int totalHours = totalSeconds / 3600;
+        int mins = (totalSeconds % 3600) / 60;
+        int secs = totalSeconds % 60;
+
+        // Time
+        std::cout << std::setfill('0') << std::setw(3) << totalHours << ":"
+                  << std::setw(2) << mins << ":"
+                  << std::setw(2) << secs << " ";
+
+        // Height
         setcolor(CYAN);
-        std::cout << std::setw(2) << std::setprecision(3)
-                  << "HASHRATE " << hashrate << units[unitIdx] << "H/s" << " | " << std::flush;
+        std::cout << "Height:" << ourHeight << " ";
 
-        std::string uptime =
-            std::to_string(daysUp) + "d-" +
-            std::to_string(hoursUp) + "h-" +
-            std::to_string(minutesUp) + "m-" +
-            std::to_string(secondsUp) + "s >> ";
+        // IB (Integrated Blocks = accepted)
+        std::cout << "IB:" << accepted << " ";
 
-        double dPrint;
-        // DERO Miner - only AstroBWTv3 and SpectreX algorithms
-        switch(miningProfile.coin.miningAlgo) {
-            case ALGO_ASTROBWTV3:
-                dPrint = difficulty;
-                break;
-            case ALGO_SPECTRE_X:
-            default:
-                dPrint = doubleDiff;
-                break;
-        }
+        // MB (Mini Blocks)
+        std::cout << "MB:" << miniBlockCounter << " ";
 
-        std::cout << std::setw(2) << "ACCEPTED " << accepted
-                  << std::setw(2) << " | REJECTED " << rejected
-                  << std::setw(2) << " | DIFFICULTY "
-                  << std::setw(6) << std::setfill(' ') << dPrint
-                  << std::setw(2) << " | UPTIME " << uptime
-                  << std::flush;
+        // Diff (as integer)
+        std::cout << "Diff:" << difficulty << " ";
 
+        // Hashrate: @ XX.XX KH/s (XX.XX KH/s) >>
         setcolor(BRIGHT_WHITE);
+        std::cout << std::fixed << std::setprecision(2)
+                  << "@ " << hashrate << units[unitIdx] << "H/s"
+                  << " (" << hashrate << units[unitIdx] << "H/s) >>" << std::flush;
+
         fflush(stdout);
 
         reportCounter = 0;

@@ -74,8 +74,7 @@ typedef struct {
 
 const Coin unknownCoin = {COIN_UNKNOWN, ALGO_UNSUPPORTED, "unknown", "unknown"};
 const Coin coins[COIN_COUNT] = {
-  {COIN_DERO,     ALGO_ASTROBWTV3,  "DERO",     "Dero"},
-  {COIN_SPECTRE,  ALGO_SPECTRE_X,   "SPR",      "Spectre"},
+  {COIN_DERO,     ALGO_ASTROBWTV3,  "DERO",     "Dero"}
 };
 
 // ============================================================================
@@ -252,29 +251,8 @@ class MiningProfile {
     }
 
     void setProtocol() {
-      // DERO-only: Support AstroBWTv3 and SpectreX protocols
-      if (this->useStratum) {
-        switch (this->coin.miningAlgo) {
-          case ALGO_SPECTRE_X:
-            this->protocol = PROTO_SPECTRE_STRATUM;
-            break;
-          case ALGO_ASTROBWTV3:
-          default:
-            // DERO uses solo protocol even with stratum transport
-            this->protocol = PROTO_DERO_SOLO;
-            break;
-        }
-      } else {
-        switch (this->coin.miningAlgo) {
-          case ALGO_SPECTRE_X:
-            this->protocol = PROTO_SPECTRE_SOLO;
-            break;
-          case ALGO_ASTROBWTV3:
-          default:
-            this->protocol = PROTO_DERO_SOLO;
-            break;
-        }
-      }
+      // DERO-only: AstroBWTv3 protocol
+      this->protocol = PROTO_DERO_SOLO;
     }
     
     // Set coin with optional version override

@@ -740,15 +740,7 @@ int dirtybird_main(int argc, char** argv)
     #endif
   }
 
-  // DERO Miner - Only DERO (AstroBWTv3) and Spectre supported
-  if (miningProfile.coin.coinId == COIN_SPECTRE) {
-    #if defined(DIRTYBIRD_ASTROBWTV3)
-    preserveAlgoOverride(miningProfile, COIN_SPECTRE);
-    miningProfile.protocol = PROTO_SPECTRE_STRATUM;
-    #else
-    UNSUPPORTED_ALGO_ERROR(unsupported_astro);
-    #endif
-  }
+  // DERO Miner - Only DERO (AstroBWTv3) supported
 
   // No xatum protocol support in DERO-only miner
 
@@ -787,13 +779,9 @@ int dirtybird_main(int argc, char** argv)
   if (vm.count("wallet"))
   {
     miningProfile.wallet = vm["wallet"].as<std::string>();
-    // DERO Miner: Only DERO and Spectre wallet detection
+    // DERO Miner: Only DERO wallet detection
     if(miningProfile.wallet.find("dero", 0) != std::string::npos) {
       preserveAlgoOverride(miningProfile, COIN_DERO);
-    }
-    if(miningProfile.wallet.find("spectre", 0) != std::string::npos || miningProfile.wallet.find("spectretest", 0) != std::string::npos) {
-      preserveAlgoOverride(miningProfile, COIN_SPECTRE);
-      miningProfile.protocol = PROTO_SPECTRE_STRATUM;
     }
 
     boost::char_separator<char> sep(".");
@@ -1076,8 +1064,7 @@ fillBlanks:
     goto fillBlanks;
   }
 
-  // necessary as long as the bridge is a thing
-  if (miningProfile.coin.miningAlgo == ALGO_SPECTRE_X) miningProfile.useStratum = true;
+  // DERO Miner: Stratum optional (not required for DERO)
 
   int i = 0;
   std::vector<std::string *> stringParams = {&miningProfile.host, &miningProfile.port, &miningProfile.wallet};
@@ -1150,7 +1137,7 @@ fillBlanks:
 
   setcolor(BRIGHT_YELLOW);
   #ifdef DIRTYBIRD_ASTROBWTV3
-  if (miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3 || miningProfile.coin.miningAlgo == ALGO_SPECTRE_X) {
+  if (miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3) {
     if (vm.count("no-tune")) {
       std::string noTune = vm["no-tune"].as<std::string>();
       if(!setAstroAlgo(noTune)) {
@@ -1275,10 +1262,7 @@ Mining:
     return rc;
   }
   #if defined(USE_ASTRO_SPSA)
-    if (
-      miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3 ||
-      miningProfile.coin.miningAlgo == ALGO_SPECTRE_X
-    ) {
+    if (miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3) {
       initSPSA();
     }
   #endif

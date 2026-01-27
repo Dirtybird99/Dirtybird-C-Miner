@@ -1,33 +1,24 @@
 #pragma once
 
 // DERO Miner - Algorithm Definitions
-// This fork focuses on AstroBWTv3 (DERO) only
+// DERO-only: AstroBWTv3
 
 // Protocol IDs
-// AstroBWTv3 (DERO)
 #define PROTO_DERO_SOLO 0
-
-// SpectreX (also uses AstroBWTv3)
-#define PROTO_SPECTRE_SOLO 20
-#define PROTO_SPECTRE_STRATUM 21
 
 // Coin IDs
 #define COIN_UNKNOWN -1
 #define COIN_DERO 0
-#define COIN_SPECTRE 1
-#define COIN_COUNT 2
+#define COIN_COUNT 1
 
 // Algorithm IDs
 #define ALGO_UNSUPPORTED 0
 #define ALGO_ASTROBWTV3 10
-#define ALGO_SPECTRE_X 30
 
 inline const char* algoName(int algo) {
   switch(algo) {
     case ALGO_ASTROBWTV3:
       return "AstroBWTv3";
-    case ALGO_SPECTRE_X:
-      return "SpectreX";
     default:
       return "Unknown";
   }
@@ -55,10 +46,9 @@ extern algo_config_t current_algo_config;
 #define CONFIG_ENDIAN_X11 2
 #define CONFIG_ENDIAN_YESPOWER 3
 
-// AstroBWT algorithms (DERO and SpectreX)
+// AstroBWT algorithms (DERO only)
 static const int astroAlgos[] = {
-  ALGO_ASTROBWTV3,
-  ALGO_SPECTRE_X
+  ALGO_ASTROBWTV3
 };
 
 static const algo_config_t algo_configs[] = {

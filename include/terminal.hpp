@@ -123,7 +123,7 @@ static const char *DERO = R"(
                                                                 
 )";
 
-static const char* coinPrompt = "Please enter the symbol for the coin you'd like to mine (i.e. DERO, XEL)";
+static const char* coinPrompt = "Please enter the symbol for the coin you'd like to mine (DERO)";
 static const char* daemonPrompt = "Please enter your mining deamon/host address: ";
 static const char* portPrompt = "Please enter your mining port: ";
 static const char* walletPrompt = "Please enter your wallet address for mining rewards: ";
@@ -259,14 +259,6 @@ inline po::options_description get_prog_opts()
   po::options_description testing("Testing", col_width);
   testing.add_options()
     ("test-dero", "Runs a set of tests to verify AstrobwtV3 is working (1 test expected to fail)")
-    ("test-spectre", "Run detailed diagnostics for SpectreX")
-    ("test-xelis", "Run the xelis-hash tests from the official source code")
-    ("test-astrix", "Run a basic astrix-hash validation test")
-    ("test-hoosat", "Run a basic hoohash validation test")
-    ("test-nexellia", "Run a basic nxl-hash validation test")
-    ("test-waglayla", "Run a basic wala-hash validation test")
-    ("test-shai", "Run a basic shai-hive validation test")
-    ("test-rin", "Run a basic rinhash validation test")
   ;
 
   po::options_description advanced("Advanced", col_width);
