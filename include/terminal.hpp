@@ -231,29 +231,9 @@ inline po::options_description get_prog_opts()
     ("worker-name", po::value<std::string>(), "Sets the worker name for this instance when mining on Pools or Bridges")
   ;
 
-  po::options_description coins("Coin Selection", col_width);
-  coins.add_options()
-    ("<symbol>", "Mine the coin corresponding to <symbol>. "
-                "For versioned algorithms, append version: --xel-v3, --xel=v2, etc. "
-                "Supported versioned coins: XEL (v1/v2/v3, default v3)")
-    ("randomx", "For mining RandomX coins")
-    ("yespower", po::value<std::string>(), "Mine with custom yespower parameters (format: N=2048,R=32,pers=string)")
-  ;
-
-  po::options_description dero("Dero", col_width);
+  po::options_description dero("DERO (AstroBWTv3)", col_width);
   dero.add_options()
-  ;
-
-  po::options_description xelis("Xelis", col_width);
-  xelis.add_options()
-    ("xatum", "Required for mining to Xatum pools on Xelis")
-    ("bench-xelis", "Run a benchmark of xelis-hash with 1 thread")
-  ;
-
-  po::options_description randomX("RandomX", col_width);
-  randomX.add_options()
-    ("rx-hugepages", "Use huge pages for RandomX")
-    ("test-randomx", "Run Tevador's reference RandomX tests")
+    ("dero", "Mine DERO using AstroBWTv3 algorithm (default)")
   ;
 
   po::options_description testing("Testing", col_width);
@@ -290,10 +270,7 @@ inline po::options_description get_prog_opts()
   ;
 
   general.add(stratum);
-  general.add(coins);
   general.add(dero);
-  general.add(xelis);
-  general.add(randomX);
   general.add(testing);
   general.add(advanced);
   general.add(debug);

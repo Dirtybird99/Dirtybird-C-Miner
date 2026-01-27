@@ -65,8 +65,8 @@
   #include "spsa.hpp"
 #endif
 
-// DERO Miner: Import uint256_t from KasStratum namespace for difficulty calculations
-using KasStratum::uint256_t;
+// DERO Miner: uint256_t for difficulty calculations
+using boost::multiprecision::uint256_t;
 
 // INITIALIZE COMMON STUFF
 algo_config_t current_algo_config;

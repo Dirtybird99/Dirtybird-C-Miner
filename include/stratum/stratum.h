@@ -5,5 +5,4 @@
 
 using byte = unsigned char;
 
-// DERO Miner: Only DERO stratum support
-#include "kas-stratum.h"
+// DERO Miner: Stratum types for DERO solo/pool mining
