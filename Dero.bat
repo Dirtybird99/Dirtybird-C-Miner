@@ -1,4 +1,4 @@
 @echo off
-deroluna-miner -d 203.0.113.10:10100 -w DERO_WALLET_PLACEHOLDER -t 20
+deroluna-miner -d dero-node-ch4k1pu.mysrv.cloud:10300 -w DERO_WALLET_PLACEHOLDER -t 20
 timeout 3
 goto loop
