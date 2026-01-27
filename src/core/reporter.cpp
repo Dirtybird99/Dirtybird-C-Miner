@@ -160,42 +160,69 @@ int update_handler(const boost::system::error_code& error)
             setcolor(BRIGHT_WHITE);
         }
 
-        // DeroLuna-style status line
-        // Format: HHH:MM:SS Height:N IB:N MB:N Diff:N @ XX.XX KH/s (XX.XX KH/s) >>
-        setcolor(BRIGHT_WHITE);
+        // DIRTYBIRD status line
         if (!gpuMine) std::cout << "\r";
         else std::cout << "\n";
 
-        // Calculate total uptime in HHH:MM:SS format
+        // Calculate uptime
         auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - g_start_time).count();
-        int totalHours = totalSeconds / 3600;
+        int hrs = totalSeconds / 3600;
         int mins = (totalSeconds % 3600) / 60;
         int secs = totalSeconds % 60;
 
-        // Time
-        std::cout << std::setfill('0') << std::setw(3) << totalHours << ":"
-                  << std::setw(2) << mins << ":"
-                  << std::setw(2) << secs << " ";
+        // Format difficulty with K/M/G suffix
+        std::string diffStr;
+        double diffVal = static_cast<double>(difficulty);
+        if (diffVal >= 1e9) {
+            diffStr = std::to_string(static_cast<int>(diffVal / 1e9)) + "G";
+        } else if (diffVal >= 1e6) {
+            diffStr = std::to_string(static_cast<int>(diffVal / 1e6)) + "M";
+        } else if (diffVal >= 1e3) {
+            diffStr = std::to_string(static_cast<int>(diffVal / 1e3)) + "K";
+        } else {
+            diffStr = std::to_string(difficulty);
+        }
 
-        // Height
-        setcolor(CYAN);
-        std::cout << "Height:" << ourHeight << " ";
+        // DIRTYBIRD unique format:
+        // [DIRTYBIRD] 19.85 KH/s | Accepted: 5 | Diff: 111M | Block: 6550439 | 00:05:32
+        setcolor(BRIGHT_YELLOW);
+        std::cout << "[DIRTYBIRD] ";
 
-        // IB (Integrated Blocks = accepted)
-        std::cout << "IB:" << accepted << " ";
+        setcolor(BRIGHT_GREEN);
+        std::cout << std::fixed << std::setprecision(2) << hashrate << units[unitIdx] << "H/s";
 
-        // MB (Mini Blocks)
-        std::cout << "MB:" << miniBlockCounter << " ";
-
-        // Diff (as integer)
-        std::cout << "Diff:" << difficulty << " ";
-
-        // Hashrate: @ XX.XX KH/s (XX.XX KH/s) >>
         setcolor(BRIGHT_WHITE);
-        std::cout << std::fixed << std::setprecision(2)
-                  << "@ " << hashrate << units[unitIdx] << "H/s"
-                  << " (" << hashrate << units[unitIdx] << "H/s) >>" << std::flush;
+        std::cout << " | ";
 
+        setcolor(CYAN);
+        std::cout << "Accepted: " << accepted;
+        if (rejected > 0) {
+            setcolor(BRIGHT_RED);
+            std::cout << " Rejected: " << rejected;
+        }
+
+        setcolor(BRIGHT_WHITE);
+        std::cout << " | ";
+
+        setcolor(MAGENTA);
+        std::cout << "Diff: " << diffStr;
+
+        setcolor(BRIGHT_WHITE);
+        std::cout << " | ";
+
+        setcolor(BLUE);
+        std::cout << "Block: " << ourHeight;
+
+        setcolor(BRIGHT_WHITE);
+        std::cout << " | ";
+
+        setcolor(WHITE);
+        std::cout << std::setfill('0') << std::setw(2) << hrs << ":"
+                  << std::setw(2) << mins << ":"
+                  << std::setw(2) << secs;
+
+        setcolor(BRIGHT_WHITE);
+        std::cout << std::flush;
         fflush(stdout);
 
         reportCounter = 0;
