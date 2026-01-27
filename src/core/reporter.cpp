@@ -87,8 +87,12 @@ int update_handler(const boost::system::error_code& error) {
         setcolor(BRIGHT_YELLOW); std::cout << "[DIRTYBIRD] ";
         setcolor(BRIGHT_GREEN); std::cout << std::fixed << std::setprecision(2) << hr << units[u] << "H/s";
         setcolor(BRIGHT_WHITE); std::cout << " | ";
-        setcolor(CYAN); std::cout << "Acc:" << accepted;
-        if (rejected > 0) { setcolor(BRIGHT_RED); std::cout << " Rej:" << rejected; }
+        setcolor(CYAN); std::cout << "MB:" << accepted;
+        setcolor(BRIGHT_WHITE); std::cout << " ";
+        setcolor(GREEN); std::cout << "IB:" << blockCounter;
+        setcolor(BRIGHT_WHITE); std::cout << " ";
+        if (rejected > 0) setcolor(BRIGHT_RED); else setcolor(WHITE);
+        std::cout << "REJ:" << rejected;
         setcolor(BRIGHT_WHITE); std::cout << " | ";
         setcolor(MAGENTA); std::cout << "Diff:" << diff;
         setcolor(BRIGHT_WHITE); std::cout << " | ";

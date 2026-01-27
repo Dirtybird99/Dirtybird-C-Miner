@@ -231,6 +231,9 @@ void dero_session(
             if (job.as_object().contains("miniblocks")) {
               accepted = job.at("miniblocks").to_number<int64_t>();
             }
+            if (job.as_object().contains("blocks")) {
+              blockCounter = job.at("blocks").to_number<int64_t>();
+            }
             if (job.as_object().contains("rejected")) {
               rejected = job.at("rejected").to_number<int64_t>();
             }
