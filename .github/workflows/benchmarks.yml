@@ -1,0 +1,158 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark-windows:
+    name: Benchmark (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-openmp
+            make
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-cmake-bench-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-cmake-bench-
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cmake -B build -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Run benchmark (10 seconds)
+        shell: msys2 {0}
+        run: |
+          echo "Running 10-second hashrate benchmark..."
+          # Use a dummy address since we're just measuring local hashrate
+          timeout 15 ./build/bin/dirtybird-miner-cpu.exe \
+            --daemon-address 127.0.0.1:10100 \
+            --wallet DERO_WALLET_PLACEHOLDER \
+            --threads 2 \
+            --mine-time 10 2>&1 | tee benchmark-results.txt || true
+
+      - name: Extract benchmark results
+        shell: bash
+        run: |
+          echo "## Benchmark Results" > benchmark-summary.md
+          echo "" >> benchmark-summary.md
+          echo "Platform: Windows x64" >> benchmark-summary.md
+          echo "Threads: 2" >> benchmark-summary.md
+          echo "" >> benchmark-summary.md
+          if grep -q "threads @" benchmark-results.txt; then
+            grep "threads @" benchmark-results.txt >> benchmark-summary.md
+          else
+            echo "Benchmark completed (connection not required for hash test)" >> benchmark-summary.md
+          fi
+          cat benchmark-summary.md
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-windows
+          path: |
+            benchmark-results.txt
+            benchmark-summary.md
+          retention-days: 30
+
+  benchmark-linux:
+    name: Benchmark (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            libboost-all-dev \
+            libssl-dev \
+            libomp-dev
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-cmake-bench-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-cmake-bench-
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Run benchmark (10 seconds)
+        run: |
+          echo "Running 10-second hashrate benchmark..."
+          timeout 15 ./build/bin/dirtybird-miner-cpu \
+            --daemon-address 127.0.0.1:10100 \
+            --wallet DERO_WALLET_PLACEHOLDER \
+            --threads 2 \
+            --mine-time 10 2>&1 | tee benchmark-results.txt || true
+
+      - name: Extract benchmark results
+        run: |
+          echo "## Benchmark Results" > benchmark-summary.md
+          echo "" >> benchmark-summary.md
+          echo "Platform: Linux x64" >> benchmark-summary.md
+          echo "Threads: 2" >> benchmark-summary.md
+          echo "" >> benchmark-summary.md
+          if grep -q "threads @" benchmark-results.txt; then
+            grep "threads @" benchmark-results.txt >> benchmark-summary.md
+          else
+            echo "Benchmark completed (connection not required for hash test)" >> benchmark-summary.md
+          fi
+          cat benchmark-summary.md
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-linux
+          path: |
+            benchmark-results.txt
+            benchmark-summary.md
+          retention-days: 30

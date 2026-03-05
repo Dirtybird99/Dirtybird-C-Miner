@@ -1,0 +1,41 @@
+# Build directories
+build/
+build-*/
+_deps/
+CPM-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+*.tmp
+nul
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Profile data
+*.profraw
+*.profdata
+default.profraw

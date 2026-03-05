@@ -1,0 +1,119 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 30,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-${presetName}",
+            "cacheVariables": {
+                "WITH_ASTROBWTV3": "ON",
+                "USE_ASTRO_SPSA": "ON",
+                "WITH_SSE4_1": "ON",
+                "WITH_AVX2": "ON"
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Release",
+            "description": "Optimized release build with LTO",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "DISABLE_LTO": "OFF"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug",
+            "description": "Debug build with symbols, no optimization",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "DISABLE_LTO": "ON"
+            }
+        },
+        {
+            "name": "profile",
+            "displayName": "Profile",
+            "description": "Release build with debug info for profiling",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build-profile",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "DISABLE_LTO": "OFF",
+                "WITH_PROFILING": "ON"
+            }
+        },
+        {
+            "name": "no-lto",
+            "displayName": "Release (No LTO)",
+            "description": "Release build without Link-Time Optimization for faster builds",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build-nolto",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "DISABLE_LTO": "ON"
+            }
+        },
+        {
+            "name": "gcc",
+            "displayName": "Release (GCC)",
+            "description": "Release build using GCC instead of Clang",
+            "inherits": "release",
+            "binaryDir": "${sourceDir}/build-gcc",
+            "cacheVariables": {
+                "USE_GCC": "ON"
+            }
+        },
+        {
+            "name": "no-spsa",
+            "displayName": "Release (No SPSA)",
+            "description": "Release build without Astro-SPSA library",
+            "inherits": "release",
+            "binaryDir": "${sourceDir}/build-nospsa",
+            "cacheVariables": {
+                "USE_ASTRO_SPSA": "OFF"
+            }
+        },
+        {
+            "name": "benchmark",
+            "displayName": "Benchmark",
+            "description": "Build with benchmark tools enabled",
+            "inherits": "release",
+            "binaryDir": "${sourceDir}/build-bench",
+            "cacheVariables": {
+                "CMAKE_CXX_FLAGS": "-DBUILD_SA_BENCHMARK -DTEST_SHA256_SCATTER"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release",
+            "configurePreset": "release",
+            "configuration": "Release"
+        },
+        {
+            "name": "debug",
+            "configurePreset": "debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "profile",
+            "configurePreset": "profile",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "no-lto",
+            "configurePreset": "no-lto",
+            "configuration": "Release"
+        }
+    ]
+}

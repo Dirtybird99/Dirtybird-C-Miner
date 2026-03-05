@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          TAG="${{ github.ref_name }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG"
+            echo "Expected format: v1.2.3 or v1.2.3-beta.1"
+            exit 1
+          fi
+          echo "Valid tag: $TAG"
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Show changelog preview
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since $PREV_TAG:"
+            git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ github.ref_name }}
+          else
+            echo "First release - all commits:"
+            git log --pretty=format:"- %s (%h)" | head -20
+          fi
+
+  build-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-openmp
+            make
+            zip
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cmake -B build -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }}
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: ./build/bin/dirtybird-miner-cpu.exe --test-dero
+
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          mkdir -p release
+          cp build/bin/dirtybird-miner-cpu.exe release/
+          cp config.json release/
+          cp build/bin/*.dll release/ 2>/dev/null || true
+          cd release
+          zip -r ../dirtybird-miner-${{ needs.verify.outputs.version }}-windows-x64.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtybird-miner-windows
+          path: dirtybird-miner-${{ needs.verify.outputs.version }}-windows-x64.zip
+
+  build-linux:
+    name: Build Linux Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            libboost-all-dev \
+            libssl-dev \
+            libomp-dev
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }}
+
+      - name: Build
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Run tests
+        run: ./build/bin/dirtybird-miner-cpu --test-dero
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp build/bin/dirtybird-miner-cpu release/
+          cp config.json release/
+          cd release
+          tar -czvf ../dirtybird-miner-${{ needs.verify.outputs.version }}-linux-x64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtybird-miner-linux
+          path: dirtybird-miner-${{ needs.verify.outputs.version }}-linux-x64.tar.gz
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [verify, build-windows, build-linux]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dirtybird-miner-windows
+          path: ./artifacts
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dirtybird-miner-linux
+          path: ./artifacts
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "## Changes since $PREV_TAG" > CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ github.ref_name }} >> CHANGELOG.md
+          else
+            echo "## Initial Release" > CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" | head -20 >> CHANGELOG.md
+          fi
+          cat CHANGELOG.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DIRTYBIRD Miner v${{ needs.verify.outputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
