@@ -295,4 +295,9 @@ int InterleavedMiner::processInterleaved(
 
 void InterleavedMiner::wolfComputeInterleaved2(workerData& wa, workerData& wb, int wi) {}
 
+double benchmarkInterleaved(int numIterations) {
+    (void)numIterations;
+    return 0.0;
+}
+
 #endif
