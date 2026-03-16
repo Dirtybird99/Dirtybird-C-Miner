@@ -203,6 +203,13 @@ if (WIN32)
     set(CMAKE_CXX_COMPILER "${DIRTYBIRD_WIN_CXX_COMPILER}" CACHE FILEPATH "" FORCE)
     set(CMAKE_ASM_COMPILER "${DIRTYBIRD_WIN_ASM_COMPILER}" CACHE FILEPATH "" FORCE)
 
+    get_filename_component(DIRTYBIRD_MSYS2_BIN_DIR "${DIRTYBIRD_WIN_C_COMPILER}" DIRECTORY)
+    get_filename_component(DIRTYBIRD_MSYS2_PREFIX "${DIRTYBIRD_MSYS2_BIN_DIR}/.." ABSOLUTE)
+    if (EXISTS "${DIRTYBIRD_MSYS2_PREFIX}/include")
+      set(DIRTYBIRD_MSYS2_INCLUDE_DIR "${DIRTYBIRD_MSYS2_PREFIX}/include")
+      set(DIRTYBIRD_MSYS2_LIB_DIR "${DIRTYBIRD_MSYS2_PREFIX}/lib")
+    endif()
+
     if (NOT USE_GCC)
       if (CMAKE_LINKER AND EXISTS "${CMAKE_LINKER}")
         set(DIRTYBIRD_WIN_LINKER "${CMAKE_LINKER}")
@@ -696,8 +703,18 @@ set(OPENSSL_USE_STATIC_LIBS TRUE)
 if(WIN32)
   message(STATUS "WIN32!")
   if(NOT WITH_HIP)
-    # Try MSYS2 MinGW64 paths first, then fall back to clang64 paths
-    if (EXISTS "C:/msys64/mingw64/include/openssl/ssl.h")
+    # Prefer the active MSYS2 toolchain prefix discovered from the compiler.
+    if (DIRTYBIRD_MSYS2_INCLUDE_DIR AND EXISTS "${DIRTYBIRD_MSYS2_INCLUDE_DIR}/openssl/ssl.h")
+      set(OPENSSL_ROOT_DIR "${DIRTYBIRD_MSYS2_PREFIX}")
+      set(SODIUM_ROOT_DIR "${DIRTYBIRD_MSYS2_PREFIX}")
+      include_directories(
+        "${DIRTYBIRD_MSYS2_INCLUDE_DIR}"
+      )
+      link_directories(
+        "${DIRTYBIRD_MSYS2_LIB_DIR}"
+      )
+    # Try legacy local MSYS2 paths next, then fall back to clang64 paths
+    elseif (EXISTS "C:/msys64/mingw64/include/openssl/ssl.h")
       set(OPENSSL_ROOT_DIR "C:/msys64/mingw64")
       set(SODIUM_ROOT_DIR "C:/msys64/mingw64")
       include_directories(
@@ -793,8 +810,13 @@ endif()
 
 # For MSYS2 MinGW builds, help CMake find OpenSSL
 if (WIN32 AND NOT MSVC AND NOT OPENSSL_ROOT_DIR)
-  # Check for MSYS2 MinGW64 installation
-  if (EXISTS "C:/msys64/mingw64/include/openssl/ssl.h")
+  # Check the resolved MSYS2 toolchain prefix first.
+  if (DIRTYBIRD_MSYS2_INCLUDE_DIR AND EXISTS "${DIRTYBIRD_MSYS2_INCLUDE_DIR}/openssl/ssl.h")
+    set(OPENSSL_ROOT_DIR "${DIRTYBIRD_MSYS2_PREFIX}" CACHE PATH "OpenSSL root")
+    set(OPENSSL_INCLUDE_DIR "${DIRTYBIRD_MSYS2_INCLUDE_DIR}" CACHE PATH "OpenSSL include")
+    set(OPENSSL_CRYPTO_LIBRARY "${DIRTYBIRD_MSYS2_LIB_DIR}/libcrypto.dll.a" CACHE FILEPATH "OpenSSL crypto lib")
+    set(OPENSSL_SSL_LIBRARY "${DIRTYBIRD_MSYS2_LIB_DIR}/libssl.dll.a" CACHE FILEPATH "OpenSSL ssl lib")
+  elseif (EXISTS "C:/msys64/mingw64/include/openssl/ssl.h")
     set(OPENSSL_ROOT_DIR "C:/msys64/mingw64" CACHE PATH "OpenSSL root")
     set(OPENSSL_INCLUDE_DIR "C:/msys64/mingw64/include" CACHE PATH "OpenSSL include")
     set(OPENSSL_CRYPTO_LIBRARY "C:/msys64/mingw64/lib/libcrypto.dll.a" CACHE FILEPATH "OpenSSL crypto lib")
@@ -841,7 +863,15 @@ set(Boost_NO_WARN_NEW_VERSIONS ON)
 
 # For MSYS2 MinGW builds, help CMake find Boost
 if (WIN32 AND NOT MSVC AND NOT Boost_ROOT)
-  if (EXISTS "C:/msys64/mingw64/include/boost/version.hpp")
+  if (DIRTYBIRD_MSYS2_INCLUDE_DIR AND EXISTS "${DIRTYBIRD_MSYS2_INCLUDE_DIR}/boost/version.hpp")
+    set(BOOST_ROOT "${DIRTYBIRD_MSYS2_PREFIX}" CACHE PATH "Boost root")
+    file(GLOB DIRTYBIRD_BOOST_CMAKE_DIRS "${DIRTYBIRD_MSYS2_LIB_DIR}/cmake/Boost-*")
+    if (DIRTYBIRD_BOOST_CMAKE_DIRS)
+      list(SORT DIRTYBIRD_BOOST_CMAKE_DIRS)
+      list(GET DIRTYBIRD_BOOST_CMAKE_DIRS -1 DIRTYBIRD_BOOST_CMAKE_DIR)
+      set(Boost_DIR "${DIRTYBIRD_BOOST_CMAKE_DIR}" CACHE PATH "Boost cmake")
+    endif()
+  elseif (EXISTS "C:/msys64/mingw64/include/boost/version.hpp")
     set(BOOST_ROOT "C:/msys64/mingw64" CACHE PATH "Boost root")
     set(Boost_DIR "C:/msys64/mingw64/lib/cmake/Boost-1.90.0" CACHE PATH "Boost cmake")
   endif()
@@ -1377,7 +1407,9 @@ else()
   if (USE_MIMALLOC)
     # Prefer static library for fully static builds
     set(MIMALLOC_STATIC_LIB "")
-    if (WIN32 AND EXISTS "C:/msys64/mingw64/lib/libmimalloc.a")
+    if (WIN32 AND DIRTYBIRD_MSYS2_LIB_DIR AND EXISTS "${DIRTYBIRD_MSYS2_LIB_DIR}/libmimalloc.a")
+      set(MIMALLOC_STATIC_LIB "${DIRTYBIRD_MSYS2_LIB_DIR}/libmimalloc.a")
+    elseif (WIN32 AND EXISTS "C:/msys64/mingw64/lib/libmimalloc.a")
       set(MIMALLOC_STATIC_LIB "C:/msys64/mingw64/lib/libmimalloc.a")
     else()
       find_library(MIMALLOC_STATIC_LIB mimalloc-static mimalloc PATHS "/usr/lib" "/usr/local/lib")
@@ -1404,7 +1436,11 @@ else()
   # UPX compression for smaller binary (like DeroLuna's 3.3MB)
   option(USE_UPX "Compress binary with UPX for smaller size" OFF)
   if (USE_UPX)
-    find_program(UPX_EXECUTABLE upx HINTS "C:/msys64/mingw64/bin")
+    if (DIRTYBIRD_MSYS2_BIN_DIR)
+      find_program(UPX_EXECUTABLE upx HINTS "${DIRTYBIRD_MSYS2_BIN_DIR}")
+    else()
+      find_program(UPX_EXECUTABLE upx HINTS "C:/msys64/mingw64/bin")
+    endif()
     if (UPX_EXECUTABLE)
       message(STATUS "UPX found: ${UPX_EXECUTABLE} - will compress binary after build")
       add_custom_command(TARGET ${DERO_OUTPUT_NAME} POST_BUILD
