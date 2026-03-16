@@ -52,13 +52,14 @@ if (WITH_ASTROBWTV3)
 
     # libsais for faster suffix array construction
     if (USE_LIBSAIS)
-        set(LIBSAIS_DIR "${CMAKE_SOURCE_DIR}/../libsais-2.10.4")
-        if (EXISTS "${LIBSAIS_DIR}/src/libsais.c")
-            list(APPEND astroSources "${LIBSAIS_DIR}/src/libsais.c")
-            include_directories("${LIBSAIS_DIR}/include")
-            message(STATUS "libsais source added: ${LIBSAIS_DIR}/src/libsais.c")
+        if (EXISTS "${DIRTYBIRD_LIBSAIS_SOURCE}")
+            list(APPEND astroSources "${DIRTYBIRD_LIBSAIS_SOURCE}")
+            include_directories("${DIRTYBIRD_LIBSAIS_INCLUDE_DIR}")
+            message(STATUS "libsais source added: ${DIRTYBIRD_LIBSAIS_SOURCE}")
         else()
-            message(FATAL_ERROR "libsais not found at ${LIBSAIS_DIR}. Please ensure dero-miner-main/libsais-2.10.4 exists.")
+            message(FATAL_ERROR
+                "Bundled libsais not found at ${DIRTYBIRD_LIBSAIS_DIR}. "
+                "Please ensure extern/libsais is present.")
         endif()
     endif()
 

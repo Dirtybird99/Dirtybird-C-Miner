@@ -259,6 +259,10 @@ option(ENABLE_SA_INSTRUMENTATION "Enable divsufsort access counting for SA analy
 option(BUILD_STATIC         "Build static binary" ON)
 option(ARM_V8               "Force ARMv8 (64 bit) architecture, use with caution if automatic detection fails, but you sure it may work" OFF)
 option(ARM_V7               "Force ARMv7 (32 bit) architecture, use with caution if automatic detection fails, but you sure it may work" OFF)
+set(DIRTYBIRD_LIBSAIS_DIR "${CMAKE_SOURCE_DIR}/extern/libsais" CACHE PATH
+    "Bundled libsais source directory")
+set(DIRTYBIRD_LIBSAIS_SOURCE "${DIRTYBIRD_LIBSAIS_DIR}/src/libsais.c")
+set(DIRTYBIRD_LIBSAIS_INCLUDE_DIR "${DIRTYBIRD_LIBSAIS_DIR}/include")
 # End of XMRig options
 
 # LTO, section GC, and strip are configured AFTER project() since they need CMAKE_CXX_COMPILER_ID
@@ -1408,7 +1412,7 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         src/crypto/salsa20_simd.c
     )
     if (USE_LIBSAIS)
-        list(APPEND BENCH_ASTRO_SOURCES "${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c")
+        list(APPEND BENCH_ASTRO_SOURCES "${DIRTYBIRD_LIBSAIS_SOURCE}")
     endif()
     # Remove SPSA-dependent files to avoid needing the library
     list(FILTER BENCH_ASTRO_SOURCES EXCLUDE REGEX ".*spsa_integrated\\.cpp$")
@@ -1514,7 +1518,7 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         src/util/numa_optimizer.cpp
     )
     if (USE_LIBSAIS)
-        list(APPEND REPLAY_ASTRO_SOURCES "${LIBSAIS_DIR}/src/libsais.c")
+        list(APPEND REPLAY_ASTRO_SOURCES "${DIRTYBIRD_LIBSAIS_SOURCE}")
     endif()
 
     add_executable(bench-dero-replay
@@ -1552,7 +1556,7 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         src/crypto/astrobwtv3/trsort.c
         src/crypto/astrobwtv3/utils.c
         # libsais 2.10.4 for comparison
-        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c
+        ${DIRTYBIRD_LIBSAIS_SOURCE}
     )
     target_include_directories(test-custom-sa PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -1560,7 +1564,7 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         ${CMAKE_SOURCE_DIR}/src/crypto
         ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
         # libsais headers
-        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/include
+        ${DIRTYBIRD_LIBSAIS_INCLUDE_DIR}
     )
     # Test with OpenMP undefined (like lean benchmark)
     target_compile_options(test-custom-sa PRIVATE -U_OPENMP -mavx2)
@@ -1907,14 +1911,14 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         src/crypto/astrobwtv3/sssort.c
         src/crypto/astrobwtv3/trsort.c
         src/crypto/astrobwtv3/utils.c
-        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c
+        ${DIRTYBIRD_LIBSAIS_SOURCE}
     )
     target_include_directories(bench-sa-comparison PRIVATE
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/crypto
         ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
-        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/include
+        ${DIRTYBIRD_LIBSAIS_INCLUDE_DIR}
     )
     target_compile_options(bench-sa-comparison PRIVATE -U_OPENMP -mavx2 -O3)
     set_target_properties(bench-sa-comparison PROPERTIES
