@@ -121,7 +121,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang cmake ninja-build lld \
+            clang cmake ninja-build lld patchelf \
             libboost-all-dev libssl-dev libomp-dev \
             libnuma-dev libudns-dev libmimalloc-dev
 

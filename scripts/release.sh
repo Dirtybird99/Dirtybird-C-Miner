@@ -27,6 +27,7 @@ STAGE_ROOT="$REPO_ROOT/$OUTPUT_DIR"
 PACKAGE_NAME="dirtybird-miner-amd64-$ASSET_VERSION"
 PACKAGE_DIR="$STAGE_ROOT/$PACKAGE_NAME"
 ARCHIVE_PATH="$STAGE_ROOT/$PACKAGE_NAME.tar.gz"
+LIB_DIR="$PACKAGE_DIR/lib"
 
 echo "================================================"
 echo "DIRTYBIRD Miner Linux Packaging"
@@ -40,12 +41,95 @@ if [[ ! -f "$BINARY_PATH" ]]; then
     exit 1
 fi
 
+if ! command -v ldd >/dev/null 2>&1; then
+    echo "ldd is required for Linux packaging." >&2
+    exit 1
+fi
+
+if ! command -v patchelf >/dev/null 2>&1; then
+    echo "patchelf is required for Linux packaging." >&2
+    exit 1
+fi
+
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "readelf is required for Linux packaging." >&2
+    exit 1
+fi
+
+should_bundle_runtime() {
+    local soname="$1"
+    case "$soname" in
+        linux-vdso.so.1|linux-gate.so.1|ld-linux*.so.*|libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|libutil.so.*|libresolv.so.*|libnsl.so.*|libanl.so.*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+bundle_runtime_libs() {
+    local binary_path="$1"
+    local output_dir="$2"
+    local line soname resolved_path actual_path
+    local -a missing_libs=()
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\=\>[[:space:]]+not[[:space:]]+found$ ]]; then
+            soname="${BASH_REMATCH[1]}"
+            if should_bundle_runtime "$soname"; then
+                missing_libs+=("$soname")
+            fi
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\=\>[[:space:]]+([^[:space:]]+)[[:space:]]+\(0x[0-9a-fA-F]+\)$ ]]; then
+            soname="${BASH_REMATCH[1]}"
+            actual_path="${BASH_REMATCH[2]}"
+            if ! should_bundle_runtime "$soname"; then
+                continue
+            fi
+            resolved_path="$(readlink -f "$actual_path")"
+            install -m 0644 "$resolved_path" "$output_dir/$soname"
+        fi
+    done < <(ldd "$binary_path")
+
+    if [[ ${#missing_libs[@]} -gt 0 ]]; then
+        printf 'Missing runtime libraries:%s\n' " ${missing_libs[*]}" >&2
+        exit 1
+    fi
+}
+
+validate_runtime_bundle() {
+    local binary_path="$1"
+    local output_dir="$2"
+    local soname actual_rpath
+
+    while IFS= read -r soname; do
+        if should_bundle_runtime "$soname" && [[ ! -f "$output_dir/$soname" ]]; then
+            echo "Bundled dependency missing from package: $soname" >&2
+            exit 1
+        fi
+    done < <(readelf -d "$binary_path" | sed -n 's/^.*Shared library: \[\(.*\)\]$/\1/p')
+
+    actual_rpath="$(patchelf --print-rpath "$binary_path")"
+    if [[ "$actual_rpath" != '$ORIGIN/lib' ]]; then
+        echo "Unexpected runtime search path: $actual_rpath" >&2
+        exit 1
+    fi
+}
+
 mkdir -p "$STAGE_ROOT"
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR"
+mkdir -p "$LIB_DIR"
 
 cp "$BINARY_PATH" "$PACKAGE_DIR/"
 chmod +x "$PACKAGE_DIR/$BINARY_NAME"
+bundle_runtime_libs "$PACKAGE_DIR/$BINARY_NAME" "$LIB_DIR"
+patchelf --set-rpath '$ORIGIN/lib' "$PACKAGE_DIR/$BINARY_NAME"
+validate_runtime_bundle "$PACKAGE_DIR/$BINARY_NAME" "$LIB_DIR"
+
 cp "$REPO_ROOT/README.md" "$PACKAGE_DIR/"
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_DIR/"
 cp "$REPO_ROOT/config.json.example" "$PACKAGE_DIR/"
@@ -54,8 +138,10 @@ cp "$REPO_ROOT/config.json.example" "$PACKAGE_DIR/config.json"
 cat > "$PACKAGE_DIR/start.sh" <<'EOF'
 #!/bin/bash
 set -e
-cd "$(dirname "$0")"
-./dirtybird-miner-cpu "$@"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$SCRIPT_DIR"
+exec ./dirtybird-miner-cpu "$@"
 EOF
 chmod +x "$PACKAGE_DIR/start.sh"
 
@@ -65,6 +151,7 @@ DIRTYBIRD Miner $ASSET_VERSION
 
 Contents:
 - dirtybird-miner-cpu
+- lib/
 - config.json
 - config.json.example
 - README.md
@@ -80,7 +167,7 @@ Self-test:
 
 Notes:
 - This build targets 64-bit AVX2-capable CPUs.
-- Linux builds may still rely on standard system libraries provided by your distro.
+- Non-glibc runtime libraries are bundled under ./lib for portability.
 EOF
 
 rm -f "$ARCHIVE_PATH"

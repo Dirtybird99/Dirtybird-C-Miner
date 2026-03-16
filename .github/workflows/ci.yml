@@ -58,7 +58,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang cmake ninja-build lld \
+            clang cmake ninja-build lld patchelf \
             libboost-all-dev libssl-dev libomp-dev \
             libnuma-dev libudns-dev libmimalloc-dev
 
@@ -100,6 +100,12 @@ jobs:
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
         run: ./build/bin/dirtybird-miner-cpu --help > /dev/null
+
+      - name: Package verification (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash ./scripts/release.sh v0.0.0-ci build dist
+          tar -tzf dist/dirtybird-miner-amd64-v0.0.0-ci.tar.gz | grep -q 'dirtybird-miner-amd64-v0.0.0-ci/lib/libboost_context.so'
 
       - name: Diagnostic self-test (Windows)
         if: runner.os == 'Windows'
