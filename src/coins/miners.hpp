@@ -65,12 +65,15 @@ inline void NumToTarget32(const Num &n, unsigned char target[32])
 // big-endian target, without hexStr() heap allocation or Num bignum parsing.
 // Preserves the original CheckHash semantics: reverse to little-endian, compare, reverse back.
 // Returns true if hash (interpreted as little-endian 256-bit int) <= target.
-inline bool CheckHashBytes(unsigned char *hash, const unsigned char target[32])
+inline bool CheckHashBytes(const unsigned char *hash, const unsigned char target[32])
 {
-  if (littleEndian()) std::reverse(hash, hash + 32);
-  int cmp = std::memcmp(hash, target, 32);
-  if (littleEndian()) std::reverse(hash, hash + 32);
-  return cmp <= 0;
+  // Compare hash (little-endian) against target (big-endian) without mutating hash.
+  // Reads hash bytes in reverse order to simulate std::reverse + memcmp.
+  for (int i = 0; i < 32; i++) {
+    unsigned char h = hash[31 - i], t = target[i];
+    if (h != t) return h < t;
+  }
+  return true;
 }
 
 inline std::string uint32ToHex(uint32_t value) {

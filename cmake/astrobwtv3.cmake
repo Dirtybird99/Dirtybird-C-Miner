@@ -41,10 +41,12 @@ if (WITH_ASTROBWTV3)
     list(FILTER astroSources EXCLUDE REGEX ".*sa_instrumentation\\.c$")
 
     list(APPEND astroSources
+      src/coins/dero_worker_pool.cpp
       src/coins/mine_dero.cpp
       src/coins/mine_dero_batched.cpp
       src/coins/mine_dero_interleaved.cpp
       src/coins/mine_dero_lockfree.cpp
+      src/crypto/sha256_override.cpp
       src/crypto/salsa20_simd.c
     )
 

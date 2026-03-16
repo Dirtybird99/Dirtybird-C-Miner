@@ -34,7 +34,7 @@ static inline bool memoptNonbranchedLutEnabled() {
     static const bool enabled = []() {
         const char* raw = std::getenv("DIRTYBIRD_MEMOPT_LUT");
         if (raw == nullptr || raw[0] == '\0') {
-            return false;
+            return true;
         }
         const char c = raw[0];
         return !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
@@ -335,24 +335,30 @@ after:
         worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
         worker.A = (256 + (worker.A % 256)) % 256;
 
-        if (worker.A < 0x10)
-        { // 6.25 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
-        }
-
-        if (worker.A < 0x20)
-        { // 12.5 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
-        }
-
-        if (worker.A < 0x30)
-        { // 18.75 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            HH_ALIGNAS(16)
-            const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
-            worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+        // Branchless hash dispatch: single selector + switch/fallthrough
+        // replaces 3 unpredictable cascading if/else branches
+        {
+          const int hash_sel = (worker.A < 0x30) + (worker.A < 0x20) + (worker.A < 0x10);
+          switch (hash_sel) {
+            case 3:  // A < 0x10: XXHash + FNV + SipHash
+              worker.prev_lhash = worker.lhash + worker.prev_lhash;
+              worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
+              [[fallthrough]];
+            case 2:  // A < 0x20: FNV + SipHash
+              worker.prev_lhash = worker.lhash + worker.prev_lhash;
+              worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
+              [[fallthrough]];
+            case 1:  // A < 0x30: SipHash only
+              {
+                worker.prev_lhash = worker.lhash + worker.prev_lhash;
+                HH_ALIGNAS(16)
+                const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
+                worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+              }
+              break;
+            default:  // hash_sel == 0, A >= 0x30: no hash (~81%)
+              break;
+          }
         }
 
         if (worker.A <= 0x40)

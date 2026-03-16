@@ -39,6 +39,7 @@ inline std::atomic<uint32_t> g_pace_sleep_ms{0};
 // Thermal governor state: scaling factor 0-100 (100 = full speed)
 // Updated once per second from reporter. Read by mining threads.
 inline std::atomic<int> g_thermal_scale{100};
+inline std::atomic<bool> g_thermal_yield_enabled{false};
 
 // Peak hashrate observed (hashes/sec), used for throttle detection
 inline std::atomic<int64_t> g_peak_hashrate{0};
@@ -150,10 +151,19 @@ inline int update(const std::vector<int64_t>& rate_history) {
     return scale;
 }
 
+inline void set_thermal_yield_enabled(bool enabled) {
+    g_thermal_yield_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+inline bool thermal_yield_enabled() {
+    return g_thermal_yield_enabled.load(std::memory_order_relaxed);
+}
+
 // Thread-side: check if thermal governor signals we should yield.
 // This is extremely lightweight — just an atomic load.
 inline bool should_thermal_yield() {
-    return g_thermal_scale.load(std::memory_order_relaxed) < 100;
+    return thermal_yield_enabled() &&
+           g_thermal_scale.load(std::memory_order_relaxed) < 100;
 }
 
 // Thread-side: perform thermal yield. Brief yield or micro-sleep

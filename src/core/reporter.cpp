@@ -1,6 +1,7 @@
 #include "reporter.hpp"
 #include "thermal_governor.hpp"
 #include <astrobwtv3/astrobwtv3.h>
+#include <sha256_override_telemetry.hpp>
 #include <lookup_mode.hpp>
 #include <algorithm>
 #include <numeric>
@@ -84,6 +85,10 @@ int update_handler(const boost::system::error_code& error) {
     while (hr >= 1000 && u < 5) { u++; hr /= 1000.0; }
     latest_hashrate = hr;
 
+    double current_hr = static_cast<double>(h_per_sec);
+    int current_u = 0;
+    while (current_hr >= 1000 && current_u < 5) { current_u++; current_hr /= 1000.0; }
+
     // Thermal governor: adjust pacing based on hashrate trend
     int duty = thermal::update(rate30sec);
 
@@ -117,18 +122,20 @@ int update_handler(const boost::system::error_code& error) {
         else snprintf(diff, 16, "%llu", difficulty);
 
         setcolor(BRIGHT_YELLOW); std::cout << "[DIRTYBIRD] ";
-        setcolor(BRIGHT_GREEN); std::cout << std::fixed << std::setprecision(2) << hr << units[u] << "H/s";
+        setcolor(BRIGHT_GREEN); std::cout << std::fixed << std::setprecision(2) << current_hr << units[current_u] << "H/s";
+        setcolor(BRIGHT_WHITE); std::cout << " (";
+        setcolor(GREEN); std::cout << std::fixed << std::setprecision(2) << hr << units[u] << "H/s avg";
+        setcolor(BRIGHT_WHITE); std::cout << ") | ";
+        setcolor(BLUE); std::cout << "Height:" << ourHeight;
         setcolor(BRIGHT_WHITE); std::cout << " | ";
-        setcolor(CYAN); std::cout << "MB:" << accepted;
-        setcolor(BRIGHT_WHITE); std::cout << " ";
-        setcolor(GREEN); std::cout << "IB:" << blockCounter;
-        setcolor(BRIGHT_WHITE); std::cout << " ";
+        setcolor(CYAN); std::cout << "Miniblocks:" << accepted;
+        setcolor(BRIGHT_WHITE); std::cout << " | ";
+        setcolor(GREEN); std::cout << "Blocks:" << blockCounter;
+        setcolor(BRIGHT_WHITE); std::cout << " | ";
         if (rejected > 0) setcolor(BRIGHT_RED); else setcolor(WHITE);
         std::cout << "REJ:" << rejected;
         setcolor(BRIGHT_WHITE); std::cout << " | ";
         setcolor(MAGENTA); std::cout << "Diff:" << diff;
-        setcolor(BRIGHT_WHITE); std::cout << " | ";
-        setcolor(BLUE); std::cout << "#" << ourHeight;
         setcolor(BRIGHT_WHITE); std::cout << " | ";
         setcolor(WHITE); printf("%02d:%02d:%02d", (int)(t/3600), (int)(t%3600/60), (int)(t%60));
         if (duty < 100) {
@@ -220,10 +227,12 @@ int update_handler(const boost::system::error_code& error) {
             last_lookup_telemetry_sec = t;
         }
 
-        static int64_t last_phase_telemetry_sec = -15;
+        static int64_t last_phase_telemetry_sec = -5;
         static AstroPhaseTelemetrySnapshot last_phase_snapshot{};
-        if (isPhaseTelemetryEnabled() && (t - last_phase_telemetry_sec >= 15)) {
+        static Sha256OverrideTelemetrySnapshot last_sha_snapshot{};
+        if (isPhaseTelemetryEnabled() && (t - last_phase_telemetry_sec >= 5)) {
             const AstroPhaseTelemetrySnapshot current = getPhaseTelemetrySnapshot();
+            const Sha256OverrideTelemetrySnapshot current_sha = getSha256OverrideTelemetrySnapshot();
             auto delta = [](uint64_t cur, uint64_t prev) -> uint64_t {
                 return (cur >= prev) ? (cur - prev) : cur;
             };
@@ -265,8 +274,30 @@ int update_handler(const boost::system::error_code& error) {
             window.sa_collision_ns = delta(current.sa_collision_ns, last_phase_snapshot.sa_collision_ns);
             window.sa_copy_ns = delta(current.sa_copy_ns, last_phase_snapshot.sa_copy_ns);
 
-            if (window.hashes > 0) {
-                const double denom = static_cast<double>(window.hashes) * 1000.0;
+            Sha256OverrideTelemetrySnapshot window_sha{};
+            window_sha.init_calls = delta(current_sha.init_calls, last_sha_snapshot.init_calls);
+            window_sha.update_calls = delta(current_sha.update_calls, last_sha_snapshot.update_calls);
+            window_sha.final_calls = delta(current_sha.final_calls, last_sha_snapshot.final_calls);
+            window_sha.update_bytes = delta(current_sha.update_bytes, last_sha_snapshot.update_bytes);
+            window_sha.update_ns = delta(current_sha.update_ns, last_sha_snapshot.update_ns);
+            window_sha.final_ns = delta(current_sha.final_ns, last_sha_snapshot.final_ns);
+            window_sha.final_zeroize_ns = delta(current_sha.final_zeroize_ns, last_sha_snapshot.final_zeroize_ns);
+            window_sha.update_len_le32_calls = delta(current_sha.update_len_le32_calls, last_sha_snapshot.update_len_le32_calls);
+            window_sha.update_len_33_48_calls = delta(current_sha.update_len_33_48_calls, last_sha_snapshot.update_len_33_48_calls);
+            window_sha.update_len_49_64_calls = delta(current_sha.update_len_49_64_calls, last_sha_snapshot.update_len_49_64_calls);
+            window_sha.update_len_65_128_calls = delta(current_sha.update_len_65_128_calls, last_sha_snapshot.update_len_65_128_calls);
+            window_sha.update_len_129_512_calls = delta(current_sha.update_len_129_512_calls, last_sha_snapshot.update_len_129_512_calls);
+            window_sha.update_len_gt512_calls = delta(current_sha.update_len_gt512_calls, last_sha_snapshot.update_len_gt512_calls);
+            window_sha.update_flush_blocks = delta(current_sha.update_flush_blocks, last_sha_snapshot.update_flush_blocks);
+            window_sha.update_direct_blocks = delta(current_sha.update_direct_blocks, last_sha_snapshot.update_direct_blocks);
+            window_sha.pair_attempt_calls = delta(current_sha.pair_attempt_calls, last_sha_snapshot.pair_attempt_calls);
+            window_sha.pair_success_calls = delta(current_sha.pair_success_calls, last_sha_snapshot.pair_success_calls);
+            window_sha.pair_fallback_calls = delta(current_sha.pair_fallback_calls, last_sha_snapshot.pair_fallback_calls);
+            window_sha.pair_blocks = delta(current_sha.pair_blocks, last_sha_snapshot.pair_blocks);
+            window_sha.final_blocks = delta(current_sha.final_blocks, last_sha_snapshot.final_blocks);
+
+            // if (window.hashes > 0) {
+                const double denom = static_cast<double>(std::max<uint64_t>(1, window.hashes)) * 1000.0;
                 const double prep_us = static_cast<double>(window.prep_ns) / denom;
                 const double wolf_us = static_cast<double>(window.wolf_ns) / denom;
                 const double spsa_us = static_cast<double>(window.spsa_call_ns) / denom;
@@ -280,7 +311,7 @@ int update_handler(const boost::system::error_code& error) {
                 const double hit_rate = (total_spsa > 0)
                     ? (100.0 * static_cast<double>(window.spsa_hits) / static_cast<double>(total_spsa))
                     : 0.0;
-                const double avg_data_len = static_cast<double>(window.data_len_sum) / static_cast<double>(window.hashes);
+                const double avg_data_len = (window.hashes > 0) ? (static_cast<double>(window.data_len_sum) / static_cast<double>(window.hashes)) : 0.0;
                 const double sa_encode_us = static_cast<double>(window.sa_encode_ns) / denom;
                 const double sa_radix_us = static_cast<double>(window.sa_radix_ns) / denom;
                 const double sa_collision_us = static_cast<double>(window.sa_collision_ns) / denom;
@@ -375,9 +406,57 @@ int update_handler(const boost::system::error_code& error) {
                               << " rc4_span=" << std::fixed << std::setprecision(2) << avg_span(window.spsa_op_family_rc4_bytes, window.spsa_op_family_rc4_calls)
                               << std::flush;
                 }
-            }
+
+                if (window_sha.update_calls > 0 || window_sha.final_calls > 0) {
+                    const double update_avg_ns = (window_sha.update_calls > 0)
+                        ? (static_cast<double>(window_sha.update_ns) / static_cast<double>(window_sha.update_calls))
+                        : 0.0;
+                    const double final_avg_ns = (window_sha.final_calls > 0)
+                        ? (static_cast<double>(window_sha.final_ns) / static_cast<double>(window_sha.final_calls))
+                        : 0.0;
+                    const uint64_t update_len_total =
+                        window_sha.update_len_le32_calls +
+                        window_sha.update_len_33_48_calls +
+                        window_sha.update_len_49_64_calls +
+                        window_sha.update_len_65_128_calls +
+                        window_sha.update_len_129_512_calls +
+                        window_sha.update_len_gt512_calls;
+                    auto pct_u = [update_len_total](uint64_t count) -> double {
+                        return (update_len_total > 0)
+                            ? (100.0 * static_cast<double>(count) / static_cast<double>(update_len_total))
+                            : 0.0;
+                    };
+                    const double zeroize_pct = (window_sha.final_calls > 0 && window_sha.final_zeroize_ns > 0) ? 100.0 : 0.0;
+                    const double pair_hit_pct = (window_sha.pair_attempt_calls > 0)
+                        ? (100.0 * static_cast<double>(window_sha.pair_success_calls) / static_cast<double>(window_sha.pair_attempt_calls))
+                        : 0.0;
+
+                    std::cout << "\n";
+                    setcolor(BRIGHT_YELLOW); std::cout << "[SPSA-SHA] ";
+                    setcolor(BRIGHT_WHITE);
+                    std::cout << "upd_calls=" << window_sha.update_calls
+                              << " upd_avg_ns=" << std::fixed << std::setprecision(2) << update_avg_ns
+                              << " fin_calls=" << window_sha.final_calls
+                              << " fin_avg_ns=" << std::fixed << std::setprecision(2) << final_avg_ns
+                              << " z_pct=" << std::fixed << std::setprecision(1) << zeroize_pct
+                              << " u_le32=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_le32_calls) << "%"
+                              << " u_33_48=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_33_48_calls) << "%"
+                              << " u_49_64=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_49_64_calls) << "%"
+                              << " u_65_128=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_65_128_calls) << "%"
+                              << " u_129_512=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_129_512_calls) << "%"
+                              << " u_513p=" << std::fixed << std::setprecision(1) << pct_u(window_sha.update_len_gt512_calls) << "%"
+                              << " blk_flush=" << window_sha.update_flush_blocks
+                              << " blk_dir=" << window_sha.update_direct_blocks
+                              << " pair_hit=" << std::fixed << std::setprecision(1) << pair_hit_pct << "%"
+                              << " pair_fb=" << window_sha.pair_fallback_calls
+                              << " pair_blk=" << window_sha.pair_blocks
+                              << " blk_fin=" << window_sha.final_blocks
+                              << std::flush;
+                }
+            // }
 
             last_phase_snapshot = current;
+            last_sha_snapshot = current_sha;
             last_phase_telemetry_sec = t;
         }
 

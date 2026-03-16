@@ -1,4 +1,5 @@
 #include "lookupcompute.h"
+#include "lookup_tables.hpp"
 #include "dirtybird-hugepages.hpp"
 
 #include <lookup.h>
@@ -13,7 +14,11 @@
 uint8_t g_reg_idx[256] = {0};
 uint8_t g_branched_idx[256] = {0};
 uint8_t g_is_branched[256] = {0};
+std::bitset<256> g_unchanged_bytes[kLookupRegOpsSize];
+std::bitset<256> g_clipped_bytes[kLookupRegOpsSize];
 bool g_lookup_tables_initialized = false;
+bool g_lookup_1d_initialized = false;
+bool g_lookup_3d_initialized = false;
 
 // Generate lookup tables for values computed formerly by branchedCompute
 

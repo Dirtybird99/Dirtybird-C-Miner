@@ -8,6 +8,8 @@
 #include <openssl/rc4.h>
 #include "crypto/astrobwtv3/astrobwtv3.h"
 
+bool printHugepagesError = false;
+
 void print_hex(const char* label, const uint8_t* data, size_t len) {
     printf("%s: ", label);
     for (size_t i = 0; i < len && i < 32; i++) {

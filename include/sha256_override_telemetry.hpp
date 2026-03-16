@@ -18,6 +18,10 @@ struct Sha256OverrideTelemetrySnapshot {
   uint64_t update_len_gt512_calls;
   uint64_t update_flush_blocks;
   uint64_t update_direct_blocks;
+  uint64_t pair_attempt_calls;
+  uint64_t pair_success_calls;
+  uint64_t pair_fallback_calls;
+  uint64_t pair_blocks;
   uint64_t final_blocks;
 };
 

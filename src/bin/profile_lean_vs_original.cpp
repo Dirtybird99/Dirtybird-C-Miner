@@ -25,6 +25,7 @@ extern "C" {
 // SPSA stub
 bool SPSA(const uint8_t*, int, workerData&) { return false; }
 bool g_use_spsa = false;
+int g_spsa_max_data_len = 0;
 bool g_verbose_tune = false;
 int numAstroFuncs = 0;
 void* allAstroFuncs = nullptr;

@@ -13,6 +13,7 @@
 #include <astrobwtv3/lookupcompute.h>
 #include <astrobwtv3/interleaved_miner.hpp>
 #include <dirtybird-hugepages.hpp>
+#include <thermal_governor.hpp>
 
 #include <array>
 #include <atomic>
@@ -42,20 +43,39 @@ static inline void write_nonce_be(byte* WORK, uint32_t N) {
  * This hides memory latency by working on hash B while hash A's memory
  * requests are in flight.
  */
+// External P-core globals (defined in miner.cpp)
+#ifdef _WIN32
+extern bool g_pcores_only;
+extern bool g_no_per_thread_affinity;
+extern int g_pcore_count;
+extern std::vector<uint32_t> g_pcore_logical_ids;
+#endif
+
 void mineDero_Interleaved(int tid) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dist(0, 255);
 
+#ifdef _WIN32
+    // P-core affinity enforcement
+    if (!g_no_per_thread_affinity && g_pcores_only && tid > 0 && static_cast<size_t>(tid - 1) < g_pcore_logical_ids.size()) {
+        DWORD targetCore = g_pcore_logical_ids[tid - 1];
+        DWORD_PTR mask = 1ULL << targetCore;
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+#endif
+
     // Per-thread interleaved miner
     thread_local InterleavedMiner* miner = nullptr;
     thread_local uint64_t localCount = 0;
+    thread_local uint64_t paceCount = 0;   // Thermal governor pace counter
 
     // Per-thread mining buffers - two work buffers for interleaved processing
     thread_local std::array<byte, MINIBLOCK_SIZE> work_a;
     thread_local std::array<byte, MINIBLOCK_SIZE> work_b;
     thread_local std::array<byte, 32> powHash_a;
     thread_local std::array<byte, 32> powHash_b;
+    thread_local byte target32[32];
 
     if (!miner) {
         miner = new InterleavedMiner();
@@ -124,6 +144,7 @@ waitForJob:
             }
 
             cmpDiff = ConvertDifficultyToBig(diffSnapshot, ALGO_ASTROBWTV3);
+            NumToTarget32(cmpDiff, target32);
 
             localJobCounter = snapshotCounter;
             uint32_t nonce = 0;
@@ -151,68 +172,83 @@ waitForJob:
                     work_a.data(), MINIBLOCK_SIZE,
                     work_b.data(), MINIBLOCK_SIZE,
                     powHash_a.data(), powHash_b.data(),
-                    false // useLookup (dead param - astroCompFunc controls compute variant)
+                    false // useLookup
                 );
+
+                // Light micro-cooling: single pause reduces core heat slightly
+                #if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+                #endif
 
                 // Update hash count (2 hashes per iteration)
                 localCount += 2;
                 if (localCount >= 512) {
-                    counter.fetch_add(localCount);
+                    counter.fetch_add(localCount, std::memory_order_relaxed);
                     localCount = 0;
                 }
 
                 // Check hash A
-                if (CheckHash(powHash_a.data(), cmpDiff, ALGO_ASTROBWTV3)) {
-                    bool submit = !submitting;
-                    if (!submit) {
-                        for (;;) {
-                            submit = !submitting;
-                            if (submit || localJobCounter != jobCounter) break;
+                if (CheckHashBytes(powHash_a.data(), target32)) {
+                    bool submitted = false;
+                    while (!submitted) {
+                        if (localJobCounter != jobCounter) break;
+
+                        {
+                            std::scoped_lock<boost::mutex> submitLock(mutex);
+                            if (localJobCounter != jobCounter) break;
+                            if (!submitting) {
+                                submitting = true;
+                                setcolor(BRIGHT_YELLOW);
+                                std::cout << "\nThread " << tid << " found a nonce! (hash A)\n" << std::flush;
+                                setcolor(BRIGHT_WHITE);
+                                share = {
+                                    {"jobid",    myJob.at("jobid").as_string().c_str()},
+                                    {"mbl_blob", hexStr(work_a.data(), MINIBLOCK_SIZE).c_str()}
+                                };
+                                data_ready = true;
+                                submitted = true;
+                            }
+                        }
+
+                        if (!submitted) {
                             boost::this_thread::yield();
                         }
                     }
-                    if (localJobCounter != jobCounter) break;
 
-                    {
-                        std::scoped_lock<boost::mutex> submitLock(mutex);
-                        submitting = true;
-                        setcolor(BRIGHT_YELLOW);
-                        std::cout << "\nThread " << tid << " found a nonce! (hash A)\n" << std::flush;
-                        setcolor(BRIGHT_WHITE);
-                        share = {
-                            {"jobid",    myJob.at("jobid").as_string().c_str()},
-                            {"mbl_blob", hexStr(work_a.data(), MINIBLOCK_SIZE).c_str()}
-                        };
-                        data_ready = true;
-                    }
-                    cv.notify_all();
+                    if (!submitted && localJobCounter != jobCounter) break;
+                    if (submitted) cv.notify_all();
                 }
 
                 // Check hash B
-                if (CheckHash(powHash_b.data(), cmpDiff, ALGO_ASTROBWTV3)) {
-                    bool submit = !submitting;
-                    if (!submit) {
-                        for (;;) {
-                            submit = !submitting;
-                            if (submit || localJobCounter != jobCounter) break;
+                if (CheckHashBytes(powHash_b.data(), target32)) {
+                    bool submitted = false;
+                    while (!submitted) {
+                        if (localJobCounter != jobCounter) break;
+
+                        {
+                            std::scoped_lock<boost::mutex> submitLock(mutex);
+                            if (localJobCounter != jobCounter) break;
+                            if (!submitting) {
+                                submitting = true;
+                                setcolor(BRIGHT_YELLOW);
+                                std::cout << "\nThread " << tid << " found a nonce! (hash B)\n" << std::flush;
+                                setcolor(BRIGHT_WHITE);
+                                share = {
+                                    {"jobid",    myJob.at("jobid").as_string().c_str()},
+                                    {"mbl_blob", hexStr(work_b.data(), MINIBLOCK_SIZE).c_str()}
+                                };
+                                data_ready = true;
+                                submitted = true;
+                            }
+                        }
+
+                        if (!submitted) {
                             boost::this_thread::yield();
                         }
                     }
-                    if (localJobCounter != jobCounter) break;
 
-                    {
-                        std::scoped_lock<boost::mutex> submitLock(mutex);
-                        submitting = true;
-                        setcolor(BRIGHT_YELLOW);
-                        std::cout << "\nThread " << tid << " found a nonce! (hash B)\n" << std::flush;
-                        setcolor(BRIGHT_WHITE);
-                        share = {
-                            {"jobid",    myJob.at("jobid").as_string().c_str()},
-                            {"mbl_blob", hexStr(work_b.data(), MINIBLOCK_SIZE).c_str()}
-                        };
-                        data_ready = true;
-                    }
-                    cv.notify_all();
+                    if (!submitted && localJobCounter != jobCounter) break;
+                    if (submitted) cv.notify_all();
                 }
 
                 if (!isConnected) break;

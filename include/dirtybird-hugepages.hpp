@@ -2,6 +2,7 @@
 
 #ifdef __cplusplus
 #include <iostream>
+#include <atomic>
 #include <cstdlib>
 #include <string>
 #include <fstream>
@@ -25,11 +26,30 @@ extern bool printHugepagesError;
   #include <cstdlib>
 #endif
 
-#define HUGE_META_PAGE_SIZE (2ULL * 1024 * 1024)
 #define HUGE_PAGE_2MB       (2ULL * 1024 * 1024)
 #define HUGE_PAGE_1GB       (1024ULL * 1024 * 1024)
+#define HUGE_ALLOC_ALIGN    64ULL
+// Keep scarce large pages for hot allocations like workerData and big lookup tables.
+// Smaller allocations still get aligned/pinned memory through the regular fallback path.
+#define DIRTYBIRD_MIN_LARGE_PAGE_ALLOC (1024ULL * 1024)
 
 #define ALIGN_UP(x, a)  ( ((x) + (a) - 1) & ~((size_t)((a) - 1)) )
+
+struct alignas(64) HugeAllocHeader {
+  void* raw_ptr;
+  size_t alloc_size;
+  size_t requested_size;
+  uint32_t page_type;
+  uint32_t flags;
+  uint64_t reserved;
+};
+
+static_assert(sizeof(HugeAllocHeader) == HUGE_ALLOC_ALIGN,
+              "HugeAllocHeader must remain one cache line");
+
+enum DirtybirdHugeAllocFlags : uint32_t {
+  DIRTYBIRD_ALLOC_FLAG_VIRTUAL_LOCKED = 1u << 0
+};
 
 struct HugePagesInfo {
   size_t page_size_2mb = 0;
@@ -141,21 +161,29 @@ inline std::string GetLastErrorAsString()
 
 inline void* malloc_huge_pages(size_t size)
 {
-    size_t requested = size + HUGE_META_PAGE_SIZE;
+    constexpr size_t header_size = sizeof(HugeAllocHeader);
+    size_t requested = size + header_size + (HUGE_ALLOC_ALIGN - 1);
     char*  ptr       = nullptr;
     size_t real_size = 0;
+    DirtybirdPageType page_type = DIRTYBIRD_PAGE_REGULAR;
+    uint32_t flags = 0;
+    const bool try_large_pages = (requested >= DIRTYBIRD_MIN_LARGE_PAGE_ALLOC);
 
 #if defined(_WIN32)
 
     SIZE_T large_page_size = GetLargePageMinimum();
-    if (large_page_size != 0) {
-        HANDLE hToken;
-        if (OpenProcessToken(GetCurrentProcess(),
-                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                             &hToken))
-        {
-            SetPrivilege(hToken, TEXT("SeLockMemoryPrivilege"), TRUE);
-            CloseHandle(hToken);
+    if (try_large_pages && large_page_size != 0) {
+        static bool lock_pages_attempted = false;
+        if (!lock_pages_attempted) {
+            lock_pages_attempted = true;
+            HANDLE hToken;
+            if (OpenProcessToken(GetCurrentProcess(),
+                                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                 &hToken))
+            {
+                SetPrivilege(hToken, TEXT("SeLockMemoryPrivilege"), TRUE);
+                CloseHandle(hToken);
+            }
         }
 
         real_size = ALIGN_UP(requested, large_page_size);
@@ -166,13 +194,20 @@ inline void* malloc_huge_pages(size_t size)
             MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
             PAGE_READWRITE
         );
+        if (ptr != NULL) {
+            page_type = DIRTYBIRD_PAGE_2MB;
+        }
     }
 
     if (ptr == NULL) {
         // Large pages failed; fallback to normal VirtualAlloc or malloc
-        if (printHugepagesError) {
+        static std::atomic<bool> large_page_warning_emitted{false};
+        if (try_large_pages && printHugepagesError &&
+            !large_page_warning_emitted.exchange(true, std::memory_order_relaxed)) {
 #ifdef __cplusplus
-            std::cerr << GetLastErrorAsString() << std::endl;
+            std::cerr << "Large-page allocation failed for " << requested
+                      << " bytes; falling back to regular pages. "
+                      << GetLastErrorAsString() << std::endl;
 #endif
             printHugepagesError = false;
         }
@@ -188,6 +223,28 @@ inline void* malloc_huge_pages(size_t size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
+
+        if (ptr != NULL) {
+            // Pin the memory using VirtualLock (DeroLuna-style optimization).
+            // This prevents the OS from paging out mining data even without huge pages.
+            // Note: May require increasing working set size via SetProcessWorkingSetSize.
+            if (!VirtualLock(ptr, real_size)) {
+                // If it fails, try to increase the working set size once and retry.
+                static bool working_set_increased = false;
+                if (!working_set_increased) {
+                    SIZE_T min_ws, max_ws;
+                    if (GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws, &max_ws)) {
+                        SetProcessWorkingSetSize(GetCurrentProcess(), min_ws + real_size, max_ws + real_size);
+                        working_set_increased = true;
+                        if (VirtualLock(ptr, real_size)) {
+                            flags |= DIRTYBIRD_ALLOC_FLAG_VIRTUAL_LOCKED;
+                        }
+                    }
+                }
+            } else {
+                flags |= DIRTYBIRD_ALLOC_FLAG_VIRTUAL_LOCKED;
+            }
+        }
 
         if (ptr == NULL) {
             // Last resort: malloc
@@ -205,7 +262,7 @@ inline void* malloc_huge_pages(size_t size)
 
 #if !defined(__APPLE__)
     // Attempt 1GB huge pages if request is large enough
-    if (requested >= HUGE_PAGE_1GB) {
+    if (try_large_pages && requested >= HUGE_PAGE_1GB) {
         size_t huge_gran = HUGE_PAGE_1GB;
         real_size = ALIGN_UP(requested, huge_gran);
         mmap_flags |= MAP_HUGETLB | MAP_HUGE_1GB;
@@ -221,6 +278,7 @@ inline void* malloc_huge_pages(size_t size)
 
         if (ptr != MAP_FAILED) {
             use_huge = 1;
+            page_type = DIRTYBIRD_PAGE_1GB;
         } else {
             ptr = nullptr;
             real_size = 0;
@@ -228,7 +286,7 @@ inline void* malloc_huge_pages(size_t size)
         }
     }
 
-    if (!ptr) {
+    if (!ptr && try_large_pages) {
         size_t huge_gran = HUGE_PAGE_2MB;
         real_size = ALIGN_UP(requested, huge_gran);
         mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
@@ -244,6 +302,7 @@ inline void* malloc_huge_pages(size_t size)
 
         if (ptr != MAP_FAILED) {
             use_huge = 1;
+            page_type = DIRTYBIRD_PAGE_2MB;
         } else {
             ptr = nullptr;
             real_size = 0;
@@ -252,7 +311,7 @@ inline void* malloc_huge_pages(size_t size)
 #endif // !__APPLE__
 
     if (!ptr) {
-        if (printHugepagesError) {
+        if (try_large_pages && printHugepagesError) {
 #ifdef __cplusplus
             std::cerr << "failed to allocate hugepages... using regular malloc"
                       << std::endl;
@@ -260,7 +319,7 @@ inline void* malloc_huge_pages(size_t size)
             printHugepagesError = false;
         }
 
-        real_size = ALIGN_UP(requested, HUGE_META_PAGE_SIZE);
+        real_size = requested;
         ptr = (char*)std::malloc(real_size);
         if (ptr == NULL) return NULL;
         real_size = 0;
@@ -268,21 +327,33 @@ inline void* malloc_huge_pages(size_t size)
 
 #endif // _WIN32 / POSIX
 
-    *((size_t*)ptr) = real_size;
+    uintptr_t user_addr = ALIGN_UP(reinterpret_cast<uintptr_t>(ptr) + header_size, HUGE_ALLOC_ALIGN);
+    auto* header = reinterpret_cast<HugeAllocHeader*>(user_addr - header_size);
+    header->raw_ptr = ptr;
+    header->alloc_size = real_size;
+    header->requested_size = size;
+    header->page_type = static_cast<uint32_t>(page_type);
+    header->flags = flags;
+    header->reserved = 0;
 
-    return ptr + HUGE_META_PAGE_SIZE;
+    return reinterpret_cast<void*>(user_addr);
 }
 
 inline void free_huge_pages(void* ptr)
 {
     if (ptr == NULL) return;
 
-    void* real_ptr = (char*)ptr - HUGE_META_PAGE_SIZE;
-
-    size_t real_size = *((size_t*)real_ptr);
+    constexpr size_t header_size = sizeof(HugeAllocHeader);
+    auto* header = reinterpret_cast<HugeAllocHeader*>(
+        reinterpret_cast<char*>(ptr) - header_size);
+    void* real_ptr = header->raw_ptr;
+    size_t real_size = header->alloc_size;
 
     if (real_size != 0) {
 #if defined(_WIN32)
+        if ((header->flags & DIRTYBIRD_ALLOC_FLAG_VIRTUAL_LOCKED) != 0) {
+            VirtualUnlock(real_ptr, real_size);
+        }
         VirtualFree(real_ptr, 0, MEM_RELEASE);
 #else
         munmap(real_ptr, real_size);
@@ -290,6 +361,36 @@ inline void free_huge_pages(void* ptr)
     } else {
         std::free(real_ptr);
     }
+}
+
+inline DirtybirdPageType get_huge_alloc_page_type(const void* ptr)
+{
+    if (ptr == NULL) return DIRTYBIRD_PAGE_REGULAR;
+
+    constexpr size_t header_size = sizeof(HugeAllocHeader);
+    const auto* header = reinterpret_cast<const HugeAllocHeader*>(
+        reinterpret_cast<const char*>(ptr) - header_size);
+    return static_cast<DirtybirdPageType>(header->page_type);
+}
+
+inline bool is_huge_alloc_virtual_locked(const void* ptr)
+{
+    if (ptr == NULL) return false;
+
+    constexpr size_t header_size = sizeof(HugeAllocHeader);
+    const auto* header = reinterpret_cast<const HugeAllocHeader*>(
+        reinterpret_cast<const char*>(ptr) - header_size);
+    return (header->flags & DIRTYBIRD_ALLOC_FLAG_VIRTUAL_LOCKED) != 0;
+}
+
+inline size_t get_huge_alloc_requested_size(const void* ptr)
+{
+    if (ptr == NULL) return 0;
+
+    constexpr size_t header_size = sizeof(HugeAllocHeader);
+    const auto* header = reinterpret_cast<const HugeAllocHeader*>(
+        reinterpret_cast<const char*>(ptr) - header_size);
+    return header->requested_size;
 }
 
 inline HugePagesInfo getHugePagesInfo() {

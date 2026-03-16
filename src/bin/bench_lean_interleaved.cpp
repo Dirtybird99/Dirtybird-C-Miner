@@ -30,10 +30,25 @@ bool SPSA(const uint8_t*, int, workerData&) { return false; }
 
 // Global stubs
 bool g_use_spsa = false;
+bool g_use_local_spsa = false;
+bool g_spsa_stamp_fast = true;
+bool g_spsa_decode_bases = false;
+int g_spsa_bucket_prefetch = 0;
+int g_spsa_max_data_len = 0;
+bool g_spsa_hit_counters = false;
+bool g_spsa_sha_profile = false;
+bool g_spsa_sha_pair = false;
+bool g_spsa_sha_zeroize = false;
 bool g_verbose_tune = false;
-int numAstroFuncs = 0;
-void* allAstroFuncs = nullptr;
+bool useLookupMine = false;
+bool lookupMine = false;
+uint8_t* lookup1D_global = nullptr;
+unsigned char* lookup3D_global = nullptr;
+int g_lookup_smart_threshold = 12;
+bool g_lookup_smart_telemetry = false;
 bool printHugepagesError = false;
+void* allAstroFuncs = nullptr;
+size_t numAstroFuncs = 0;
 
 // Get current process memory usage
 void get_memory_usage(size_t& working_set, size_t& private_bytes) {

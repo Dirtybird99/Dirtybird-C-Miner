@@ -21,7 +21,7 @@
 #include "astrotest.hpp"
 #include "memory_optimized.hpp"
 #include "derobwt.hpp"
-// #include "branched_AVX2.h"
+#include "branched_AVX2.h"
 
 #include <unordered_map>
 #include <array>
@@ -54,6 +54,7 @@
 #endif
 
 LookupMode g_lookup_mode = LOOKUP_MODE_3D;
+extern bool useLookupMine;
 
 #if defined(USE_ASTRO_SPSA)
   #include "spsa.hpp"
@@ -136,12 +137,12 @@ LookupMode g_lookup_mode = LOOKUP_MODE_3D;
     #define SPSA_LOG_STATS() log_spsa_stats()
   #else
     // No-op macros when stats are disabled for maximum performance
-    static bool spsa_banner_printed = false;
+    static std::atomic<bool> spsa_banner_printed{false};
     static inline void print_spsa_banner_once() {
-      if (!spsa_banner_printed) {
+      bool expected = false;
+      if (spsa_banner_printed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         printf("\n*** SPSA ENABLED - Using Stamped Permutation Suffix Array ***\n");
         fflush(stdout);
-        spsa_banner_printed = true;
       }
     }
     #define SPSA_HIT() do { \
@@ -312,6 +313,7 @@ extern "C"
 #include <hex.h>
 #include <openssl/rc4.h>
 #include "rc4_avx512.hpp"
+#include "spsa_state.hpp"
 
 #include <fstream>
 
@@ -1188,7 +1190,7 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
     // auto end = std::chrono::steady_clock::now();
 
     /*
-    if (lookupMine) {
+    if (useLookupMine) {
       // start = std::chrono::steady_clock::now();
       lookupCompute(worker, false);
       // end = std::chrono::steady_clock::now();
@@ -1234,7 +1236,7 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
     // syncTag.wait(syncTarget);
 
     // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end-start);
-    // if (!lookupMine) printf("AVX2: ");
+    // if (!useLookupMine) printf("AVX2: ");
     // else printf("Lookup: ");
     // printf("branched section took %dns\n", time.count());
     // if (debugOpOrder) {
@@ -1269,14 +1271,14 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
       #if defined(USE_ASTRO_SPSA)
         if (g_use_spsa) SPSA_LOG_ENABLED();
         prefetchSpsaBucketArrays(worker);
-        if(g_use_spsa && SPSA(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker)) {
+        if(shouldUseSpsaForDataLen(worker.data_len) && SPSA(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker)) {
           SPSA_HIT();
           memcpy(outputhash, worker.padding, 32);
         } else {
           SPSA_MISS();
-          #if USE_DEROBWT
+          #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
           derobwt::compute_sa_threadsafe(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker.sa);
-          #else
+      #else
           int32_t *bucketA = nullptr;
           int32_t *bucketB = nullptr;
           getSABucketScratch(worker, bucketA, bucketB);
@@ -1287,7 +1289,7 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
         }
         SPSA_LOG_STATS();
       #else
-        #if USE_DEROBWT
+        #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
           derobwt::compute_sa_threadsafe(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker.sa);
         #else
           int32_t *bucketA = nullptr;
@@ -1401,7 +1403,8 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
     auto t0 = std::chrono::steady_clock::now();
 #endif
 
-    uint8_t scratch[384] = {0};
+    alignas(32) uint8_t scratch[384] = {0};
+    memset(worker.sData, 0, ASTRO_SCRATCH_SIZE);
 
     hashSHA256(worker.sha256, input, &scratch[320], inputLen);
 #if USE_SIMD_SALSA20
@@ -1452,7 +1455,7 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
     // auto end = std::chrono::steady_clock::now();
 
     /*
-    if (lookupMine) {
+    if (useLookupMine) {
       // start = std::chrono::steady_clock::now();
       lookupCompute(worker, false);
       // end = std::chrono::steady_clock::now();
@@ -1482,7 +1485,7 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
 #endif
 
     // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end-start);
-    // if (!lookupMine) printf("AVX2: ");
+    // if (!useLookupMine) printf("AVX2: ");
     // else printf("Lookup: ");
     // printf("branched section took %dns\n", time.count());
     // if (debugOpOrder) {
@@ -1508,7 +1511,7 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
     // auto start = std::chrono::steady_clock::now();
     // divsufsort(worker.sData, worker.sa, worker.data_len, worker.bA, worker.bB);
     #if defined(USE_ASTRO_SPSA)
-      if (g_use_spsa) {
+      if (shouldUseSpsaForDataLen(worker.data_len)) {
         SPSA_LOG_ENABLED();
         if (phaseTelemetry) {
           const uint64_t prefetch_start_ns = phase_now_ns();
@@ -1522,22 +1525,44 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
           phase_spsa_start_ns = phase_now_ns();
         }
         // TNN-style direct SPSA path: SPSA prepares SA and may also compute final SHA.
-        bool alreadySha = SPSA(worker.sData, worker.data_len, worker);
+        bool alreadySha = false;
+        if (g_use_local_spsa) {
+          alreadySha = spsa::SPSA_Integrated(worker.sData, worker.data_len, worker, outputhash);
+        } else {
+          alreadySha = SPSA(worker.sData, worker.data_len, worker);
+          if (alreadySha) {
+            SPSA_HIT();
+            uint64_t phase_hit_copy_start_ns = 0;
+            if (phaseTelemetry) {
+              phase_hit_copy_start_ns = phase_now_ns();
+            }
+            memcpy(outputhash, worker.padding, 32);
+            if (phaseTelemetry) {
+              phase_spsa_hit_copy_ns += (phase_now_ns() - phase_hit_copy_start_ns);
+            }
+          }
+        }
+
         if (phaseTelemetry) {
           phase_spsa_ns += (phase_now_ns() - phase_spsa_start_ns);
         }
+        
         if (alreadySha) {
-          SPSA_HIT();
-          uint64_t phase_hit_copy_start_ns = 0;
-          if (phaseTelemetry) {
-            phase_hit_copy_start_ns = phase_now_ns();
-          }
-          memcpy(outputhash, worker.padding, 32);
-          if (phaseTelemetry) {
-            phase_spsa_hit_copy_ns += (phase_now_ns() - phase_hit_copy_start_ns);
+          if (!g_use_local_spsa) {
+            // Already handled above for library path
+          } else {
+            SPSA_HIT();
           }
         } else {
           SPSA_MISS();
+          if (g_verbose_tune) {
+            printf("AstroBWTv3: SPSA fallback!\n");
+          }
+          if (g_use_local_spsa) {
+            int32_t *bucketA = nullptr, *bucketB = nullptr;
+            getSABucketScratch(worker, bucketA, bucketB);
+            SA_FUNCTION(worker.sData, worker.sa, worker.data_len, bucketA, bucketB);
+          }
           byte *B = reinterpret_cast<byte *>(worker.sa);
           uint64_t phase_hash_start_ns = 0;
           if (phaseTelemetry) {
@@ -1565,7 +1590,7 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
         // Zero padding after data for deterministic radix sort reads near end
         memset(worker.sData + worker.data_len, 0, 16);
       #endif
-      #if USE_DEROBWT
+      #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
         // DeroBWT: Custom tiered fingerprint sorting for AstroBWTv3
         derobwt::compute_sa_threadsafe(worker.sData, worker.data_len, worker.sa);
       #else
@@ -1576,7 +1601,15 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
         if (phaseTelemetry) {
           phase_sa_start_ns = phase_now_ns();
         }
+        if (g_verbose_tune) {
+          printf("  [Std] Prep phase done, data_len=%u\n", worker.data_len);
+          fflush(stdout);
+        }
         SA_FUNCTION(worker.sData, worker.sa, worker.data_len, bucketA, bucketB);
+        if (g_verbose_tune) {
+          printf("  [Std] SA phase done\n");
+          fflush(stdout);
+        }
         if (phaseTelemetry) {
           phase_sa_ns += (phase_now_ns() - phase_sa_start_ns);
         }
@@ -1593,6 +1626,10 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
         phase_hash_start_ns = phase_now_ns();
       }
       hashSHA256(worker.sha256, B, outputhash, worker.data_len*4);
+      if (g_verbose_tune) {
+        printf("  [Std] Final hash done\n");
+        fflush(stdout);
+      }
       if (phaseTelemetry) {
         phase_hash_ns += (phase_now_ns() - phase_hash_start_ns);
       }

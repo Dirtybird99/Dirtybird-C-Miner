@@ -1,72 +1,73 @@
 #pragma once
-// dluna_radix_sa.h - DeroLuna-style SA backend:
-// 1) 24-bit prefix key extraction (4x unrolled + bswap)
-// 2) Stable 2-pass radix sort (12 bits + 12 bits)
-// 3) Fused collision resolution + SA output (no separate copy phase)
-//
-// This is tuned for AstroBWT random-like data where 24-bit collisions are sparse.
+/**
+ * dluna_radix_sa.h - DeroLuna-style SA backend
+ * 
+ * Exact algorithmic match for DeroLuna v1.14 radix_sort (RVA 0x45cb0):
+ * - 2-pass MSD radix sort
+ * - 12-bit radix (4096-entry buckets)
+ * - bswap for lexicographical order in 32-bit keys
+ * - Fused collision detection + introsort fallback
+ */
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 bool isPhaseTelemetryEnabled();
 void addSABreakdownTelemetry(uint64_t encode_ns, uint64_t radix_ns, uint64_t collision_ns, uint64_t copy_ns);
 
 namespace dluna_radix_sa {
 
-static constexpr uint32_t RADIX_BITS = 12;
-static constexpr uint32_t RADIX_SIZE = 1u << RADIX_BITS;  // 4096
-static constexpr uint32_t RADIX_MASK = RADIX_SIZE - 1u;
 static constexpr int32_t RADIX_MAX_N = (277 * 256) + 1;
+static constexpr uint32_t RADIX_BITS = 12;
+static constexpr uint32_t RADIX_SIZE = 1u << RADIX_BITS; 
+static constexpr uint32_t RADIX_MASK = RADIX_SIZE - 1u;
 
-// Compare suffixes lexicographically for collision buckets.
-// Skips first 3 bytes (already matched by 24-bit radix key).
+struct SortRecord {
+    uint32_t key;
+    uint32_t pos;
+};
+
 static inline bool suffix_less(const uint8_t* T, int32_t n, int32_t a, int32_t b) {
     if (a == b) return false;
-
-    int32_t pa = a + 3;
-    int32_t pb = b + 3;
-
-    while ((pa + 8) <= n && (pb + 8) <= n) {
-        uint64_t va = 0;
-        uint64_t vb = 0;
-        std::memcpy(&va, T + pa, sizeof(uint64_t));
-        std::memcpy(&vb, T + pb, sizeof(uint64_t));
-        if (va != vb) {
+    int32_t pa = a;
+    int32_t pb = b;
+    
+#if defined(__AVX2__)
+    while ((pa + 32) <= n && (pb + 32) <= n) {
+        __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(T + pa));
+        __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(T + pb));
+        __m256i eq = _mm256_cmpeq_epi8(va, vb);
+        unsigned int mask = (unsigned int)_mm256_movemask_epi8(eq);
+        if (mask != 0xFFFFFFFFu) {
 #if defined(_MSC_VER)
-            va = _byteswap_uint64(va);
-            vb = _byteswap_uint64(vb);
+            unsigned long pos; _BitScanForward(&pos, ~mask);
 #else
-            va = __builtin_bswap64(va);
-            vb = __builtin_bswap64(vb);
+            unsigned int pos = __builtin_ctz(~mask);
 #endif
-            return va < vb;
+            return T[pa + pos] < T[pb + pos];
         }
-        pa += 8;
-        pb += 8;
+        pa += 32; pb += 32;
     }
+#endif
 
     while (pa < n && pb < n) {
         if (T[pa] != T[pb]) return T[pa] < T[pb];
-        ++pa;
-        ++pb;
+        ++pa; ++pb;
     }
-
-    // Shorter suffix is lexicographically smaller if one is a prefix of the other.
     return (n - a) < (n - b);
 }
 
-// API-compatible with divsufsort/libsais wrappers.
 static inline int radix_sort_sa(const uint8_t* T, int32_t* SA, int32_t n,
                                 int* /*bucket_A*/ = nullptr, int* /*bucket_B*/ = nullptr) {
     if (T == nullptr || SA == nullptr || n < 0) return -1;
     if (n == 0) return 0;
-    if (n == 1) {
-        SA[0] = 0;
-        return 0;
-    }
+    if (n == 1) { SA[0] = 0; return 0; }
     if (n > RADIX_MAX_N) return -1;
 
     const bool phase_telemetry = isPhaseTelemetryEnabled();
@@ -74,177 +75,88 @@ static inline int radix_sort_sa(const uint8_t* T, int32_t* SA, int32_t n,
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     };
-    uint64_t encode_ns = 0;
-    uint64_t radix_ns = 0;
-    uint64_t collision_ns = 0;
-    uint64_t copy_ns = 0;  // always 0: copy is fused into collision phase
+    uint64_t encode_ns = 0, radix_ns = 0, collision_ns = 0, copy_ns = 0;
 
-    // Pack each suffix as:
-    // upper 32 bits = 24-bit key, lower 32 bits = position
-    // Fixed thread-local arrays avoid per-hash size checks and heap-backed vector growth.
-    // Cache-line aligned for optimal memory access patterns.
-    alignas(64) thread_local uint64_t records[RADIX_MAX_N];
-    alignas(64) thread_local uint64_t temp_records[RADIX_MAX_N];
+    alignas(64) thread_local SortRecord records[RADIX_MAX_N];
+    alignas(64) thread_local SortRecord temp_records[RADIX_MAX_N];
+    alignas(64) thread_local uint32_t bkt1[RADIX_SIZE];
+    alignas(64) thread_local uint32_t bkt2[RADIX_SIZE];
 
-    alignas(64) thread_local uint32_t count_lo[RADIX_SIZE];
-    alignas(64) thread_local uint32_t count_hi[RADIX_SIZE];
-    alignas(64) thread_local uint32_t offs_lo[RADIX_SIZE];
-    alignas(64) thread_local uint32_t offs_hi[RADIX_SIZE];
-    std::memset(count_lo, 0, sizeof(count_lo));
-    std::memset(count_hi, 0, sizeof(count_hi));
+    std::memset(bkt1, 0, sizeof(bkt1));
+    std::memset(bkt2, 0, sizeof(bkt2));
 
-    // ── Phase 1: Encode ─────────────────────────────────────────────────
-    // 4x-unrolled key extraction using bswap for big-endian 3-byte prefix.
-    uint64_t t_encode_start = 0;
-    if (phase_telemetry) {
-        t_encode_start = now_ns();
-    }
+    uint64_t t_start = now_ns();
 
-    // Safe limit: need at least 3 bytes beyond position i for a uint32_t read,
-    // and 4x unroll needs 4 iterations headroom.
-    const int32_t safe_limit = (n >= 3) ? (n - 3) : 0;
-    const int32_t unroll_limit = safe_limit & ~3;  // round down to multiple of 4
-    int32_t i = 0;
-
-    for (; i < unroll_limit; i += 4) {
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(T + i + 128, 0, 1);
-#endif
-        uint32_t k0, k1, k2, k3;
+    // Phase 1: Encode (24-bit key) + Histogram
+    // DeroLuna loads 4 bytes and masks to 24-bit
+    for (int32_t i = 0; i < n; i++) {
+        uint32_t key32 = 0;
+        // Safe load 4 bytes (AstroBWT padding allows this)
+        std::memcpy(&key32, T + i, 4);
 #if defined(_MSC_VER)
-        k0 = _byteswap_ulong(*(const uint32_t*)(T + i))     >> 8;
-        k1 = _byteswap_ulong(*(const uint32_t*)(T + i + 1)) >> 8;
-        k2 = _byteswap_ulong(*(const uint32_t*)(T + i + 2)) >> 8;
-        k3 = _byteswap_ulong(*(const uint32_t*)(T + i + 3)) >> 8;
+        key32 = _byteswap_ulong(key32);
 #else
-        k0 = __builtin_bswap32(*(const uint32_t*)(T + i))     >> 8;
-        k1 = __builtin_bswap32(*(const uint32_t*)(T + i + 1)) >> 8;
-        k2 = __builtin_bswap32(*(const uint32_t*)(T + i + 2)) >> 8;
-        k3 = __builtin_bswap32(*(const uint32_t*)(T + i + 3)) >> 8;
+        key32 = __builtin_bswap32(key32);
 #endif
-        records[i]     = (static_cast<uint64_t>(k0) << 32) | static_cast<uint32_t>(i);
-        records[i + 1] = (static_cast<uint64_t>(k1) << 32) | static_cast<uint32_t>(i + 1);
-        records[i + 2] = (static_cast<uint64_t>(k2) << 32) | static_cast<uint32_t>(i + 2);
-        records[i + 3] = (static_cast<uint64_t>(k3) << 32) | static_cast<uint32_t>(i + 3);
-
-        count_lo[k0 & RADIX_MASK]++;
-        count_lo[k1 & RADIX_MASK]++;
-        count_lo[k2 & RADIX_MASK]++;
-        count_lo[k3 & RADIX_MASK]++;
-
-        count_hi[(k0 >> RADIX_BITS) & RADIX_MASK]++;
-        count_hi[(k1 >> RADIX_BITS) & RADIX_MASK]++;
-        count_hi[(k2 >> RADIX_BITS) & RADIX_MASK]++;
-        count_hi[(k3 >> RADIX_BITS) & RADIX_MASK]++;
+        uint32_t key24 = key32 >> 8;
+        records[i] = {key24, static_cast<uint32_t>(i)};
+        
+        // DeroLuna's exact bucket extraction:
+        // top12 = key >> 12
+        // mid12 = key & 0xFFF
+        bkt2[key24 >> 12]++;
+        bkt1[key24 & 0xFFF]++;
     }
 
-    // Scalar tail for positions that can still use fast bswap (i < safe_limit)
-    for (; i < safe_limit; ++i) {
-#if defined(_MSC_VER)
-        const uint32_t key24 = _byteswap_ulong(*(const uint32_t*)(T + i)) >> 8;
-#else
-        const uint32_t key24 = __builtin_bswap32(*(const uint32_t*)(T + i)) >> 8;
-#endif
-        records[i] = (static_cast<uint64_t>(key24) << 32) | static_cast<uint32_t>(i);
-        count_lo[key24 & RADIX_MASK]++;
-        count_hi[(key24 >> RADIX_BITS) & RADIX_MASK]++;
+    if (phase_telemetry) encode_ns = now_ns() - t_start;
+    uint64_t t_radix = now_ns();
+
+    // Phase 2: Prefix Sums (Exclusive)
+    uint32_t off1 = 0, off2 = 0;
+    for (uint32_t r = 0; r < RADIX_SIZE; r++) {
+        uint32_t c1 = bkt1[r];
+        uint32_t c2 = bkt2[r];
+        bkt1[r] = off1;
+        bkt2[r] = off2;
+        off1 += c1;
+        off2 += c2;
     }
 
-    // Boundary positions (last 3): safe byte-by-byte extraction
-    for (; i < n; ++i) {
-        const uint32_t b0 = static_cast<uint32_t>(T[i]);
-        const uint32_t b1 = (i + 1 < n) ? static_cast<uint32_t>(T[i + 1]) : 0u;
-        const uint32_t b2 = (i + 2 < n) ? static_cast<uint32_t>(T[i + 2]) : 0u;
-        const uint32_t key24 = (b0 << 16) | (b1 << 8) | b2;
-        records[i] = (static_cast<uint64_t>(key24) << 32) | static_cast<uint32_t>(i);
-        count_lo[key24 & RADIX_MASK]++;
-        count_hi[(key24 >> RADIX_BITS) & RADIX_MASK]++;
+    // Phase 3: 2 Radix Passes
+    // Pass 1: LSB 12 bits (mid12)
+    for (int32_t r = 0; r < n; r++) {
+        temp_records[bkt1[records[r].key & 0xFFF]++] = records[r];
+    }
+    // Pass 2: MSB 12 bits (top12)
+    for (int32_t r = 0; r < n; r++) {
+        records[bkt2[temp_records[r].key >> 12]++] = temp_records[r];
     }
 
-    if (phase_telemetry) {
-        encode_ns = now_ns() - t_encode_start;
-    }
+    if (phase_telemetry) radix_ns = now_ns() - t_radix;
+    uint64_t t_coll = now_ns();
 
-    // ── Prefix sums ─────────────────────────────────────────────────────
-    offs_lo[0] = 0;
-    offs_hi[0] = 0;
-    for (uint32_t b = 1; b < RADIX_SIZE; ++b) {
-        offs_lo[b] = offs_lo[b - 1] + count_lo[b - 1];
-        offs_hi[b] = offs_hi[b - 1] + count_hi[b - 1];
-    }
-
-    // ── Phase 2: Radix sort ─────────────────────────────────────────────
-    uint64_t t_radix_start = 0;
-    if (phase_telemetry) {
-        t_radix_start = now_ns();
-    }
-
-    // Pass 1: stable sort by low 12 bits.
-    for (int32_t r = 0; r < n; ++r) {
-        const uint64_t rec = records[r];
-        const uint32_t bucket = static_cast<uint32_t>((rec >> 32) & RADIX_MASK);
-        temp_records[offs_lo[bucket]++] = rec;
-    }
-
-    // Pass 2: stable sort by high 12 bits.
-    for (int32_t r = 0; r < n; ++r) {
-        const uint64_t rec = temp_records[r];
-        const uint32_t key24 = static_cast<uint32_t>(rec >> 32);
-        const uint32_t bucket = (key24 >> RADIX_BITS) & RADIX_MASK;
-        records[offs_hi[bucket]++] = rec;
-    }
-    if (phase_telemetry) {
-        radix_ns = now_ns() - t_radix_start;
-    }
-
-    // ── Phase 3: Fused collision resolution + SA output ─────────────────
-    // Scans sorted records, resolves same-key collisions in-place,
-    // and writes directly to SA[] — no separate copy phase needed.
+    // Phase 4: Collision Resolution
     int32_t out = 0;
-    i = 0;
-    uint64_t t_collision_start = 0;
-    if (phase_telemetry) {
-        t_collision_start = now_ns();
-    }
-    while (i < n) {
-        const uint32_t key = static_cast<uint32_t>(records[i] >> 32);
+    for (int32_t i = 0; i < n; ) {
+        uint32_t key = records[i].key;
         int32_t j = i + 1;
-        while (j < n && static_cast<uint32_t>(records[j] >> 32) == key)
-            ++j;
+        while (j < n && records[j].key == key) j++;
 
-        const int32_t bucket_size = j - i;
-        if (bucket_size == 1) {
-            // Unique key — write directly to SA.
-            SA[out++] = static_cast<int32_t>(records[i] & 0xFFFFFFFFu);
-        } else if (bucket_size == 2) {
-            // 2-element collision — direct compare and swap.
-            const int32_t a = static_cast<int32_t>(records[i] & 0xFFFFFFFFu);
-            const int32_t b = static_cast<int32_t>(records[i + 1] & 0xFFFFFFFFu);
-            if (suffix_less(T, n, a, b)) {
-                SA[out]     = a;
-                SA[out + 1] = b;
-            } else {
-                SA[out]     = b;
-                SA[out + 1] = a;
-            }
-            out += 2;
+        int32_t bsize = j - i;
+        if (bsize == 1) {
+            SA[out++] = static_cast<int32_t>(records[i].pos);
         } else {
-            // 3+ collisions — sort and write.
-            std::sort(records + i, records + j,
-                      [T, n](uint64_t lhs, uint64_t rhs) {
-                          const int32_t a = static_cast<int32_t>(lhs & 0xFFFFFFFFu);
-                          const int32_t b = static_cast<int32_t>(rhs & 0xFFFFFFFFu);
-                          return suffix_less(T, n, a, b);
-                      });
-            for (int32_t k = i; k < j; ++k) {
-                SA[out++] = static_cast<int32_t>(records[k] & 0xFFFFFFFFu);
-            }
+            // DeroLuna uses introsort for collisions
+            std::sort(records + i, records + j, [T, n](const SortRecord& a, const SortRecord& b) {
+                return suffix_less(T, n, a.pos, b.pos);
+            });
+            for (int32_t k = i; k < j; k++) SA[out++] = static_cast<int32_t>(records[k].pos);
         }
-
         i = j;
     }
+
     if (phase_telemetry) {
-        collision_ns = now_ns() - t_collision_start;
+        collision_ns = now_ns() - t_coll;
         addSABreakdownTelemetry(encode_ns, radix_ns, collision_ns, copy_ns);
     }
 

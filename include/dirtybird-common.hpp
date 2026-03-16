@@ -8,6 +8,7 @@
 #include <string>
 #include <random>
 #include <map>
+#include <thread>
 
 #include <boost/program_options.hpp>
 
@@ -54,6 +55,16 @@ extern bool g_pcores_only;  // Limit mining to P-cores only (for hybrid CPUs lik
 extern int g_pcore_count;   // Number of P-core logical processors detected
 extern int threads;
 extern int g_omp_threads;  // OpenMP threads per mining thread (0 = auto)
+
+// Auto-tune OpenMP worker count conservatively on small systems, but keep the
+// 20T/23T hybrid-CPU path on OMP=2 where local benchmarks consistently win.
+inline int get_auto_omp_threads_for_mining(int mining_threads) {
+  const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
+  if (hw_threads >= 20 && mining_threads >= 16) {
+    return 2;
+  }
+  return 1;
+}
 
 // Adaptive thread management (DeroLuna-style over-provisioning)
 constexpr int MAX_MINING_THREADS = 64;

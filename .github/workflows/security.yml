@@ -54,20 +54,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            cmake \
-            ninja-build \
-            libboost-all-dev \
-            libssl-dev \
-            libomp-dev
+            clang cmake ninja-build lld \
+            libboost-all-dev libssl-dev libomp-dev \
+            libnuma-dev libudns-dev libmimalloc-dev
 
       - name: Build for CodeQL
         run: |
-          cmake -B build -G Ninja \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_LTO=ON \
+            -DBUILD_STATIC=ON \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++
-          cmake --build build --config Release -j$(nproc)
+          cmake --build build --target dirtybird-miner-cpu --parallel
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3

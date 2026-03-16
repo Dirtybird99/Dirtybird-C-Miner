@@ -186,12 +186,18 @@ enum SpsaBucketPrefetchMode : int {
 };
 
 extern bool g_use_spsa;
+extern bool g_use_local_spsa;
 extern bool g_spsa_stamp_fast;
 extern int g_spsa_bucket_prefetch;
+extern int g_spsa_max_data_len;
 extern bool g_spsa_hit_counters;
 extern bool g_verbose_tune;
 extern int g_lookup_smart_threshold;
 extern bool g_lookup_smart_telemetry;
+
+inline bool shouldUseSpsaForDataLen(int data_len) {
+  return g_use_spsa && (g_spsa_max_data_len <= 0 || data_len <= g_spsa_max_data_len);
+}
 
 inline void getSABucketScratch(workerData &worker, int32_t *&bucketA, int32_t *&bucketB) {
 #if defined(USE_LIBSAIS) || defined(USE_DLUNA_RADIX_SA) || defined(USE_RADIX_SA) || defined(USE_BUCKET_SA)
@@ -221,35 +227,18 @@ inline uint32_t revInt(uint32_t dword)
 
 inline void initWorker(workerData &worker) {
   #if defined(__AVX2__)
-
-  for(int i = 0; i < 33; i++) {
-    int size = 32-i;
-
-    uint32_t a = ~(size > 28 ? 0xFFFFFFFF >> (std::max(4-(size - 28), 0)*8) : 0);  
-    uint32_t b = ~(size > 24 ? 0xFFFFFFFF >> (std::max(4-(size - 24), 0)*8) : 0);  
-    uint32_t c = ~(size > 20 ? 0xFFFFFFFF >> (std::max(4-(size - 20), 0)*8) : 0);  
-    uint32_t d = ~(size > 16 ? 0xFFFFFFFF >> (std::max(4-(size - 16), 0)*8) : 0);  
-    uint32_t e = ~(size > 12 ? 0xFFFFFFFF >> (std::max(4-(size - 12), 0)*8) : 0);  
-    uint32_t f = ~(size > 8 ? 0xFFFFFFFF >> (std::max(4-(size - 8), 0)*8) : 0);  
-    uint32_t g = ~(size > 4 ? 0xFFFFFFFF >> (std::max(4-(size - 4), 0)*8) : 0);  
-    uint32_t h = ~(size > 0 ? 0xFFFFFFFF >> (std::max(4-size,0)*8) : 0);
-    uint32_t vec[8] = {revInt(a),revInt(b),revInt(c),revInt(d),revInt(e),revInt(f),revInt(g),revInt(h)};
-
-    // printf("genMask bytes for length %d: ", 32-i);
-    // printf("%08X, %08X, %08X, %08X, %08X, %08X, %08X, %08X", a, b, c, d, e, f, g, h);
-    // printf("\n");
-
-    byte *cpyPoint = &worker.maskTable_bytes[32*i];
-    memcpy(cpyPoint, vec, 32);
+  for(int len = 0; len <= 32; len++) {
+    for(int i = 0; i < 32; i++) {
+      worker.maskTable_bytes[32*len + i] = (i < len) ? 0xFF : 0x00;
+    }
   }
+  #endif
   // printf("worker.maskTable\n");
   // uint32_t v[8];
   // for(int i = 0; i < 32; i++) {
   //   _mm256_storeu_si256((__m256i*)v, _mm256_loadu_si256(&worker.maskTable[i]));
   //   printf("%02d v8_u32: %x %x %x %x %x %x %x %x\n", i, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
   // }
-
-  #endif
 
   memcpy(worker.iota8, iota8_g, 256);
 

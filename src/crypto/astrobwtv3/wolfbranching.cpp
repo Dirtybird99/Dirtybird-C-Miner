@@ -7,6 +7,7 @@
 
 // Cached AVX2 availability flag (set once at init)
 static bool g_has_avx2 = false;
+static bool g_logged_avx2 = false;
 
 // The base for the following code was contributed by @Wolf9466 on Discord
 
@@ -227,7 +228,8 @@ void wolfPermute(uint8_t *in, uint8_t *out, uint16_t op, uint8_t pos1, uint8_t p
 void initWolfPermuteDispatch() {
 #if defined(__x86_64__) || defined(_M_X64)
     g_has_avx2 = branch_tables::avx2_available();
-    if (g_has_avx2) {
+    if (g_has_avx2 && !g_logged_avx2) {
+        g_logged_avx2 = true;
         printf("wolfPermute: AVX2 enabled\n");
     }
 #endif

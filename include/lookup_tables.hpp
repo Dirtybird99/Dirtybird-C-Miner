@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <bit>
+#include <bitset>
 #include <algorithm>
 #include <vector>
 #include "lookup.h"  // bitTable for popcount
@@ -31,10 +32,15 @@ extern uint8_t *lookup1D_global;      // Regular ops: 152 x 256 = 38 KB (L1 cach
 extern unsigned char *lookup3D_global; // Branched ops: 104 x 256 x 256 = 6.5 MB (L3 cache)
 
 // Index arrays: map opcode -> table index (extern - defined in lookupcompute.cpp)
+constexpr size_t kLookupRegOpsSize = 152;
 extern uint8_t g_reg_idx[256];      // Regular op index (0-151)
 extern uint8_t g_branched_idx[256]; // Branched op index (0-103)
 extern uint8_t g_is_branched[256];  // 1 if branched op, 0 if regular (replaces linear search)
+extern std::bitset<256> g_unchanged_bytes[kLookupRegOpsSize];
+extern std::bitset<256> g_clipped_bytes[kLookupRegOpsSize];
 extern bool g_lookup_tables_initialized;
+extern bool g_lookup_1d_initialized;
+extern bool g_lookup_3d_initialized;
 
 // Legacy compile-time default for precomputed 3D table.
 // Runtime `--lookup-mode` now controls whether 3D table is used.
@@ -136,27 +142,44 @@ inline void initIndexArrays() {
 
 // Generate the lookup tables at startup
 inline void generateTables(uint8_t* lookup1D, uint8_t* lookup3D) {
-    if (g_lookup_tables_initialized) return;
-
-    initIndexArrays();
-
-    // Generate 1D table for regular ops (no pos2val dependency)
-    // Layout: lookup1D[reg_idx * 256 + input] = output
-    // Size: 152 * 256 = 38 KB (fits in L1 cache!)
-    for (int op = 0; op < 256; op++) {
-        if (isBranchedOp(op)) continue;
-
-        uint8_t idx = g_reg_idx[op];
-        uint32_t opcode = CodeLUT[op];
-        size_t base = (size_t)idx * 256;
-
-        for (int input = 0; input < 256; input++) {
-            lookup1D[base + input] = computeBranchCorrect((uint8_t)input, 0, opcode);
+    if (!g_lookup_tables_initialized) {
+        initIndexArrays();
+        for (auto& bits : g_unchanged_bytes) {
+            bits.reset();
         }
+        for (auto& bits : g_clipped_bytes) {
+            bits.reset();
+        }
+        g_lookup_tables_initialized = true;
+    }
+
+    if (lookup1D != nullptr && !g_lookup_1d_initialized) {
+        // Generate 1D table for regular ops (no pos2val dependency)
+        // Layout: lookup1D[reg_idx * 256 + input] = output
+        // Size: 152 * 256 = 38 KB (fits in L1 cache!)
+        for (int op = 0; op < 256; op++) {
+            if (isBranchedOp(op)) continue;
+
+            uint8_t idx = g_reg_idx[op];
+            uint32_t opcode = CodeLUT[op];
+            size_t base = (size_t)idx * 256;
+
+            for (int input = 0; input < 256; input++) {
+                const uint8_t result = computeBranchCorrect((uint8_t)input, 0, opcode);
+                lookup1D[base + input] = result;
+                if (result == input) {
+                    g_unchanged_bytes[idx].set(input);
+                }
+                if (result == 0) {
+                    g_clipped_bytes[idx].set(input);
+                }
+            }
+        }
+        g_lookup_1d_initialized = true;
     }
 
     // Generate 3D table for branched ops (depends on pos2val) when available.
-    if (lookup3D != nullptr) {
+    if (lookup3D != nullptr && !g_lookup_3d_initialized) {
         // Layout: lookup3D[branched_idx * 256 * 256 + pos2val * 256 + input] = output
         // Size: 104 * 256 * 256 = 6.5 MB (fits in L3 cache)
         for (int op = 0; op < 256; op++) {
@@ -173,9 +196,8 @@ inline void generateTables(uint8_t* lookup1D, uint8_t* lookup3D) {
                 }
             }
         }
+        g_lookup_3d_initialized = true;
     }
-
-    g_lookup_tables_initialized = true;
 }
 
 // Lookup function for regular ops (1D - L1 cache friendly)

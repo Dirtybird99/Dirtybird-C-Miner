@@ -186,26 +186,34 @@ waitForJob:
                     }
 
                     if (CheckHash(powHash, cmpDiff, ALGO_ASTROBWTV3)) {
-                        bool submit = !submitting;
-                        if (!submit) {
-                            for (;;) {
-                                submit = !submitting;
-                                if (submit || localJobCounter != jobCounter) break;
+                        bool submitted = false;
+                        while (!submitted) {
+                            if (localJobCounter != jobCounter) break;
+
+                            {
+                                std::scoped_lock<boost::mutex> submitLock(mutex);
+                                if (localJobCounter != jobCounter) break;
+                                if (!submitting) {
+                                    submitting = true;
+                                    setcolor(BRIGHT_YELLOW);
+                                    std::cout << "\nThread " << tid << " found a nonce! (batch index " << i << ")\n" << std::flush;
+                                    setcolor(BRIGHT_WHITE);
+                                    share = {
+                                        {"jobid",    myJob.at("jobid").as_string().c_str()},
+                                        {"mbl_blob", hexStr(WORK, MINIBLOCK_SIZE).c_str()}
+                                    };
+                                    data_ready = true;
+                                    submitted = true;
+                                }
+                            }
+
+                            if (!submitted) {
                                 boost::this_thread::yield();
                             }
                         }
-                        if (localJobCounter != jobCounter) break;
 
-                        submitting = true;
-                        setcolor(BRIGHT_YELLOW);
-                        std::cout << "\nThread " << tid << " found a nonce! (batch index " << i << ")\n" << std::flush;
-                        setcolor(BRIGHT_WHITE);
-                        share = {
-                            {"jobid",    myJob.at("jobid").as_string().c_str()},
-                            {"mbl_blob", hexStr(WORK, MINIBLOCK_SIZE).c_str()}
-                        };
-                        data_ready = true;
-                        cv.notify_all();
+                        if (!submitted && localJobCounter != jobCounter) break;
+                        if (submitted) cv.notify_all();
                     }
                 }
 

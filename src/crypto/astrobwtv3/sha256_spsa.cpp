@@ -257,10 +257,9 @@ static ALWAYS_INLINE void fill_block_from_reduced_sa_starts(
 ) {
     if (LIKELY(num_entries == ENTRIES_PER_BLOCK)) {
         int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
-        const bool stamp_fast_enabled = g_spsa_stamp_fast;
-        for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
-            const uint32_t* __restrict entries = sa_data + start_entry + i;
-            if (LIKELY(stamp_fast_enabled)) {
+        if (LIKELY(g_spsa_stamp_fast)) {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
                 const uint32_t all_stamp_mask = entries[0] & entries[1] & entries[2] & entries[3] & 0x80000000u;
                 if (LIKELY(all_stamp_mask == 0x80000000u)) {
                     spsa::merge_entries_to_global_pos_batch4_stamp_only_starts(
@@ -275,7 +274,10 @@ static ALWAYS_INLINE void fill_block_from_reduced_sa_starts(
                         out32 + i
                     );
                 }
-            } else {
+            }
+        } else {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
                 spsa::merge_entries_to_global_pos_batch4_starts(
                     entries,
                     stamp_start_chunks,
@@ -303,10 +305,30 @@ static ALWAYS_INLINE void fill_block_from_reduced_sa_bases(
 ) {
     if (LIKELY(num_entries == ENTRIES_PER_BLOCK)) {
         int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
-        const bool stamp_fast_enabled = g_spsa_stamp_fast;
-        for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
-            const uint32_t* __restrict entries = sa_data + start_entry + i;
-            if (LIKELY(stamp_fast_enabled)) {
+        if (LIKELY(g_spsa_stamp_fast)) {
+#if defined(__AVX2__)
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 8) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(entries));
+                // High bit (bit 31) of each 32-bit entry indicates stamp ref
+                int mask = _mm256_movemask_ps(_mm256_castsi256_ps(e));
+                if (LIKELY(mask == 0xFF)) { // All 8 are stamps
+                    spsa::merge_entries_to_global_pos_avx2_stamp_only_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                } else {
+                    spsa::merge_entries_to_global_pos_avx2_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                }
+            }
+#else
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
                 const uint32_t all_stamp_mask = entries[0] & entries[1] & entries[2] & entries[3] & 0x80000000u;
                 if (LIKELY(all_stamp_mask == 0x80000000u)) {
                     spsa::merge_entries_to_global_pos_batch4_stamp_only_bases(
@@ -321,7 +343,11 @@ static ALWAYS_INLINE void fill_block_from_reduced_sa_bases(
                         out32 + i
                     );
                 }
-            } else {
+            }
+#endif
+        } else {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
                 spsa::merge_entries_to_global_pos_batch4_bases(
                     entries,
                     stamp_base_offsets,
@@ -885,13 +911,18 @@ void sha256_reduced_sa_ni(
     const size_t stamp_count = stamps.size();
     const spsa::Stamp* stamp_data = stamps.data();
     const bool use_base_offsets = g_spsa_decode_bases;
-    alignas(64) uint16_t stamp_start_chunks[SPSA_DECODE_STAMP_TABLE_SIZE] = {};
-    alignas(64) int32_t stamp_base_offsets[SPSA_DECODE_STAMP_TABLE_SIZE] = {};
+    // Hot-path scratch: only the copied prefix is read, so avoid per-call zeroing.
+    alignas(64) static thread_local uint16_t stamp_start_chunks[SPSA_DECODE_STAMP_TABLE_SIZE];
+    alignas(64) static thread_local int32_t stamp_base_offsets[SPSA_DECODE_STAMP_TABLE_SIZE];
     const size_t copied_stamp_count = std::min(stamp_count, static_cast<size_t>(spsa::MAX_STAMPS));
-    for (size_t i = 0; i < copied_stamp_count; i++) {
-        const int32_t base_offset = static_cast<int32_t>(stamp_data[i].start_chunk) << 8;
-        stamp_base_offsets[i] = base_offset;
-        stamp_start_chunks[i] = static_cast<uint16_t>(base_offset >> 8);
+    if (use_base_offsets) {
+        for (size_t i = 0; i < copied_stamp_count; i++) {
+            stamp_base_offsets[i] = static_cast<int32_t>(stamp_data[i].start_chunk) << 8;
+        }
+    } else {
+        for (size_t i = 0; i < copied_stamp_count; i++) {
+            stamp_start_chunks[i] = stamp_data[i].start_chunk;
+        }
     }
 
     // Double-buffered block storage (cache-line aligned)

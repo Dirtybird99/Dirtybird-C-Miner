@@ -8,7 +8,9 @@
 // Salsa20 implementation selector
 // USE_SIMD_SALSA20: Use AVX2 SIMD Salsa20 for ~2-5% speedup (tested working)
 // Note: ucstk::Salsa20 is always included for struct layout compatibility with SPSA
+#ifndef USE_SIMD_SALSA20
 #define USE_SIMD_SALSA20 0  // Scalar Salsa20: less AVX2 heat for sustained mining
+#endif
 
 #include "Salsa20.h"           // Always needed for struct layout (SPSA binary compat)
 #if USE_SIMD_SALSA20
@@ -24,7 +26,9 @@
 // CRYPTOGAMS RC4 is used for encryption (25% of iterations)
 // OpenSSL RC4_KEY is maintained for SPSA S-box access
 // ENABLED: Phase 1 optimization
-#define USE_CRYPTOGAMS_RC4_DUAL 0  // Single RC4 KSA: saves ~70 KSAs/hash for less heat
+#ifndef USE_CRYPTOGAMS_RC4_DUAL
+#define USE_CRYPTOGAMS_RC4_DUAL 0  // Disabled: replay-screened slower on this machine
+#endif
 
 // USE_SELECTIVE_MEMCPY: Enable selective copy optimization in wolfCompute
 // PERMANENTLY DISABLED: wolfPermute reads from chunk[p1:p2) before/during writes,
@@ -57,7 +61,9 @@
 // USE_FAST_RC4: Disabled - OpenSSL RC4 is ~12% faster than FastRc4.
 // Testing showed: FastRc4 = 12.89 KH/s, OpenSSL = 14.41 KH/s (16 threads)
 // The struct layout was fixed (fast_rc4_key moved to end), but it's not beneficial.
+#ifndef USE_FAST_RC4
 #define USE_FAST_RC4 0
+#endif
 #define MAX_LENGTH ((256 * 277) - 1) // this is the maximum
 #define ASTRO_SCRATCH_SIZE ((MAX_LENGTH + 64))
 #define MAX_RUN_LEN 48
@@ -92,18 +98,6 @@ public:
   // For aarch64
   byte aarchFixup[256];
   byte opt[256];
-  // byte simpleLookup[regOps_size*(256*256)];
-  // byte lookup3D[branchedOps_size*256*256];
-  // uint16_t lookup2D[regOps_size*(256*256)];
-  // std::bitset<256> clippedBytes[regOps_size];
-  // std::bitset<256> unchangedBytes[regOps_size];
-  // std::bitset<256> isBranched;
-
-  // byte branchedOps[branchedOps_size*2];
-  // byte regularOps[regOps_size*2];
-
-  // byte branched_idx[256];
-  // byte reg_idx[256];
 
   int lucky = 0;
 
@@ -195,4 +189,13 @@ public:
 
   friend std::ostream& operator<<(std::ostream& os, const workerData& wd);
 };
+
+// SPSA-focused zero-allocation SHA256 (defined in sha256_override.cpp)
+// Approximately 40% faster than two sequential hashSHA256 calls on SHA-NI CPUs.
+#if defined(__x86_64__) || defined(_M_X64)
+extern "C" void sha256_2way_ni(
+    const uint8_t* data_a, size_t len_a, uint8_t digest_a[32],
+    const uint8_t* data_b, size_t len_b, uint8_t digest_b[32]);
+#endif
+
 #endif
