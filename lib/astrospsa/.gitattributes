@@ -1,0 +1,8 @@
+# Treat known binary formats as binary
+*.a binary
+*.so binary
+*.dylib binary
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
