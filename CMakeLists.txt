@@ -533,13 +533,20 @@ cmake_print_variables(CMAKE_SYSTEM_PROCESSOR)
 # This CMAKE variable isn't defined until 'project' is called.
 set(DO_STATIC " ")
 
-# No static linking on macOS, ever
-if (NOT CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
-  # If this is NOT an MSVC-style compiler, we can use -static
-  if (NOT (MSVC
-           OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
-               AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")))
-    set(DO_STATIC " -static ")
+# Fully static Linux links break thread detection and Boost's CMake fallback in
+# clean CI environments. Keep BUILD_STATIC for MinGW-style Windows packaging,
+# but use normal system linkage elsewhere unless we are cross-compiling.
+if (BUILD_STATIC)
+  if (CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
+    message(STATUS "BUILD_STATIC requested on macOS; using dynamic system linkage.")
+  elseif (WIN32 OR WIN_CROSS)
+    if (NOT (MSVC
+             OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+                 AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")))
+      set(DO_STATIC " -static ")
+    endif()
+  else()
+    message(STATUS "BUILD_STATIC requested on ${CMAKE_HOST_SYSTEM_NAME}; using dynamic system linkage for compatibility.")
   endif()
 endif()
 
