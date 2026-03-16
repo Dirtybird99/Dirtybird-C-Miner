@@ -69,7 +69,11 @@ static inline void portable_aligned_free(void* ptr) {
 #else
 #include <cstdlib>
 static inline void* portable_aligned_alloc(size_t alignment, size_t size) {
-    return aligned_alloc(alignment, size);
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
 }
 static inline void portable_aligned_free(void* ptr) {
     free(ptr);

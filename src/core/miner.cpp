@@ -2895,12 +2895,16 @@ void setAffinity(boost::thread::native_handle_type t, uint64_t core)
     threadToPhysicalCore[core] = physical_core_id;
   }
 
+  #if defined(DIRTYBIRD_OS_ANDROID)
+  (void)threadHandle;
+  #else
   if (pthread_setaffinity_np(threadHandle, sizeof(cpu_set_t), &cpuset) != 0)
   {
     std::cerr << "Failed to set CPU affinity for thread" << std::endl;
     fflush(stdout);
     setcolor(BRIGHT_WHITE);
   }
+  #endif
 #endif
 }
 

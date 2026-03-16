@@ -162,6 +162,19 @@ extern bool useLookupMine;
   #define MINPREFLEN 4
 #endif
 
+static inline int classifySpsaCoreLenBin(int data_len) {
+  if (data_len < 65536) {
+    return 0;
+  }
+  if (data_len < 67584) {
+    return 1;
+  }
+  if (data_len < 69632) {
+    return 2;
+  }
+  return 3;
+}
+
 #if defined(USE_ASTRO_SPSA)
 static inline void prefetchSpsaBucketArrays(workerData &worker) {
   if (g_spsa_bucket_prefetch == SPSA_BUCKET_PREFETCH_OFF) {
@@ -175,19 +188,6 @@ static inline void prefetchSpsaBucketArrays(workerData &worker) {
     __builtin_prefetch(&worker.bHeads[pf][0], 1, 2);
     __builtin_prefetch(&worker.bHeadIdx[pf][0], 1, 2);
   }
-}
-
-static inline int classifySpsaCoreLenBin(int data_len) {
-  if (data_len < 65536) {
-    return 0;
-  }
-  if (data_len < 67584) {
-    return 1;
-  }
-  if (data_len < 69632) {
-    return 2;
-  }
-  return 3;
 }
 #endif
 

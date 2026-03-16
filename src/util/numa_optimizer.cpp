@@ -69,7 +69,7 @@ int NUMAOptimizer::memory_nodes = 0;
 int NUMAOptimizer::total_cpus = 0;
 
 bool NUMAOptimizer::initialize() {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (numa_available() < 0) {
         std::cerr << "NUMA not available on this system" << std::endl;
         fflush(stdout);
@@ -138,7 +138,7 @@ bool NUMAOptimizer::initialize() {
 }
 
 void NUMAOptimizer::detectTopology() {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     total_cpus = numa_num_configured_cpus();
     int max_nodes = numa_max_node() + 1;
     
@@ -176,7 +176,7 @@ int NUMAOptimizer::getTotalCPUs() {
 }
 
 void* NUMAOptimizer::allocateLocal(size_t size) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!numa_initialized) {
         return malloc(size);
     }
@@ -220,7 +220,7 @@ void* NUMAOptimizer::allocateLocal(size_t size) {
 }
 
 void* NUMAOptimizer::allocateOnNode(size_t size, int node) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!numa_initialized) {
         return malloc(size);
     }
@@ -252,7 +252,7 @@ void* NUMAOptimizer::allocateOnNode(size_t size, int node) {
 }
 
 void NUMAOptimizer::deallocate(void* ptr, size_t size) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!numa_initialized) {
         free(ptr);
     } else {
@@ -271,7 +271,7 @@ void NUMAOptimizer::deallocate(void* ptr, size_t size) {
 }
 
 void NUMAOptimizer::optimizeMemoryForMining(void* ptr, size_t size) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!ptr || size == 0) return;
     
     // Use huge pages for large allocations (reduces TLB pressure)
@@ -304,7 +304,7 @@ void NUMAOptimizer::optimizeMemoryForMining(void* ptr, size_t size) {
 }
 
 void NUMAOptimizer::printThreadBinding(int thread_id) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     int current_node = numa_node_of_cpu(sched_getcpu());
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -338,7 +338,7 @@ void NUMAOptimizer::printThreadBinding(int thread_id) {
 }
 
 bool NUMAOptimizer::isAvailable() {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     return numa_available() >= 0;
 #elif defined(_WIN32)
     LoadNumaFunctions();
@@ -353,7 +353,7 @@ bool NUMAOptimizer::isAvailable() {
 }
 
 bool NUMAOptimizer::setMemoryPolicy(int node) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!numa_initialized) {
         return false;
     }
@@ -398,7 +398,7 @@ bool NUMAOptimizer::setMemoryPolicy(int node) {
 }
 
 void NUMAOptimizer::restoreMemoryPolicy() {
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
     if (!numa_initialized) {
         return;
     }

@@ -1,0 +1,3 @@
+3e8f18598b54ade09d12bc7bdbdcafe5dbafc7a938e1962bfb79b4033328a19d  dirtybird-miner-v1.0.10_windows.zip
+af72cb162e980e8af2c4904c877389b17c45671b9a176af2190a8ef0d2d16cdb  dirtybird-miner-v1.0.10_linux_hiveos_mmpos.tar.gz
+7415a5090705992d34d763a2f0c1e6e68f433c521e5651a49fbdf1c3c4979d84  dirtybird-miner-v1.0.10_aarch64_android.tar.gz

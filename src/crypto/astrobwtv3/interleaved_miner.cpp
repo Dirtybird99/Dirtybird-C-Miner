@@ -2,6 +2,78 @@
  * Two Miners Per Thread - Interleaved Execution Implementation
  */
 
+#if defined(DIRTYBIRD_OS_ANDROID)
+
+#include "interleaved_miner.hpp"
+
+InterleavedMiner::InterleavedMiner()
+    : worker_a_(nullptr), worker_b_(nullptr), initialized_(false) {}
+
+InterleavedMiner::~InterleavedMiner() = default;
+
+bool InterleavedMiner::initialize() {
+    return false;
+}
+
+int InterleavedMiner::processInterleaved(
+    const uint8_t* input_a, int len_a,
+    const uint8_t* input_b, int len_b,
+    uint8_t* hash_a, uint8_t* hash_b,
+    int wIndex
+) {
+    (void)input_a;
+    (void)len_a;
+    (void)input_b;
+    (void)len_b;
+    (void)hash_a;
+    (void)hash_b;
+    (void)wIndex;
+    return 0;
+}
+
+void InterleavedMiner::prepPhaseSingle(workerData& worker, const uint8_t* input, int inputLen) {
+    (void)worker;
+    (void)input;
+    (void)inputLen;
+}
+
+void InterleavedMiner::wolfComputeInterleaved2(workerData& wa, workerData& wb, int wi) {
+    (void)wa;
+    (void)wb;
+    (void)wi;
+}
+
+bool wolfComputeSingleIteration(workerData& worker, int wIndex, int iteration,
+                                uint8_t& lp1, uint8_t& lp2,
+                                uint8_t& chunkCount, int& firstChunk) {
+    (void)worker;
+    (void)wIndex;
+    (void)iteration;
+    (void)lp1;
+    (void)lp2;
+    (void)chunkCount;
+    (void)firstChunk;
+    return false;
+}
+
+void wolfComputeFinalize(workerData& worker, int wIndex,
+                         uint8_t lp1, uint8_t lp2,
+                         uint8_t chunkCount, int firstChunk) {
+    (void)worker;
+    (void)wIndex;
+    (void)lp1;
+    (void)lp2;
+    (void)chunkCount;
+    (void)firstChunk;
+}
+
+double benchmarkInterleaved(int numIterations) {
+    (void)numIterations;
+    return 0.0;
+}
+
+#else
+
 #include "interleaved_miner.hpp"
 #include "dirtybird-hugepages.hpp"
 #include "astrobwtv3.h"
@@ -222,4 +294,5 @@ int InterleavedMiner::processInterleaved(
 }
 
 void InterleavedMiner::wolfComputeInterleaved2(workerData& wa, workerData& wb, int wi) {}
-double benchmarkInterleaved(int n) { return 0.0; }
+
+#endif

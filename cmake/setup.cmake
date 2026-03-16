@@ -18,7 +18,7 @@ function(setup_target_libraries target_name)
   endif()
 
   # Link libraries for non-Apple, non-Windows systems (likely Linux)
-  if(NOT APPLE AND NOT WIN32 AND NOT WIN_CROSS)
+  if(NOT APPLE AND NOT WIN32 AND NOT WIN_CROSS AND NOT DIRTYBIRD_OS_ANDROID)
     target_link_libraries(${target_name} udns numa)
   endif()
 

@@ -116,7 +116,7 @@ inline tcp::endpoint resolve_host(
     int addrCount = 0;
     net::ip::address ip_address;
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(DIRTYBIRD_OS_ANDROID)
     // Check if host is already an IP address
     boost::asio::ip::address::from_string(host, ec);
     if (ec)

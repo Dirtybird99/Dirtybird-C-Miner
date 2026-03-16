@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include "dirtybird-hugepages.hpp"
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
 #include <numa.h>
 #include <sched.h>
 #include <pthread.h>

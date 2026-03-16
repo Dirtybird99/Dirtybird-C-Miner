@@ -40,6 +40,17 @@ if (WITH_ASTROBWTV3)
     list(FILTER astroSources EXCLUDE REGEX ".*sa_benchmark\\.cpp$")
     list(FILTER astroSources EXCLUDE REGEX ".*sa_instrumentation\\.c$")
 
+    if (NOT USE_ASTRO_SPSA)
+        list(FILTER astroSources EXCLUDE REGEX ".*sha256_spsa\\.cpp$")
+        list(FILTER astroSources EXCLUDE REGEX ".*spsa_state\\.cpp$")
+    endif()
+
+    if (TARGET_ARCH STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        # These translation units are x86-specific implementations or parity helpers.
+        list(FILTER astroSources EXCLUDE REGEX ".*cloned_astrobwt\\.cpp$")
+        list(FILTER astroSources EXCLUDE REGEX ".*wolf_vsimd\\.cpp$")
+    endif()
+
     list(APPEND astroSources
       src/coins/dero_worker_pool.cpp
       src/coins/mine_dero.cpp

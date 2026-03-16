@@ -29,7 +29,7 @@ public:
         
         // First time seeing this thread - detect its NUMA node
         if (node_id == -1) {
-            #ifdef __linux__
+            #if defined(__linux__) && !defined(DIRTYBIRD_OS_ANDROID)
             int cpu = sched_getcpu();
             if (cpu >= 0) {
                 node_id = numa_node_of_cpu(cpu);

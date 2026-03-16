@@ -15,6 +15,11 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 set(TARGET_ARCH "amd64")
 set(CMAKE_BUILD_TYPE Release)
+set(DIRTYBIRD_PREPROJECT_ANDROID OFF)
+if ((DEFINED ANDROID_ABI AND NOT "${ANDROID_ABI}" STREQUAL "") OR
+    (DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "android.toolchain.cmake"))
+  set(DIRTYBIRD_PREPROJECT_ANDROID ON)
+endif()
 
 # =============================================================================
 # PERFORMANCE OPTIMIZATION FLAGS
@@ -55,10 +60,12 @@ endif()
 
 # Use native CPU tuning for local builds (better cache/pipeline utilization)
 option(TUNE_NATIVE "Enable -mtune=native for local builds" OFF)
-if (TUNE_NATIVE AND NOT WITH_HIP)
+if (TUNE_NATIVE AND NOT WITH_HIP AND NOT DIRTYBIRD_PREPROJECT_ANDROID)
     message(STATUS "Native CPU tuning enabled (-mtune=native)")
     set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mtune=native")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mtune=native")
+elseif (TUNE_NATIVE AND DIRTYBIRD_PREPROJECT_ANDROID)
+    message(STATUS "Skipping -mtune=native for Android cross-build")
 endif()
 
 # Thin LTO for faster link times with similar performance
@@ -79,6 +86,7 @@ set(MAX_PERFORMANCE_PREFETCH_DISTANCE "256" CACHE STRING
     "Clang -mllvm prefetch-distance value used by MAX_PERFORMANCE; set to OFF to disable")
 set(DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE "")
 set(DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE "")
+set(DIRTYBIRD_WINDOWS_CLANG_LINK_FLAGS "")
 if (MAX_PERFORMANCE)
     message(STATUS "MAX_PERFORMANCE mode enabled - all optimizations active")
     set(TUNE_NATIVE ON CACHE BOOL "" FORCE)
@@ -144,7 +152,10 @@ set(HIP_PLATFORM "${HIP_PLATFORM}" CACHE STRING "HIP platform: amd or nvidia")
 set_property(CACHE HIP_PLATFORM PROPERTY STRINGS "" "amd" "nvidia")
 
 # ----------------- Select C / C++ / HIP compilers -----------------
-if (WIN32)
+if (DIRTYBIRD_PREPROJECT_ANDROID)
+  message(STATUS "Target system is Android (toolchain-driven build)")
+
+elseif (WIN32)
 
   # ---------- Windows + HIP (MSVC / clang-cl toolchain) ----------
   if (WITH_HIP)
@@ -211,15 +222,20 @@ if (WIN32)
     endif()
 
     if (NOT USE_GCC)
-      if (CMAKE_LINKER AND EXISTS "${CMAKE_LINKER}")
+      if (CMAKE_LINKER AND EXISTS "${CMAKE_LINKER}" AND
+          CMAKE_LINKER MATCHES "([/\\\\]|^)ld\\.lld(\\.exe)?$")
         set(DIRTYBIRD_WIN_LINKER "${CMAKE_LINKER}")
       else()
-        find_program(DIRTYBIRD_WIN_LINKER NAMES ld.lld.exe ld.lld)
+        find_program(DIRTYBIRD_WIN_LINKER
+          NAMES ld.lld.exe ld.lld
+          HINTS "${DIRTYBIRD_MSYS2_BIN_DIR}"
+          REQUIRED)
       endif()
 
-      if (DIRTYBIRD_WIN_LINKER)
-        set(CMAKE_LINKER "${DIRTYBIRD_WIN_LINKER}" CACHE FILEPATH "" FORCE)
-      endif()
+      set(CMAKE_LINKER "${DIRTYBIRD_WIN_LINKER}" CACHE FILEPATH "" FORCE)
+      set(DIRTYBIRD_WINDOWS_CLANG_LINK_FLAGS
+          "-fuse-ld=lld --ld-path=${DIRTYBIRD_WIN_LINKER}")
+      message(STATUS "Windows Clang linker: ${DIRTYBIRD_WIN_LINKER}")
     endif()
   endif()
 
@@ -831,7 +847,9 @@ if (NOT WIN32 OR NOT WITH_HIP)
   endif()
 endif()
 
-if (UNIX)
+if (DIRTYBIRD_OS_ANDROID)
+  set(THREAD_LIB "")
+elseif (UNIX)
   set(THREAD_LIB pthread)
 elseif(NOT WITH_HIP)
   set(THREAD_LIB winpthread)
@@ -988,6 +1006,8 @@ if(WIN_CROSS)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${DIRTYBIRD_BOOST_LIBDIRS}")
   #set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Xlinker /force")
   set(LINK_OPTIONS "${CMAKE_EXE_LINKER_FLAGS}")
+elseif (ANDROID OR CMAKE_SYSTEM_NAME MATCHES "Android")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -v")
 elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin" OR USE_GCC)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lc++ -fuse-ld=ld")
 elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
@@ -1006,12 +1026,9 @@ elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -v")
   endif()
 elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Windows")
-  if (NOT WITH_HIP)
-    if (DIRTYBIRD_MSYS2_BIN_DIR AND EXISTS "${DIRTYBIRD_MSYS2_BIN_DIR}/ld.lld.exe")
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${DIRTYBIRD_MSYS2_BIN_DIR}/ld.lld.exe")
-    elseif (DIRTYBIRD_MSYS2_BIN_DIR AND EXISTS "${DIRTYBIRD_MSYS2_BIN_DIR}/ld.lld")
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${DIRTYBIRD_MSYS2_BIN_DIR}/ld.lld")
-    endif()
+  if (NOT WITH_HIP AND NOT DIRTYBIRD_WINDOWS_CLANG_LINK_FLAGS STREQUAL "")
+    set(CMAKE_EXE_LINKER_FLAGS
+        "${CMAKE_EXE_LINKER_FLAGS} ${DIRTYBIRD_WINDOWS_CLANG_LINK_FLAGS}")
   endif()
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -v")
 endif()

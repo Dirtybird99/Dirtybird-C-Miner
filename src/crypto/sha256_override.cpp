@@ -1036,6 +1036,8 @@ static bool sha256_try_pair_blocks(uint32_t state[8], const uint8_t* blocks, siz
 // OpenSSL-compatible API (C linkage to match SPSA library expectations)
 // ============================================================================
 
+#if !defined(DIRTYBIRD_OS_ANDROID)
+
 #if defined(DIRTYBIRD_SHA256_LINK_WRAP)
 #define DIRTYBIRD_SHA256_OVERRIDE_SYMBOL(name) __wrap_##name
 #else
@@ -1201,3 +1203,5 @@ int DIRTYBIRD_SHA256_OVERRIDE_SYMBOL(SHA256_Final)(unsigned char *md, SHA256_CTX
 #undef DIRTYBIRD_SHA256_OVERRIDE_SYMBOL
 
 }  // extern "C"
+
+#endif
