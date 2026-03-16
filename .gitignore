@@ -17,6 +17,7 @@ Makefile
 *.so
 *.dylib
 *.a
+!lib/astrospsa/*.a
 *.lib
 *.o
 *.obj
