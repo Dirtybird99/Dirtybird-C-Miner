@@ -171,19 +171,47 @@ if (WIN32)
     message(STATUS "Target system is Windows (CPU-only build)")
 
     if (USE_GCC)
-      # DERO Miner: Use MSYS2 GCC for Windows builds
-      set(CMAKE_C_COMPILER   "C:/msys64/mingw64/bin/gcc.exe"   CACHE FILEPATH "" FORCE)
-      set(CMAKE_CXX_COMPILER "C:/msys64/mingw64/bin/g++.exe"   CACHE FILEPATH "" FORCE)
-      set(CMAKE_ASM_COMPILER "C:/msys64/mingw64/bin/gcc.exe"   CACHE FILEPATH "" FORCE)
+      set(_DIRTYBIRD_WIN_C_NAMES gcc.exe gcc)
+      set(_DIRTYBIRD_WIN_CXX_NAMES g++.exe g++)
     else()
-      # DERO Miner: Use MSYS2 Clang for Windows builds
-      set(CMAKE_C_COMPILER   "C:/msys64/mingw64/bin/clang.exe"   CACHE FILEPATH "" FORCE)
-      set(CMAKE_CXX_COMPILER "C:/msys64/mingw64/bin/clang++.exe" CACHE FILEPATH "" FORCE)
-      set(CMAKE_ASM_COMPILER "C:/msys64/mingw64/bin/clang.exe"   CACHE FILEPATH "" FORCE)
+      set(_DIRTYBIRD_WIN_C_NAMES clang.exe clang)
+      set(_DIRTYBIRD_WIN_CXX_NAMES clang++.exe clang++)
+    endif()
 
-      # Use MSYS2 lld if available
-      if (EXISTS "C:/msys64/mingw64/bin/ld.lld.exe")
-        set(CMAKE_LINKER "C:/msys64/mingw64/bin/ld.lld.exe" CACHE FILEPATH "" FORCE)
+    # Resolve toolchain binaries from the active MSYS2 environment instead of
+    # assuming a fixed C:/msys64 install root. GitHub-hosted runners install
+    # MSYS2 under a temp directory, so hardcoded paths break release builds.
+    if (CMAKE_C_COMPILER AND EXISTS "${CMAKE_C_COMPILER}")
+      set(DIRTYBIRD_WIN_C_COMPILER "${CMAKE_C_COMPILER}")
+    else()
+      find_program(DIRTYBIRD_WIN_C_COMPILER NAMES ${_DIRTYBIRD_WIN_C_NAMES} REQUIRED)
+    endif()
+
+    if (CMAKE_CXX_COMPILER AND EXISTS "${CMAKE_CXX_COMPILER}")
+      set(DIRTYBIRD_WIN_CXX_COMPILER "${CMAKE_CXX_COMPILER}")
+    else()
+      find_program(DIRTYBIRD_WIN_CXX_COMPILER NAMES ${_DIRTYBIRD_WIN_CXX_NAMES} REQUIRED)
+    endif()
+
+    if (CMAKE_ASM_COMPILER AND EXISTS "${CMAKE_ASM_COMPILER}")
+      set(DIRTYBIRD_WIN_ASM_COMPILER "${CMAKE_ASM_COMPILER}")
+    else()
+      find_program(DIRTYBIRD_WIN_ASM_COMPILER NAMES ${_DIRTYBIRD_WIN_C_NAMES} REQUIRED)
+    endif()
+
+    set(CMAKE_C_COMPILER   "${DIRTYBIRD_WIN_C_COMPILER}"   CACHE FILEPATH "" FORCE)
+    set(CMAKE_CXX_COMPILER "${DIRTYBIRD_WIN_CXX_COMPILER}" CACHE FILEPATH "" FORCE)
+    set(CMAKE_ASM_COMPILER "${DIRTYBIRD_WIN_ASM_COMPILER}" CACHE FILEPATH "" FORCE)
+
+    if (NOT USE_GCC)
+      if (CMAKE_LINKER AND EXISTS "${CMAKE_LINKER}")
+        set(DIRTYBIRD_WIN_LINKER "${CMAKE_LINKER}")
+      else()
+        find_program(DIRTYBIRD_WIN_LINKER NAMES ld.lld.exe ld.lld)
+      endif()
+
+      if (DIRTYBIRD_WIN_LINKER)
+        set(CMAKE_LINKER "${DIRTYBIRD_WIN_LINKER}" CACHE FILEPATH "" FORCE)
       endif()
     endif()
   endif()
