@@ -294,24 +294,7 @@ void NUMAOptimizer::optimizeMemoryForMining(void* ptr, size_t size) {
     
 #elif defined(_WIN32)
     if (!ptr || size == 0) return;
-    
-    // Enable large pages if possible (requires SeLockMemoryPrivilege)
-    SIZE_T min_large_page_size = GetLargePageMinimum();
-    if (min_large_page_size > 0 && size >= min_large_page_size) {
-        // Try to enable large page support
-        HANDLE hToken;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-            TOKEN_PRIVILEGES tp = {0};
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            
-            if (LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
-                AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
-            }
-            CloseHandle(hToken);
-        }
-    }
-    
+
     // Touch memory to ensure it's committed and local
     volatile char* touch = (volatile char*)ptr;
     for (size_t i = 0; i < size; i += 4096) {

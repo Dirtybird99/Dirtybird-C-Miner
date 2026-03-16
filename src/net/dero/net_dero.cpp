@@ -199,11 +199,18 @@ void dero_session(
         boost::json::value workData = boost::json::parse(workInfo.str(), jsonEc);
         if (!jsonEc)
         {
-          job = workData;
+          if (!workData.is_object()) {
+            continue;
+          }
 
-          // Safely extract lasterror
-          if (job.as_object().contains("lasterror")) {
-            std::string lastError = std::string(job.at("lasterror").as_string());
+          auto &workObj = workData.as_object();
+          auto *blobField = workObj.if_contains("blockhashing_blob");
+          auto *heightField = workObj.if_contains("height");
+          auto *difficultyField = workObj.if_contains("difficultyuint64");
+
+          auto *lastErrorField = workObj.if_contains("lasterror");
+          if (lastErrorField && lastErrorField->is_string()) {
+            std::string lastError = std::string(lastErrorField->as_string());
             if (!lastError.empty())
             {
               std::cerr << "received error: " << lastError << std::endl
@@ -211,10 +218,7 @@ void dero_session(
             }
           }
 
-          // Safely extract fields with existence checks
-          if (!job.as_object().contains("blockhashing_blob") ||
-              !job.as_object().contains("height") ||
-              !job.as_object().contains("difficultyuint64")) {
+          if (!blobField || !heightField || !difficultyField) {
             setcolor(RED);
             printf("\nMissing required fields in job response\n");
             setcolor(BRIGHT_WHITE);
@@ -222,30 +226,36 @@ void dero_session(
             continue;
           }
 
-          // Thread-safe update of job globals
+          bool shouldLogConnected = false;
           {
-            boost::lock_guard<boost::mutex> lock(jobMutex);
-            currentBlob = std::string(job.at("blockhashing_blob").as_string());
-            ourHeight = job.at("height").to_number<int64_t>();
-            difficulty = job.at("difficultyuint64").to_number<int64_t>();
-            if (job.as_object().contains("miniblocks")) {
-              accepted = job.at("miniblocks").to_number<int64_t>();
+            // Keep job assignment and worker-visible metadata in the same critical section.
+            std::scoped_lock<boost::mutex> lockGuard(mutex);
+            job = workData;
+
+            boost::lock_guard<boost::mutex> jobLock(jobMutex);
+            currentBlob = std::string(blobField->as_string());
+            ourHeight = heightField->to_number<int64_t>();
+            difficulty = difficultyField->to_number<int64_t>();
+            if (auto *acceptedField = workObj.if_contains("miniblocks")) {
+              accepted = acceptedField->to_number<int64_t>();
             }
-            if (job.as_object().contains("blocks")) {
-              blockCounter = job.at("blocks").to_number<int64_t>();
+            if (auto *blocksField = workObj.if_contains("blocks")) {
+              blockCounter = blocksField->to_number<int64_t>();
             }
-            if (job.as_object().contains("rejected")) {
-              rejected = job.at("rejected").to_number<int64_t>();
+            if (auto *rejectedField = workObj.if_contains("rejected")) {
+              rejected = rejectedField->to_number<int64_t>();
             }
+
+            shouldLogConnected = !isConnected;
+            isConnected = true;
+            jobCounter++;
           }
 
-          if (!isConnected)
+          if (shouldLogConnected)
           {
             std::string connectedMsg = "Connected (" + host + ")";
             logInfo(connectedMsg);
           }
-          isConnected = true;
-          jobCounter++;
         }
         else
         {

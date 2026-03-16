@@ -13,7 +13,7 @@ function(setup_target_libraries target_name)
     if (NOT WITH_HIP)
       target_link_libraries(${target_name} mingw32)
     endif()
-    target_link_libraries(${target_name} wsock32 ws2_32 kernel32)
+    target_link_libraries(${target_name} wsock32 ws2_32 kernel32 winmm)
     target_link_winring0(${target_name})
   endif()
 
@@ -52,4 +52,39 @@ function(setup_target_libraries target_name)
   set_target_properties(${target_name} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
+
+  if(WIN32 AND OpenMP_FOUND)
+    set(DIRTYBIRD_RUNTIME_DLL_HINTS
+      "C:/msys64/mingw64/bin"
+      "$ENV{MSYSTEM_PREFIX}/bin"
+    )
+
+    if(NOT DEFINED DIRTYBIRD_LIBOMP_DLL)
+      find_program(DIRTYBIRD_LIBOMP_DLL NAMES libomp.dll HINTS ${DIRTYBIRD_RUNTIME_DLL_HINTS})
+    endif()
+    if(NOT DEFINED DIRTYBIRD_LIBGCC_DLL)
+      find_program(DIRTYBIRD_LIBGCC_DLL NAMES libgcc_s_seh-1.dll HINTS ${DIRTYBIRD_RUNTIME_DLL_HINTS})
+    endif()
+    if(NOT DEFINED DIRTYBIRD_WINPTHREAD_DLL)
+      find_program(DIRTYBIRD_WINPTHREAD_DLL NAMES libwinpthread-1.dll HINTS ${DIRTYBIRD_RUNTIME_DLL_HINTS})
+    endif()
+
+    set(DIRTYBIRD_RUNTIME_DLLS "")
+    foreach(runtime_dll
+      "${DIRTYBIRD_LIBOMP_DLL}"
+      "${DIRTYBIRD_LIBGCC_DLL}"
+      "${DIRTYBIRD_WINPTHREAD_DLL}"
+    )
+      if(runtime_dll)
+        list(APPEND DIRTYBIRD_RUNTIME_DLLS "${runtime_dll}")
+      endif()
+    endforeach()
+
+    if(DIRTYBIRD_RUNTIME_DLLS)
+      add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DIRTYBIRD_RUNTIME_DLLS} $<TARGET_FILE_DIR:${target_name}>
+        COMMENT "Copying MinGW/OpenMP runtimes"
+      )
+    endif()
+  endif()
 endfunction()

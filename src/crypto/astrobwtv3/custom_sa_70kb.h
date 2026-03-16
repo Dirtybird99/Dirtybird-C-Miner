@@ -62,9 +62,12 @@ extern "C" {
     #define ENABLE_SA_INSTRUMENTATION 0
 #endif
 
-/* 2-character radix sort for LMS suffixes (better initial ordering) */
+/* 2-character radix sort for LMS suffixes (better initial ordering)
+ * DISABLED: Large TLS arrays (144KB + 256KB) cause crashes on MinGW.
+ * TODO: Convert to dynamically allocated per-thread workspace.
+ */
 #ifndef ENABLE_SA_RADIX_LMS
-    #define ENABLE_SA_RADIX_LMS 1
+    #define ENABLE_SA_RADIX_LMS 0
 #endif
 
 /* ========================================================================== */

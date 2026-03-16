@@ -8,6 +8,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <numeric>
 #include <iostream>
 #include <iomanip>
@@ -177,8 +179,41 @@ __m256i shiftLeft256(__m256i a);
 extern void (*astroCompFunc)(workerData &worker, bool isTest, int wIndex);
 
 // SPSA control - declared in miner.cpp
+enum SpsaBucketPrefetchMode : int {
+  SPSA_BUCKET_PREFETCH_OFF = 0,
+  SPSA_BUCKET_PREFETCH_LIGHT = 1,
+  SPSA_BUCKET_PREFETCH_FULL = 2
+};
+
 extern bool g_use_spsa;
+extern bool g_use_local_spsa;
+extern bool g_spsa_stamp_fast;
+extern int g_spsa_bucket_prefetch;
+extern int g_spsa_max_data_len;
+extern bool g_spsa_hit_counters;
 extern bool g_verbose_tune;
+extern int g_lookup_smart_threshold;
+extern bool g_lookup_smart_telemetry;
+
+inline bool shouldUseSpsaForDataLen(int data_len) {
+  return g_use_spsa && (g_spsa_max_data_len <= 0 || data_len <= g_spsa_max_data_len);
+}
+
+inline void getSABucketScratch(workerData &worker, int32_t *&bucketA, int32_t *&bucketB) {
+#if defined(USE_LIBSAIS) || defined(USE_DLUNA_RADIX_SA) || defined(USE_RADIX_SA) || defined(USE_BUCKET_SA)
+  // These SA backends manage their own internal scratch and ignore bucket arrays.
+  bucketA = nullptr;
+  bucketB = nullptr;
+#elif USE_WORKER_SA_BUCKETS
+  bucketA = worker.bA;
+  bucketB = worker.bB;
+#else
+  static thread_local int32_t tl_bucketA[256];
+  static thread_local int32_t tl_bucketB[256 * 256];
+  bucketA = tl_bucketA;
+  bucketB = tl_bucketB;
+#endif
+}
 
 template <std::size_t N>
 inline void generateInitVector(std::uint8_t (&iv_buff)[N]);
@@ -192,35 +227,18 @@ inline uint32_t revInt(uint32_t dword)
 
 inline void initWorker(workerData &worker) {
   #if defined(__AVX2__)
-
-  for(int i = 0; i < 33; i++) {
-    int size = 32-i;
-
-    uint32_t a = ~(size > 28 ? 0xFFFFFFFF >> (std::max(4-(size - 28), 0)*8) : 0);  
-    uint32_t b = ~(size > 24 ? 0xFFFFFFFF >> (std::max(4-(size - 24), 0)*8) : 0);  
-    uint32_t c = ~(size > 20 ? 0xFFFFFFFF >> (std::max(4-(size - 20), 0)*8) : 0);  
-    uint32_t d = ~(size > 16 ? 0xFFFFFFFF >> (std::max(4-(size - 16), 0)*8) : 0);  
-    uint32_t e = ~(size > 12 ? 0xFFFFFFFF >> (std::max(4-(size - 12), 0)*8) : 0);  
-    uint32_t f = ~(size > 8 ? 0xFFFFFFFF >> (std::max(4-(size - 8), 0)*8) : 0);  
-    uint32_t g = ~(size > 4 ? 0xFFFFFFFF >> (std::max(4-(size - 4), 0)*8) : 0);  
-    uint32_t h = ~(size > 0 ? 0xFFFFFFFF >> (std::max(4-size,0)*8) : 0);
-    uint32_t vec[8] = {revInt(a),revInt(b),revInt(c),revInt(d),revInt(e),revInt(f),revInt(g),revInt(h)};
-
-    // printf("genMask bytes for length %d: ", 32-i);
-    // printf("%08X, %08X, %08X, %08X, %08X, %08X, %08X, %08X", a, b, c, d, e, f, g, h);
-    // printf("\n");
-
-    byte *cpyPoint = &worker.maskTable_bytes[32*i];
-    memcpy(cpyPoint, vec, 32);
+  for(int len = 0; len <= 32; len++) {
+    for(int i = 0; i < 32; i++) {
+      worker.maskTable_bytes[32*len + i] = (i < len) ? 0xFF : 0x00;
+    }
   }
+  #endif
   // printf("worker.maskTable\n");
   // uint32_t v[8];
   // for(int i = 0; i < 32; i++) {
   //   _mm256_storeu_si256((__m256i*)v, _mm256_loadu_si256(&worker.maskTable[i]));
   //   printf("%02d v8_u32: %x %x %x %x %x %x %x %x\n", i, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
   // }
-
-  #endif
 
   memcpy(worker.iota8, iota8_g, 256);
 
@@ -233,6 +251,14 @@ inline void initWorker(workerData &worker) {
   for (int b = 0; b < DERO_BATCH; b++) {
     // Use placement new to properly construct FastRc4 in allocated memory
     new (&worker.fast_rc4_key[b]) rc4_avx512::FastRc4();
+  }
+#endif
+
+  // Initialize CryptogamsRc4 when using malloc allocation (constructor not called)
+#if USE_CRYPTOGAMS_RC4_DUAL
+  for (int b = 0; b < DERO_BATCH; b++) {
+    // Use placement new to properly construct CryptogamsRc4 in allocated memory
+    new (&worker.cryptogams_rc4[b]) rc4_cryptogams::CryptogamsRc4();
   }
 #endif
 
@@ -446,6 +472,67 @@ extern AstroFunc allAstroFuncs[];
 extern size_t numAstroFuncs;
 
 bool setAstroAlgo(std::string desiredAlgo);
+const char* getCurrentAstroAlgoName();
+const char* getSABackendName();
+uint64_t getSPSAHits();
+uint64_t getSPSAMisses();
+
+struct AstroPhaseTelemetrySnapshot {
+  uint64_t hashes;
+  uint64_t data_len_sum;
+  uint64_t spsa_hits;
+  uint64_t spsa_misses;
+  uint64_t prep_ns;
+  uint64_t wolf_ns;
+  uint64_t spsa_call_ns;
+  uint64_t spsa_prefetch_ns;
+  uint64_t spsa_hit_copy_ns;
+  uint64_t spsa_miss_hash_ns;
+  uint64_t spsa_core_ns;
+  uint64_t spsa_core_calls;
+  uint64_t spsa_core_bin0_calls;
+  uint64_t spsa_core_bin0_ns;
+  uint64_t spsa_core_bin1_calls;
+  uint64_t spsa_core_bin1_ns;
+  uint64_t spsa_core_bin2_calls;
+  uint64_t spsa_core_bin2_ns;
+  uint64_t spsa_core_bin3_calls;
+  uint64_t spsa_core_bin3_ns;
+  uint64_t spsa_op_family_nonbranched_calls;
+  uint64_t spsa_op_family_nonbranched_bytes;
+  uint64_t spsa_op_family_branched_calls;
+  uint64_t spsa_op_family_branched_bytes;
+  uint64_t spsa_op_family_op253_calls;
+  uint64_t spsa_op_family_op253_bytes;
+  uint64_t spsa_op_family_rc4_calls;
+  uint64_t spsa_op_family_rc4_bytes;
+  uint64_t sa_fallback_ns;
+  uint64_t final_hash_ns;
+  uint64_t total_ns;
+  uint64_t sa_encode_ns;
+  uint64_t sa_radix_ns;
+  uint64_t sa_collision_ns;
+  uint64_t sa_copy_ns;
+};
+
+struct AstroLookupTelemetrySnapshot {
+  uint64_t smart_branched_total;
+  uint64_t smart_path_lut;
+  uint64_t smart_path_avx2;
+  uint64_t smart_span_hist[33];
+};
+
+void setPhaseTelemetryEnabled(bool enabled);
+bool isPhaseTelemetryEnabled();
+AstroPhaseTelemetrySnapshot getPhaseTelemetrySnapshot();
+void resetPhaseTelemetry();
+size_t classifySpsaOpFamilyForTelemetry(uint8_t op);
+void addSpsaOpFamilyTelemetryBatch(const std::array<uint64_t, 4>& calls,
+                                   const std::array<uint64_t, 4>& bytes);
+void addSABreakdownTelemetry(uint64_t encode_ns, uint64_t radix_ns, uint64_t collision_ns, uint64_t copy_ns);
+AstroLookupTelemetrySnapshot getLookupTelemetrySnapshot();
+void resetLookupTelemetry();
+
 void astroTune(int num_threads, int tuneWarmupSec, int tuneDurationSec);
 
 /**

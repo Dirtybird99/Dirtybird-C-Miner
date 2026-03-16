@@ -19,31 +19,38 @@ set(CMAKE_BUILD_TYPE Release)
 # =============================================================================
 # PERFORMANCE OPTIMIZATION FLAGS
 # =============================================================================
-# Base optimization: -Ofast includes -O3 + -ffast-math + -fno-protect-parens
-set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -Ofast -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Ofast -Wuninitialized -DNDEBUG")
+# Base optimization level
+# THERMAL_MODE uses -O2 (cooler code) instead of -Ofast (hotter but faster per-hash)
+option(THERMAL_MODE "Use -O2 for cooler sustained performance on thermally-limited CPUs" OFF)
+option(ENABLE_LOOP_UNROLL "Enable -funroll-loops in release builds" ON)
+if (THERMAL_MODE)
+    message(STATUS "THERMAL MODE: Using -O2 for cooler sustained performance")
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -O2 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -Wuninitialized -DNDEBUG")
+else()
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -Ofast -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Ofast -Wuninitialized -DNDEBUG")
+endif()
 
 # Loop unrolling for tight mining loops (RC4, SHA256, Salsa20)
-set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -funroll-loops")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops")
+if (ENABLE_LOOP_UNROLL)
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -funroll-loops")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops")
+endif()
 
 # Omit frame pointer - frees up a register for hot code paths
 set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -fomit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fomit-frame-pointer")
 
 # Aggressive inlining for crypto primitives
+# Inlining: let LTO decide inline thresholds (LTO overrides compile-time settings)
+# Removing aggressive inline threshold reduces .text size for better I-cache
 option(AGGRESSIVE_INLINE "Enable aggressive function inlining" ON)
 if (AGGRESSIVE_INLINE)
     set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -finline-functions")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -finline-functions")
-    # Clang/GCC: increase inline threshold (default ~225)
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mllvm -inline-threshold=1000")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mllvm -inline-threshold=1000")
-    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   --param inline-unit-growth=200")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} --param inline-unit-growth=200")
-    endif()
+    # NOTE: Clang inline threshold is set after project() where CMAKE_CXX_COMPILER_ID is available
+    # (see LTO Configuration section below)
 endif()
 
 # Use native CPU tuning for local builds (better cache/pipeline utilization)
@@ -64,34 +71,73 @@ option(USE_THIN_LTO "Use Thin LTO instead of Full LTO (faster builds)" OFF)
 #   cmake -DMAX_PERFORMANCE=ON -DTUNE_NATIVE=ON -B build-max
 #
 # This enables all aggressive optimizations suitable for the local CPU
-option(MAX_PERFORMANCE "Enable maximum performance optimizations" OFF)
+option(MAX_PERFORMANCE "Enable maximum performance optimizations" ON)
+option(MAX_PERFORMANCE_DISABLE_AUTO_VECTORIZATION
+       "When MAX_PERFORMANCE is ON, disable LLVM auto-vectorization and SLP vectorization"
+       ON)
+set(MAX_PERFORMANCE_PREFETCH_DISTANCE "256" CACHE STRING
+    "Clang -mllvm prefetch-distance value used by MAX_PERFORMANCE; set to OFF to disable")
+set(DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE "")
+set(DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE "")
 if (MAX_PERFORMANCE)
     message(STATUS "MAX_PERFORMANCE mode enabled - all optimizations active")
     set(TUNE_NATIVE ON CACHE BOOL "" FORCE)
     set(AGGRESSIVE_INLINE ON CACHE BOOL "" FORCE)
     set(WITH_AVX2 ON CACHE BOOL "" FORCE)
     # Prefetch distance tuning for mining workloads
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mllvm -prefetch-distance=256")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mllvm -prefetch-distance=256")
+    if (NOT MAX_PERFORMANCE_PREFETCH_DISTANCE STREQUAL "OFF")
+        # project() has not run yet here, so compiler ID is not final.
+        # Stash Clang-only flags and apply them later once the toolchain exists.
+        set(DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE
+            "${DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE} -mllvm -prefetch-distance=${MAX_PERFORMANCE_PREFETCH_DISTANCE}")
+        set(DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE
+            "${DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE} -mllvm -prefetch-distance=${MAX_PERFORMANCE_PREFETCH_DISTANCE}")
     endif()
-    # Vectorization hints
-    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -fvectorize")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fvectorize")
-    # Tree vectorization for crypto loops
-    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -ftree-vectorize")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ftree-vectorize")
+    if (MAX_PERFORMANCE_DISABLE_AUTO_VECTORIZATION)
+        # Disable auto-vectorization: lookup compute path uses scalar table lookups
+        # AVX2 auto-vectorization has historically increased thermal throttling on
+        # sustained workloads, so keep the old behavior as the default preset.
+        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -fno-vectorize -fno-slp-vectorize")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fno-vectorize -fno-slp-vectorize")
+    endif()
 endif()
 # =============================================================================
 
 option(USE_GCC        "Use GCC instead of Clang" OFF)
 option(USE_ASTRO_SPSA "Use Astro Stamped Permutation Suffix Array library" ON)
-option(USE_CUSTOM_SA  "Use custom 70KB SA-IS algorithm instead of divsufsort" ON)
+option(USE_DLUNA_RADIX_SA "Use DeroLuna-style 24-bit prefix radix+collision SA" OFF)  # Experimental: faster in some benches but not reference-stable
+option(USE_RADIX_SA   "Use DeroHE-style 2-pass radix sort SA (cache-friendly, lower thermal)" OFF)
+option(USE_BUCKET_SA  "Use 2-byte prefix bucket sort SA (optimized for random bytes)" OFF)
+option(USE_CUSTOM_SA  "Use custom 70KB SA-IS algorithm instead of divsufsort" OFF)  # Disabled: custom_sa has bugs and is 4x slower
+option(USE_LIBSAIS   "Use libsais 2.10.4 for faster suffix array construction" ON)  # State-of-the-art SA library
+option(DIRTYBIRD_SIMD_SALSA20 "Enable SIMD Salsa20 in the CPU hot path" ON)
+option(DIRTYBIRD_CRYPTOGAMS_RC4_DUAL "Enable dual-state CRYPTOGAMS RC4 path" ON)
+option(DIRTYBIRD_FAST_RC4 "Enable FastRc4 path" OFF)
 option(WIN_CROSS      "Whether we are cross-compiling on Linux for Windows" OFF)
 option(DISABLE_LTO    "Disable Link-Time Optimization" OFF)
 
+# mimalloc: High-performance allocator (15-30% faster heap ops, better multi-thread scaling)
+# Overrides operator new/delete globally, including for precompiled SPSA library
+option(USE_MIMALLOC   "Use mimalloc allocator for faster heap operations" ON)
+
 # OpenMP support for parallel suffix array construction (like TNN/Luna)
 option(WITH_OPENMP    "Enable OpenMP for parallel SA construction in divsufsort" ON)
+
+if (DIRTYBIRD_CRYPTOGAMS_RC4_DUAL AND DIRTYBIRD_FAST_RC4)
+  message(FATAL_ERROR "DIRTYBIRD_CRYPTOGAMS_RC4_DUAL and DIRTYBIRD_FAST_RC4 cannot both be enabled.")
+endif()
+
+if (DIRTYBIRD_SIMD_SALSA20)
+  add_compile_definitions(USE_SIMD_SALSA20=1)
+endif()
+
+if (DIRTYBIRD_CRYPTOGAMS_RC4_DUAL)
+  add_compile_definitions(USE_CRYPTOGAMS_RC4_DUAL=1)
+endif()
+
+if (DIRTYBIRD_FAST_RC4)
+  add_compile_definitions(USE_FAST_RC4=1)
+endif()
 
 # HIP_PLATFORM: "" (none), "amd", or "nvidia"
 set(HIP_PLATFORM "${HIP_PLATFORM}" CACHE STRING "HIP platform: amd or nvidia")
@@ -173,6 +219,17 @@ endif()
 
 string(REGEX REPLACE "^[a-zA-Z]" ""  INTERNAL_DERO_VERSION ${INTERNAL_DERO_VERSION})
 
+set(DIRTYBIRD_VERSION_DEFAULT "1.0.0-dev")
+if(DEFINED DIRTYBIRD_VERSION)
+  set(INTERNAL_DIRTYBIRD_VERSION "${DIRTYBIRD_VERSION}")
+elseif(DEFINED ENV{DIRTYBIRD_VERSION})
+  set(INTERNAL_DIRTYBIRD_VERSION "$ENV{DIRTYBIRD_VERSION}")
+else()
+  set(INTERNAL_DIRTYBIRD_VERSION "${DIRTYBIRD_VERSION_DEFAULT}")
+endif()
+string(REGEX REPLACE "^v" "" INTERNAL_DIRTYBIRD_VERSION "${INTERNAL_DIRTYBIRD_VERSION}")
+set(DIRTYBIRD_VERSION "${INTERNAL_DIRTYBIRD_VERSION}" CACHE STRING "Public DIRTYBIRD version" FORCE)
+
 # DERO Miner Options - AstroBWTv3 only
 option(WITH_ASTROBWTV3      "Enable AstroBWTv3 (DERO) algorithm" ON)
 # option(WITH_ARGON2          "Enable Argon2 algorithms family" ON)
@@ -204,29 +261,10 @@ option(ARM_V8               "Force ARMv8 (64 bit) architecture, use with caution
 option(ARM_V7               "Force ARMv7 (32 bit) architecture, use with caution if automatic detection fails, but you sure it may work" OFF)
 # End of XMRig options
 
-if (NOT WITH_HIP)
-  if (NOT DISABLE_LTO)
-    if (USE_THIN_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      message(STATUS "Enabling Thin LTO for non-HIP build (faster link, similar perf)")
-      set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
-      set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto=thin")
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=thin")
-    else()
-      message(STATUS "Enabling Full LTO for non-HIP build")
-      set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto")
-      set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
-    endif()
-  else()
-    message(STATUS "LTO disabled by DISABLE_LTO option")
-  endif()
+# LTO, section GC, and strip are configured AFTER project() since they need CMAKE_CXX_COMPILER_ID
+# See "LTO Configuration" block below project()
 
-  # Strip symbols from release builds for smaller binary (better I-cache locality)
-  # DeroLuna: 3.3MB, DirtyBird was 14.1MB - this helps close the gap
-  if (NOT CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s")
-    message(STATUS "Symbol stripping enabled for release build")
-  endif()
-else()
+if (WITH_HIP)
   set(USE_ASTRO_SPSA OFF)
 
   # ----- HIP on Windows: use clang-cl / MSVC-style toolchain -----
@@ -280,16 +318,105 @@ project(
   DESCRIPTION "High-Performance DERO Miner with SPSA, Incremental SA, and AVX-512 RC4"
 )
 
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  if (NOT DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE STREQUAL "")
+    set(CMAKE_C_FLAGS_RELEASE
+        "${CMAKE_C_FLAGS_RELEASE}${DIRTYBIRD_DEFERRED_CLANG_C_FLAGS_RELEASE}")
+  endif()
+  if (NOT DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE STREQUAL "")
+    set(CMAKE_CXX_FLAGS_RELEASE
+        "${CMAKE_CXX_FLAGS_RELEASE}${DIRTYBIRD_DEFERRED_CLANG_CXX_FLAGS_RELEASE}")
+  endif()
+  if (NOT MAX_PERFORMANCE_PREFETCH_DISTANCE STREQUAL "OFF")
+    message(STATUS "Clang MAX_PERFORMANCE prefetch distance: ${MAX_PERFORMANCE_PREFETCH_DISTANCE}")
+  endif()
+endif()
+
+# =============================================================================
+# LTO Configuration (must be after project() so CMAKE_CXX_COMPILER_ID is set)
+# =============================================================================
+if (NOT WITH_HIP)
+  if (NOT DISABLE_LTO)
+    if (USE_THIN_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      message(STATUS "Enabling Thin LTO for non-HIP build (faster link, similar perf)")
+      set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
+      set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto=thin")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=thin")
+    else()
+      message(STATUS "Enabling Full LTO for non-HIP build")
+      set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto")
+      set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
+    endif()
+
+    # LTO backend optimization level: -O3 enables aggressive cross-module IPO
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--lto-O3")
+    message(STATUS "LTO backend optimization level: O3")
+  else()
+    message(STATUS "LTO disabled by DISABLE_LTO option")
+  endif()
+
+  # Section-level dead code elimination (works with LTO for aggressive cleanup)
+  set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -ffunction-sections -fdata-sections")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffunction-sections -fdata-sections")
+
+  # Strip symbols from release builds for smaller binary (better I-cache locality)
+  if (NOT CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s -Wl,--gc-sections")
+    message(STATUS "Symbol stripping + section GC enabled for release build")
+  endif()
+
+  # Clang-specific: aggressive inline threshold (must be after project() for compiler ID)
+  if (AGGRESSIVE_INLINE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Clang detected: applying -mllvm -inline-threshold=250 (compile + LTO linker)")
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mllvm -inline-threshold=250")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mllvm -inline-threshold=250")
+    set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS}  -Wl,-mllvm,-inline-threshold=250")
+  endif()
+
+  # Keep the LTO backend aligned with the compile-time tuning target.
+  # Without this, the final whole-program codegen can fall back to the generic
+  # -march CPU and discard the local scheduling model from -mtune.
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang") 
+    if (TUNE_NATIVE)
+      set(DIRTYBIRD_LTO_MCPU "native")
+    elseif (WIN32 AND TARGET_ARCH MATCHES "amd64" AND CPU_ARCHTARGET STREQUAL "x86-64-v3")
+      set(DIRTYBIRD_LTO_MCPU "raptorlake")
+    else()
+      set(DIRTYBIRD_LTO_MCPU "")
+    endif()
+
+    if (NOT DIRTYBIRD_LTO_MCPU STREQUAL "")
+      set(CMAKE_EXE_LINKER_FLAGS
+          "${CMAKE_EXE_LINKER_FLAGS} -Wl,-plugin-opt=mcpu=${DIRTYBIRD_LTO_MCPU}")
+      message(STATUS "Clang LTO backend CPU tuning: -plugin-opt=mcpu=${DIRTYBIRD_LTO_MCPU}")
+    endif()
+  endif()
+
+  # CPU tuning for Raptor Lake (13th/14th gen Intel hybrid arch)
+  if (NOT TUNE_NATIVE)
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mtune=raptorlake")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mtune=raptorlake")
+    message(STATUS "CPU tuning: -mtune=raptorlake (hybrid P+E core scheduling)")
+  endif()
+endif()
+
 # OpenMP support for divsufsort parallelism (like TNN/Luna thread multiplication)
 # Must be after project() so C/CXX languages are enabled
 if (WITH_OPENMP AND NOT WITH_HIP)
+  # CMake's OpenMP probe uses try_compile/try_link. On Windows/Clang our
+  # full-LTO linker flags can make those tiny probe links fail even though the
+  # real target links fine with libomp. Probe with a clean executable linker
+  # flag set, then restore the production flags for the actual miner targets.
+  set(_dirtybird_saved_exe_linker_flags "${CMAKE_EXE_LINKER_FLAGS}")
+  set(CMAKE_EXE_LINKER_FLAGS "")
   find_package(OpenMP)
+  set(CMAKE_EXE_LINKER_FLAGS "${_dirtybird_saved_exe_linker_flags}")
+  unset(_dirtybird_saved_exe_linker_flags)
   if(OpenMP_FOUND)
     message(STATUS "OpenMP found - enabling parallel suffix array construction")
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${OpenMP_C_FLAGS}")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${OpenMP_CXX_FLAGS}")
-    add_definitions(-D_OPENMP)
-    add_definitions(-DDIRTYBIRD_OPENMP)
+    add_compile_definitions(DIRTYBIRD_OPENMP)
   else()
     message(STATUS "OpenMP not found - using single-threaded suffix array")
   endif()
@@ -475,9 +602,8 @@ if(TARGET_ARCH MATCHES "amd64")
   endif()
 endif()
 
-set(DIRTYBIRD_VERSION "0.0.1")
-set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} ${DO_STATIC} -DDERO_VERSION=${INTERNAL_DERO_VERSION} -DDIRTYBIRD_VERSION=${DIRTYBIRD_VERSION}") # ${WIN_CROSS_OPTS}")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${DO_STATIC} -DDERO_VERSION=${INTERNAL_DERO_VERSION} -DDIRTYBIRD_VERSION=${DIRTYBIRD_VERSION}") # ${WIN_CROSS_OPTS}")
+set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} ${DO_STATIC} -DDERO_VERSION=${INTERNAL_DERO_VERSION} -DDIRTYBIRD_VERSION_STR=\\\"${DIRTYBIRD_VERSION}\\\"") # ${WIN_CROSS_OPTS}")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${DO_STATIC} -DDERO_VERSION=${INTERNAL_DERO_VERSION} -DDIRTYBIRD_VERSION_STR=\\\"${DIRTYBIRD_VERSION}\\\"") # ${WIN_CROSS_OPTS}")
 
 # =============================================================================
 # OPTIMIZATION SUMMARY
@@ -883,6 +1009,27 @@ file(GLOB SOURCES_NET
   # DERO Miner: Removed spectre sources
 )
 
+# Radix SA: DeroHE-style 2-pass radix sort replaces SPSA
+if(USE_DLUNA_RADIX_SA)
+  set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -DUSE_DLUNA_RADIX_SA")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DUSE_DLUNA_RADIX_SA")
+  message(STATUS "DLUNA RADIX SA: Using 24-bit prefix radix + collision sort")
+endif()
+
+# Radix SA: DeroHE-style 2-pass radix sort replaces SPSA
+if(USE_RADIX_SA)
+  set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -DUSE_RADIX_SA")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DUSE_RADIX_SA")
+  message(STATUS "RADIX SA: Using DeroHE-style 2-pass radix sort")
+endif()
+
+# Bucket SA: 2-byte prefix counting sort optimized for random bytes
+if(USE_BUCKET_SA)
+  set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -DUSE_BUCKET_SA")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DUSE_BUCKET_SA")
+  message(STATUS "BUCKET SA: Using 2-byte prefix bucket sort")
+endif()
+
 include(cmake/spsa.cmake)
 
 if (NOT WITH_HIP)
@@ -1167,6 +1314,39 @@ else()
   )
 
   setup_target_libraries(${DERO_OUTPUT_NAME})
+  if (USE_ASTRO_SPSA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_definitions(${DERO_OUTPUT_NAME} PRIVATE DIRTYBIRD_SHA256_LINK_WRAP)
+    target_link_options(${DERO_OUTPUT_NAME} PRIVATE
+      "-Wl,--wrap=SHA256_Init"
+      "-Wl,--wrap=SHA256_Update"
+      "-Wl,--wrap=SHA256_Final"
+    )
+  endif()
+
+  # mimalloc: faster allocator for all heap operations (new/delete/malloc/free)
+  if (USE_MIMALLOC)
+    # Prefer static library for fully static builds
+    set(MIMALLOC_STATIC_LIB "")
+    if (WIN32 AND EXISTS "C:/msys64/mingw64/lib/libmimalloc.a")
+      set(MIMALLOC_STATIC_LIB "C:/msys64/mingw64/lib/libmimalloc.a")
+    else()
+      find_library(MIMALLOC_STATIC_LIB mimalloc-static mimalloc PATHS "/usr/lib" "/usr/local/lib")
+    endif()
+    if (MIMALLOC_STATIC_LIB)
+      message(STATUS "mimalloc (static) found: ${MIMALLOC_STATIC_LIB}")
+      target_compile_definitions(${DERO_OUTPUT_NAME} PRIVATE USE_MIMALLOC)
+      # Override operator new/delete globally via mimalloc_override.cpp
+      # (SPSA library uses _Znwy/_ZdlPv which resolve to our replacements at link time)
+      # Note: -include mimalloc-override.h not used - conflicts with MinGW headers
+      target_link_libraries(${DERO_OUTPUT_NAME} ${MIMALLOC_STATIC_LIB})
+    else()
+      message(WARNING "mimalloc not found - using default allocator")
+    endif()
+  endif()
+
+  # NOTE: Cold code -Os per-file overrides disabled - conflicts with Full LTO backend
+  # optimization (all modules merge into single LTO unit, -Os can deoptimize hot code)
+  # The PGO profile already handles code layout optimization.
 
   # Set output name
   set_target_properties(${DERO_OUTPUT_NAME} PROPERTIES OUTPUT_NAME ${DERO_OUTPUT_NAME})
@@ -1222,6 +1402,14 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         src/crypto/astrobwtv3/*.cpp
         src/crypto/astrobwtv3/*.c
     )
+    # Add critical dependencies missing from GLOB
+    list(APPEND BENCH_ASTRO_SOURCES
+        src/crypto/sha256_override.cpp
+        src/crypto/salsa20_simd.c
+    )
+    if (USE_LIBSAIS)
+        list(APPEND BENCH_ASTRO_SOURCES "${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c")
+    endif()
     # Remove SPSA-dependent files to avoid needing the library
     list(FILTER BENCH_ASTRO_SOURCES EXCLUDE REGEX ".*spsa_integrated\\.cpp$")
 
@@ -1249,9 +1437,275 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
         target_link_libraries(bench-interleaved mingw32 wsock32 ws2_32 kernel32)
     endif()
     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(bench-interleaved PRIVATE -mavx2)
+        target_compile_options(bench-interleaved PRIVATE -mavx2 -mstackrealign)
     endif()
     set_target_properties(bench-interleaved PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Vertical SIMD Benchmark
+    add_executable(bench-vsimd
+        src/bin/bench_vsimd.cpp
+        ${BENCH_ASTRO_SOURCES}
+    )
+    target_include_directories(bench-vsimd PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${DIRTYBIRD_BOOST_INCLUDES}
+    )
+    target_link_libraries(bench-vsimd
+        ${DIRTYBIRD_BOOST_LIBS}
+        OpenSSL::Crypto
+    )
+    if(OpenMP_FOUND)
+        target_link_libraries(bench-vsimd OpenMP::OpenMP_CXX)
+    endif()
+    if(WIN32)
+        target_link_libraries(bench-vsimd mingw32 wsock32 ws2_32 kernel32)
+    endif()
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench-vsimd PRIVATE -mavx2 -mstackrealign)
+    endif()
+    set_target_properties(bench-vsimd PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Profile original phases (for comparison with lean)
+    add_executable(profile-original-phases
+        src/bin/profile_original_phases.cpp
+        ${BENCH_ASTRO_SOURCES}
+    )
+    target_include_directories(profile-original-phases PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${DIRTYBIRD_BOOST_INCLUDES}
+    )
+    target_link_libraries(profile-original-phases
+        ${DIRTYBIRD_BOOST_LIBS}
+        OpenSSL::Crypto
+    )
+    if(OpenMP_FOUND)
+        target_link_libraries(profile-original-phases OpenMP::OpenMP_CXX)
+    endif()
+    if(WIN32)
+        target_link_libraries(profile-original-phases mingw32 wsock32 ws2_32 kernel32)
+    endif()
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(profile-original-phases PRIVATE -mavx2)
+    endif()
+    set_target_properties(profile-original-phases PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    file(GLOB_RECURSE REPLAY_ASTRO_SOURCES
+        src/crypto/astrobwtv3/*.cpp
+        src/crypto/astrobwtv3/*.c
+    )
+    list(FILTER REPLAY_ASTRO_SOURCES EXCLUDE REGEX ".*optimization_tests\\.cpp$")
+    list(FILTER REPLAY_ASTRO_SOURCES EXCLUDE REGEX ".*sa_benchmark\\.cpp$")
+    list(FILTER REPLAY_ASTRO_SOURCES EXCLUDE REGEX ".*sha256_scatter\\.cpp$")
+    list(FILTER REPLAY_ASTRO_SOURCES EXCLUDE REGEX ".*astrotest\\.cpp$")
+    list(FILTER REPLAY_ASTRO_SOURCES EXCLUDE REGEX ".*sa_instrumentation\\.c$")
+    list(APPEND REPLAY_ASTRO_SOURCES
+        src/crypto/sha256_override.cpp
+        src/crypto/salsa20_simd.c
+        src/util/numa_optimizer.cpp
+    )
+    if (USE_LIBSAIS)
+        list(APPEND REPLAY_ASTRO_SOURCES "${LIBSAIS_DIR}/src/libsais.c")
+    endif()
+
+    add_executable(bench-dero-replay
+        src/bin/bench_dero_replay.cpp
+        ${REPLAY_ASTRO_SOURCES}
+    )
+    target_include_directories(bench-dero-replay PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${DIRTYBIRD_BOOST_INCLUDES}
+    )
+    setup_target_libraries(bench-dero-replay)
+    if (USE_ASTRO_SPSA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_definitions(bench-dero-replay PRIVATE DIRTYBIRD_SHA256_LINK_WRAP)
+        target_link_options(bench-dero-replay PRIVATE
+            "-Wl,--wrap=SHA256_Init"
+            "-Wl,--wrap=SHA256_Update"
+            "-Wl,--wrap=SHA256_Final"
+        )
+    endif()
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench-dero-replay PRIVATE -mavx2)
+    endif()
+    set_target_properties(bench-dero-replay PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Test custom_sa_70kb without OpenMP (compares divsufsort, custom_sa_70kb, libsais)
+    add_executable(test-custom-sa
+        src/bin/test_custom_sa.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+        # libsais 2.10.4 for comparison
+        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c
+    )
+    target_include_directories(test-custom-sa PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+        # libsais headers
+        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/include
+    )
+    # Test with OpenMP undefined (like lean benchmark)
+    target_compile_options(test-custom-sa PRIVATE -U_OPENMP -mavx2)
+    target_compile_definitions(test-custom-sa PRIVATE USE_CUSTOM_SA USE_LIBSAIS)
+    set_target_properties(test-custom-sa PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Debug test for custom SA
+    add_executable(test-sa-debug
+        src/bin/test_sa_debug.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-sa-debug PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-sa-debug PRIVATE -U_OPENMP -mavx2 -g -O0)
+    target_compile_definitions(test-sa-debug PRIVATE SA_DEBUG)
+    set_target_properties(test-sa-debug PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Small test for custom SA (without debug output)
+    add_executable(test-sa-small
+        src/bin/test_sa_small.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-sa-small PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-sa-small PRIVATE -U_OPENMP -mavx2 -g -O0)
+    target_compile_definitions(test-sa-small PRIVATE SA_DEBUG)
+    set_target_properties(test-sa-small PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Order debug test for custom SA
+    add_executable(test-sa-order-debug
+        src/bin/test_sa_order_debug.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-sa-order-debug PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-sa-order-debug PRIVATE -U_OPENMP -mavx2 -g -O0)
+    set_target_properties(test-sa-order-debug PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # SA trace test
+    add_executable(test-sa-trace
+        src/bin/test_sa_trace.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-sa-trace PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-sa-trace PRIVATE -U_OPENMP -mavx2 -g -O0)
+    set_target_properties(test-sa-trace PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # LMS sort test
+    add_executable(test-lms-sort
+        src/bin/test_lms_sort.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-lms-sort PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-lms-sort PRIVATE -U_OPENMP -mavx2 -g -O0)
+    set_target_properties(test-lms-sort PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Chain trace test
+    add_executable(test-chain-trace
+        src/bin/test_chain_trace.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-chain-trace PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-chain-trace PRIVATE -U_OPENMP -mavx2 -g -O0)
+    set_target_properties(test-chain-trace PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Random pattern debug test
+    add_executable(test-random-debug
+        src/bin/test_random_debug.cpp
+        src/crypto/astrobwtv3/custom_sa_70kb.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+    )
+    target_include_directories(test-random-debug PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_compile_options(test-random-debug PRIVATE -U_OPENMP -mavx2 -g -O0)
+    set_target_properties(test-random-debug PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
@@ -1278,6 +1732,33 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
     )
     target_link_libraries(test-rc4-correctness PRIVATE OpenSSL::Crypto)
     set_target_properties(test-rc4-correctness PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # RC4 prep phase test
+    add_executable(test-prep-phase
+        src/bin/test_prep_phase.cpp
+    )
+    target_include_directories(test-prep-phase PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(test-prep-phase PRIVATE OpenSSL::Crypto)
+    set_target_properties(test-prep-phase PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # RC4 worker test (uses actual workerData struct)
+    add_executable(test-worker-rc4
+        src/bin/test_worker_rc4.cpp
+    )
+    target_include_directories(test-worker-rc4 PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+    )
+    target_link_libraries(test-worker-rc4 PRIVATE OpenSSL::Crypto)
+    set_target_properties(test-worker-rc4 PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
@@ -1330,6 +1811,113 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
     )
     target_link_libraries(test-hash-flow PRIVATE OpenSSL::Crypto)
     set_target_properties(test-hash-flow PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Lean memory sizes test (minimal deps)
+    add_executable(test-lean-sizes
+        src/bin/test_lean_sizes.cpp
+    )
+    target_include_directories(test-lean-sizes PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+    )
+    target_link_libraries(test-lean-sizes PRIVATE OpenSSL::Crypto)
+    set_target_properties(test-lean-sizes PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Lean interleaved miner benchmark (full integration test)
+    file(GLOB_RECURSE LEAN_ASTRO_SOURCES
+        src/crypto/astrobwtv3/*.cpp
+        src/crypto/astrobwtv3/*.c
+    )
+    list(APPEND LEAN_ASTRO_SOURCES
+        src/crypto/salsa20_simd.c
+    )
+    # Remove SPSA-dependent files to avoid needing the library
+    list(FILTER LEAN_ASTRO_SOURCES EXCLUDE REGEX ".*spsa_integrated\\.cpp$")
+
+    add_executable(bench-lean-interleaved
+        src/bin/bench_lean_interleaved.cpp
+        ${LEAN_ASTRO_SOURCES}
+    )
+    target_include_directories(bench-lean-interleaved PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${DIRTYBIRD_BOOST_INCLUDES}
+    )
+    target_link_libraries(bench-lean-interleaved
+        ${DIRTYBIRD_BOOST_LIBS}
+        OpenSSL::Crypto
+    )
+    # Disable OpenMP for lean benchmark - we do our own threading and
+    # divsufsort's #pragma omp critical causes global lock contention.
+    # Undefine _OPENMP to make divsufsort use the serial (thread-safe) path.
+    target_compile_options(bench-lean-interleaved PRIVATE -U_OPENMP)
+    # Still link OpenMP for any other potential uses
+    if(OpenMP_FOUND)
+        target_link_libraries(bench-lean-interleaved OpenMP::OpenMP_CXX)
+    endif()
+    if(WIN32)
+        target_link_libraries(bench-lean-interleaved mingw32 wsock32 ws2_32 kernel32)
+    endif()
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench-lean-interleaved PRIVATE -mavx2)
+    endif()
+    set_target_properties(bench-lean-interleaved PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Wolf comparison benchmark
+    add_executable(bench-wolf-comparison
+        src/bin/bench_wolf_comparison.cpp
+        ${LEAN_ASTRO_SOURCES}
+    )
+    target_include_directories(bench-wolf-comparison PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${DIRTYBIRD_BOOST_INCLUDES}
+    )
+    target_link_libraries(bench-wolf-comparison
+        ${DIRTYBIRD_BOOST_LIBS}
+        OpenSSL::Crypto
+    )
+    target_compile_options(bench-wolf-comparison PRIVATE -U_OPENMP)
+    if(OpenMP_FOUND)
+        target_link_libraries(bench-wolf-comparison OpenMP::OpenMP_CXX)
+    endif()
+    if(WIN32)
+        target_link_libraries(bench-wolf-comparison mingw32 wsock32 ws2_32 kernel32)
+    endif()
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench-wolf-comparison PRIVATE -mavx2)
+    endif()
+    set_target_properties(bench-wolf-comparison PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # SA Comparison benchmark (libsais vs divsufsort)
+    add_executable(bench-sa-comparison
+        src/bin/bench_sa_comparison.cpp
+        src/crypto/astrobwtv3/divsufsort.c
+        src/crypto/astrobwtv3/sssort.c
+        src/crypto/astrobwtv3/trsort.c
+        src/crypto/astrobwtv3/utils.c
+        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/src/libsais.c
+    )
+    target_include_directories(bench-sa-comparison PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/crypto/astrobwtv3
+        ${CMAKE_SOURCE_DIR}/../libsais-2.10.4/include
+    )
+    target_compile_options(bench-sa-comparison PRIVATE -U_OPENMP -mavx2 -O3)
+    set_target_properties(bench-sa-comparison PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 endif()

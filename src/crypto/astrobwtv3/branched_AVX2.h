@@ -1,9 +1,17 @@
 #include "astrobwtv3.h"
+#include "lookup_tables.hpp"
 #include "scalar_ops_simd.hpp"
 
 #if defined(__AVX2__)
 
+using namespace astro_branched_simd;
+
 namespace astro_branched_zOp {
+  
+  inline __m256i genMask(workerData &worker, int len) {
+    return _mm256_loadu_si256((__m256i*)&worker.maskTable_bytes[32*len]);
+  }
+
   // arithmetic operations
 
   void __attribute__((noinline)) a0(__m256i &in) {
@@ -1012,8 +1020,9 @@ namespace astro_branched_zOp {
     #pragma GCC unroll 32
     for (int i = worker.pos1; i < worker.pos2; i++)
     {
-      byte newVal = worker.simpleLookup[worker.reg_idx[worker.op]*256 + worker.prev_chunk[i]];
-      if (worker.unchangedBytes[worker.reg_idx[worker.op]].test(worker.prev_chunk[i])) {
+      const uint8_t reg_index = g_reg_idx[worker.op];
+      byte newVal = lookup1D_global[static_cast<size_t>(reg_index) * 256 + worker.prev_chunk[i]];
+      if (g_unchanged_bytes[reg_index].test(worker.prev_chunk[i])) {
         worker.chunk[i] = worker.prev_chunk[i];
       } else {
         // INSERT_RANDOM_CODE_START
@@ -1338,8 +1347,9 @@ namespace astro_branched_zOp {
     #pragma GCC unroll 32
     for (int i = worker.pos1; i < worker.pos2; i++)
     {
-      byte newVal = worker.simpleLookup[worker.reg_idx[worker.op]*256 + worker.prev_chunk[i]];
-      if (worker.unchangedBytes[worker.reg_idx[worker.op]].test(worker.prev_chunk[i])) {
+      const uint8_t reg_index = g_reg_idx[worker.op];
+      byte newVal = lookup1D_global[static_cast<size_t>(reg_index) * 256 + worker.prev_chunk[i]];
+      if (g_unchanged_bytes[reg_index].test(worker.prev_chunk[i])) {
         worker.chunk[i] = worker.prev_chunk[i];
       } else {
         // INSERT_RANDOM_CODE_START
@@ -2583,7 +2593,12 @@ namespace astro_branched_zOp {
   }
 
   void op254(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
+#if USE_CRYPTOGAMS_RC4_DUAL
+    worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+    RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);  // Keep for SPSA S-box access
+#else
     RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
+#endif
 
     p0(data);
     r3(data);
@@ -2595,7 +2610,12 @@ namespace astro_branched_zOp {
   }
 
   void op255(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
+#if USE_CRYPTOGAMS_RC4_DUAL
+    worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+    RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);  // Keep for SPSA S-box access
+#else
     RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
+#endif
 
     p0(data);
     r3(data);
@@ -2607,9 +2627,9 @@ namespace astro_branched_zOp {
   }
 
   void r_op0(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
-    byte newVal = worker.simpleLookup[worker.prev_chunk[worker.pos1]];
+    byte newVal = lookup1D_global[worker.prev_chunk[worker.pos1]];
     __m256i newVec = _mm256_set1_epi8(newVal);
-    data = _mm256_blendv_epi8(data, newVec, genMask(worker.pos2 - worker.pos1));
+    data = _mm256_blendv_epi8(data, newVec, genMask(worker, worker.pos2 - worker.pos1));
     storeStep(worker, data, old, wIndex);
 
     if ((worker.pos2 - worker.pos1) % 2 == 1) {
@@ -2622,28 +2642,30 @@ namespace astro_branched_zOp {
   }
 
   void r_op1(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
-    byte newVal = worker.lookup3D[worker.branched_idx[worker.op] * 256 * 256 +
-                                  worker.prev_chunk[worker.pos2] * 256 +
+    byte newVal = lookup3D_global[static_cast<size_t>(g_branched_idx[worker.op]) * 256 * 256 +
+                                  static_cast<size_t>(worker.prev_chunk[worker.pos2]) * 256 +
                                   worker.prev_chunk[worker.pos1]];
 
     __m256i newVec = _mm256_set1_epi8(newVal);
-    data = _mm256_blendv_epi8(data, newVec, genMask(worker.pos2 - worker.pos1));
+    data = _mm256_blendv_epi8(data, newVec, genMask(worker, worker.pos2 - worker.pos1));
     storeStep(worker, data, old, wIndex);
 
     return;
   }
 
   void r_op2(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
-    byte newVal = worker.simpleLookup[worker.reg_idx[worker.op] * 256 + worker.prev_chunk[worker.pos1]];
+    byte newVal = lookup1D_global[static_cast<size_t>(g_reg_idx[worker.op]) * 256 + worker.prev_chunk[worker.pos1]];
     __m256i newVec = _mm256_set1_epi8(newVal);
-    data = _mm256_blendv_epi8(data, newVec, genMask(worker.pos2 - worker.pos1));
+    data = _mm256_blendv_epi8(data, newVec, genMask(worker, worker.pos2 - worker.pos1));
     storeStep(worker, data, old, wIndex);
   }
 
   void r_op253(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
     storeStep(worker, data, old, wIndex);
     if (worker.isSame) {
-      byte newVal = worker.lookup3D[worker.branched_idx[worker.op]*256*256 + worker.prev_chunk[worker.pos2]*256 + worker.prev_chunk[worker.pos1]];
+      byte newVal = lookup3D_global[static_cast<size_t>(g_branched_idx[worker.op]) * 256 * 256 +
+                                    static_cast<size_t>(worker.prev_chunk[worker.pos2]) * 256 +
+                                    worker.prev_chunk[worker.pos1]];
       if (worker.prev_chunk[worker.pos1] == newVal) {
         worker.prev_lhash = (worker.lhash * (worker.pos2-worker.pos1))+ worker.prev_lhash;
         worker.lhash = XXHash64::hash(worker.chunk, worker.pos2,0);
@@ -2666,7 +2688,12 @@ namespace astro_branched_zOp {
   }
 
   void r_op254(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
+#if USE_CRYPTOGAMS_RC4_DUAL
+    worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+    RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);  // Keep for SPSA S-box access
+#else
     RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
+#endif
 
     p0(data);
     r3(data);
@@ -2678,7 +2705,12 @@ namespace astro_branched_zOp {
   }
 
   void r_op255(workerData &worker, __m256i &data, __m256i &old, int wIndex) {
+#if USE_CRYPTOGAMS_RC4_DUAL
+    worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+    RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);  // Keep for SPSA S-box access
+#else
     RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
+#endif
 
     p0(data);
     r3(data);
@@ -3528,4 +3560,3 @@ namespace astro_branched_zOp {
 }
 
 #endif
-

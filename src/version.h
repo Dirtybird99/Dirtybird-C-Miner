@@ -21,10 +21,10 @@
 #define APP_ID        "dirtybird-miner"
 #define APP_NAME      "DIRTYBIRD Miner"
 #define APP_DESC      "DIRTYBIRD Miner"
-#ifndef DIRTYBIRD_VERSION
-#define DIRTYBIRD_VERSION "" // for linter to be quiet
+#ifndef DIRTYBIRD_VERSION_STR
+#define DIRTYBIRD_VERSION_STR ""
 #endif
-#define APP_VERSION   DIRTYBIRD_VERSION
+#define APP_VERSION   DIRTYBIRD_VERSION_STR
 #define APP_KIND      "miner"
 
 #ifdef _MSC_VER

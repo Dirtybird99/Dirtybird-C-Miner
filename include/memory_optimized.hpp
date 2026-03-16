@@ -163,7 +163,8 @@ static inline void memcpy256_cached(void* dst, const void* src) {
 #endif
 
 /**
- * Incremental copy: only copy the range [start, end).
+ * Incremental copy: copy everything EXCEPT the range [start, end).
+ * Copies [0, start) and [end, 256) from src to dst.
  * Reduces memory traffic when only a small portion changes.
  *
  * Memory savings: (256 - (end - start)) bytes per call
@@ -174,25 +175,13 @@ static inline void memcpy256_cached(void* dst, const void* src) {
 static inline void memcpy_range_avx2(uint8_t* __restrict dst,
                                       const uint8_t* __restrict src,
                                       uint8_t start, uint8_t end) {
-    // Copy everything before start (aligned to 32 bytes)
-    int pre_end = start & ~31;
-    for (int i = 0; i < pre_end; i += 32) {
-        _mm256_storeu_si256((__m256i*)(dst + i), _mm256_loadu_si256((__m256i*)(src + i)));
-    }
-    // Copy remaining bytes before start
-    for (int i = pre_end; i < start; i++) {
+    // Simple scalar implementation for correctness verification
+    // Copy [0, start)
+    for (int i = 0; i < start; i++) {
         dst[i] = src[i];
     }
-
-    // Copy everything after end (aligned to 32 bytes)
-    int post_start = (end + 31) & ~31;
-    if (post_start < 256) {
-        for (int i = post_start; i < 256; i += 32) {
-            _mm256_storeu_si256((__m256i*)(dst + i), _mm256_loadu_si256((__m256i*)(src + i)));
-        }
-    }
-    // Copy remaining bytes after end
-    for (int i = end; i < post_start && i < 256; i++) {
+    // Copy [end, 256)
+    for (int i = end; i < 256; i++) {
         dst[i] = src[i];
     }
 }

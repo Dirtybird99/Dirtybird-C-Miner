@@ -5,8 +5,17 @@
 #include <stdint.h>
 #include <vector>
 
-// Scalar Salsa20 - SIMD version has bugs in column round alignment
-#include "Salsa20.h"
+// Salsa20 implementation selector
+// USE_SIMD_SALSA20: Use AVX2 SIMD Salsa20 for ~2-5% speedup (tested working)
+// Note: ucstk::Salsa20 is always included for struct layout compatibility with SPSA
+#ifndef USE_SIMD_SALSA20
+#define USE_SIMD_SALSA20 0  // Scalar Salsa20: less AVX2 heat for sustained mining
+#endif
+
+#include "Salsa20.h"           // Always needed for struct layout (SPSA binary compat)
+#if USE_SIMD_SALSA20
+#include "salsa20_simd.h"      // SIMD functions for actual processing
+#endif
 
 #include <openssl/sha.h>
 #include <openssl/rc4.h>
@@ -16,26 +25,45 @@
 // USE_CRYPTOGAMS_RC4_DUAL: Enable dual RC4 state optimization
 // CRYPTOGAMS RC4 is used for encryption (25% of iterations)
 // OpenSSL RC4_KEY is maintained for SPSA S-box access
-// DISABLED: Testing hash correctness
-#define USE_CRYPTOGAMS_RC4_DUAL 0
+// ENABLED: Phase 1 optimization
+#ifndef USE_CRYPTOGAMS_RC4_DUAL
+#define USE_CRYPTOGAMS_RC4_DUAL 0  // Disabled: replay-screened slower on this machine
+#endif
 
 // USE_SELECTIVE_MEMCPY: Enable selective copy optimization in wolfCompute
-// Only copies unchanged regions when modified range is small
-// Saves ~50KB per hash (240 bytes × 277 iterations)
-// DISABLED: Testing hash correctness
+// PERMANENTLY DISABLED: wolfPermute reads from chunk[p1:p2) before/during writes,
+// so we MUST copy the entire 256-byte chunk. The optimization premise was wrong:
+// we assumed wolfPermute only writes to [p1,p2) but it reads from chunk too.
+// Investigation complete - this optimization is not possible for AstroBWTv3.
 #define USE_SELECTIVE_MEMCPY 0
 
 // USE_DEROBWT: Enable DeroBWT suffix array implementation
 // Custom tiered fingerprint sorting optimized for AstroBWTv3 workload
-// Expected: +5-10% over divsufsort
-// DISABLED: Currently producing incorrect hashes - needs debugging
+// DISABLED: Testing if this causes regression from 28 KH/s to 10 KH/s
 #define USE_DEROBWT 0
+
+// USE_LOOKUP_TABLES: Enable lookup table optimization for branch operations
+// Replaces compute-intensive AVX2/AVX512 SIMD with memory lookups (~17MB tables)
+// Expected: Reduced thermal throttling due to memory-bound vs compute-bound workload
+// Can be overridden via cmake: -DCMAKE_CXX_FLAGS="-DUSE_LOOKUP_TABLES=0"
+#ifndef USE_LOOKUP_TABLES
+#define USE_LOOKUP_TABLES 1
+#endif
+
+// USE_WORKER_SA_BUCKETS:
+// 1 = keep bA/bB arrays inside workerData (legacy behavior)
+// 0 = use thread-local SA bucket scratch (reduces workerData by ~257KB)
+#ifndef USE_WORKER_SA_BUCKETS
+#define USE_WORKER_SA_BUCKETS 0
+#endif
 
 #define DERO_BATCH 1
 // USE_FAST_RC4: Disabled - OpenSSL RC4 is ~12% faster than FastRc4.
 // Testing showed: FastRc4 = 12.89 KH/s, OpenSSL = 14.41 KH/s (16 threads)
 // The struct layout was fixed (fast_rc4_key moved to end), but it's not beneficial.
+#ifndef USE_FAST_RC4
 #define USE_FAST_RC4 0
+#endif
 #define MAX_LENGTH ((256 * 277) - 1) // this is the maximum
 #define ASTRO_SCRATCH_SIZE ((MAX_LENGTH + 64))
 #define MAX_RUN_LEN 48
@@ -70,18 +98,6 @@ public:
   // For aarch64
   byte aarchFixup[256];
   byte opt[256];
-  // byte simpleLookup[regOps_size*(256*256)];
-  // byte lookup3D[branchedOps_size*256*256];
-  // uint16_t lookup2D[regOps_size*(256*256)];
-  // std::bitset<256> clippedBytes[regOps_size];
-  // std::bitset<256> unchangedBytes[regOps_size];
-  // std::bitset<256> isBranched;
-
-  // byte branchedOps[branchedOps_size*2];
-  // byte regularOps[regOps_size*2];
-
-  // byte branched_idx[256];
-  // byte reg_idx[256];
 
   int lucky = 0;
 
@@ -89,13 +105,7 @@ public:
   uint8_t sha_padding[64];
   ucstk::Salsa20 salsa20;
   RC4_KEY key[DERO_BATCH];
-  // NOTE: fast_rc4_key moved to end of struct to preserve SPSA-compatible layout
-
-#if USE_CRYPTOGAMS_RC4_DUAL
-  // CRYPTOGAMS RC4 for fast encryption (used ~25% of iterations)
-  // OpenSSL RC4_KEY is kept for SPSA S-box access compatibility
-  rc4_cryptogams::CryptogamsRc4 cryptogams_rc4[DERO_BATCH];
-#endif
+  // NOTE: fast_rc4_key and cryptogams_rc4 moved to end of struct to preserve SPSA-compatible layout
 
   // std::vector<std::tuple<int,int,int>> repeats;
 
@@ -113,7 +123,7 @@ public:
 
   bool isSame = false;
 
-  #ifndef USE_ASTRO_SPSA
+  #if !defined(USE_ASTRO_SPSA) && USE_WORKER_SA_BUCKETS
   int bA[256];
   int bB[256*256];
   #endif
@@ -150,10 +160,19 @@ public:
   // int modifiedBytes[MODBUFFER] = {0};
   uint8_t stampTemplates[277];
 
-  // NOTE: buckets_d, bHeads, bHeadIdx required for SPSA library struct layout (cannot remove)
+  #if defined(USE_ASTRO_SPSA)
+  // SPSA-only bucket state. Keep these arrays only when SPSA is compiled in.
+  // This avoids carrying ~896KB/worker in non-SPSA builds.
   uint16_t buckets_d[256][256];
   uint32_t bHeads[256][256];
   uint32_t bHeadIdx[256][256];
+  #endif
+
+#if USE_CRYPTOGAMS_RC4_DUAL
+  // CryptogamsRc4 placed at end to preserve SPSA-compatible struct layout
+  // Used for fast encryption (25% of iterations), OpenSSL RC4_KEY kept for SPSA S-box access
+  rc4_cryptogams::CryptogamsRc4 cryptogams_rc4[DERO_BATCH];
+#endif
 
 #if USE_FAST_RC4
   // FastRc4 placed at end to preserve SPSA-compatible struct layout
@@ -170,4 +189,13 @@ public:
 
   friend std::ostream& operator<<(std::ostream& os, const workerData& wd);
 };
+
+// SPSA-focused zero-allocation SHA256 (defined in sha256_override.cpp)
+// Approximately 40% faster than two sequential hashSHA256 calls on SHA-NI CPUs.
+#if defined(__x86_64__) || defined(_M_X64)
+extern "C" void sha256_2way_ni(
+    const uint8_t* data_a, size_t len_a, uint8_t digest_a[32],
+    const uint8_t* data_b, size_t len_b, uint8_t digest_b[32]);
+#endif
+
 #endif

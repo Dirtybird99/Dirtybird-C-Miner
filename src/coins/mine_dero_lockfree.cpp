@@ -14,7 +14,10 @@
  */
 
 #include "miners.hpp"
+#include "dero_worker_pool.hpp"
 #include "numa_optimizer.hpp"
+#include "dirtybird-hugepages.hpp"
+#include "thermal_governor.hpp"
 #include <astrobwtv3/astrobwtv3.h>
 #include <astrobwtv3/lookupcompute.h>
 
@@ -25,6 +28,7 @@
 #include <boost/thread.hpp>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 
 #ifdef _WIN32
@@ -60,9 +64,13 @@ static inline void write_nonce_be(byte* WORK, uint32_t N) {
 // Prefetch worker data for next hash
 static inline void prefetch_worker(workerData* worker) {
 #if defined(__x86_64__) || defined(_M_X64)
-    // Prefetch frequently accessed worker fields
-    _mm_prefetch((const char*)worker->sData, _MM_HINT_T0);
-    _mm_prefetch((const char*)&worker->sa[0], _MM_HINT_T0);
+    // Prefetch fields that persist across hashes and are read early:
+    // - sha256 context (used at start of AstroBWTv3)
+    // - key[0] (used by RC4 in branch compute)
+    // - lhash/prev_lhash (used to compute random_switcher)
+    // NOTE: sData and sa are overwritten each hash, so prefetching them is wasteful.
+    _mm_prefetch((const char*)&worker->sha256, _MM_HINT_T0);
+    _mm_prefetch((const char*)&worker->key[0], _MM_HINT_T0);
     _mm_prefetch((const char*)&worker->lhash, _MM_HINT_T0);
 #endif
 }
@@ -85,6 +93,14 @@ extern std::vector<uint32_t> g_pcore_logical_ids;
  * 3. Batch counter updates (512 hashes)
  * 4. Lock-free share flag checking
  */
+// External P-core globals (defined in miner.cpp)
+#ifdef _WIN32
+extern bool g_pcores_only;
+extern bool g_no_per_thread_affinity;
+extern int g_pcore_count;
+extern std::vector<uint32_t> g_pcore_logical_ids;
+#endif
+
 void mineDero_LockFree(int tid)
 {
     std::random_device rd;
@@ -93,25 +109,33 @@ void mineDero_LockFree(int tid)
 
 #ifdef _WIN32
     // P-core affinity enforcement
-    if (g_pcores_only && tid > 0 && static_cast<size_t>(tid - 1) < g_pcore_logical_ids.size()) {
+    if (!g_no_per_thread_affinity && g_pcores_only && tid > 0 && static_cast<size_t>(tid - 1) < g_pcore_logical_ids.size()) {
         DWORD targetCore = g_pcore_logical_ids[tid - 1];
         DWORD_PTR mask = 1ULL << targetCore;
         SetThreadAffinityMask(GetCurrentThread(), mask);
     }
 #endif
 
+    // Adaptive: check if this thread was culled before starting
+    if (tid > 0 && tid < MAX_MINING_THREADS && thread_stop[tid].load(std::memory_order_relaxed)) {
+        return;
+    }
+
     // Thread-local state
     thread_local workerData* worker = nullptr;
+    thread_local bool pooled_worker = false;
     thread_local uint64_t localCount = 0;
     thread_local JobSnapshot localJob;
     thread_local std::array<byte, 32> powHash;
     thread_local Num cmpDiff;
+    thread_local std::array<byte, 32> cmpTarget;
 
     // Initialize worker on first call
     if (!worker) {
-        worker = static_cast<workerData*>(NUMAOptimizer::allocateLocal(sizeof(workerData)));
+        worker = getDeroWorkerForThread(tid);
+        pooled_worker = (worker != nullptr);
         if (!worker) {
-            worker = static_cast<workerData*>(std::malloc(sizeof(workerData)));
+            worker = static_cast<workerData*>(malloc_huge_pages(sizeof(workerData)));
         }
         if (!worker) {
             setcolor(RED);
@@ -119,17 +143,19 @@ void mineDero_LockFree(int tid)
             setcolor(BRIGHT_WHITE);
             return;
         }
-
         NUMAOptimizer::optimizeMemoryForMining(worker, sizeof(workerData));
-        initWorker(*worker);
-        lookupGen(*worker, nullptr, nullptr);
+        if (!pooled_worker) {
+            initWorker(*worker);
+            lookupGen(*worker, nullptr, nullptr);
+        }
         localJob.valid = false;
         localJob.counter = -1;
 
 #ifdef DIRTYBIRD_OPENMP
         // Configure OpenMP threads
         if (tid == 0) {
-            int omp_threads = (g_omp_threads > 0) ? g_omp_threads : 2;
+            int omp_threads = (g_omp_threads > 0) ? g_omp_threads
+                                                  : get_auto_omp_threads_for_mining(threads);
             omp_set_num_threads(omp_threads);
             omp_set_dynamic(0);
         }
@@ -148,6 +174,13 @@ void mineDero_LockFree(int tid)
 waitForJob:
     while (!isConnected) {
         CHECK_CLOSE;
+        // Adaptive: check if this thread was culled during warmup
+        if (tid > 0 && tid < MAX_MINING_THREADS && thread_stop[tid].load(std::memory_order_relaxed)) {
+            if (worker && !pooled_worker) { free_huge_pages(worker); }
+            worker = nullptr;
+            pooled_worker = false;
+            return;
+        }
         boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
     }
 
@@ -181,6 +214,7 @@ waitForJob:
                 }
 
                 cmpDiff = ConvertDifficultyToBig(localJob.diff, ALGO_ASTROBWTV3);
+                NumToTarget32(cmpDiff, cmpTarget.data());
                 localJob.valid = true;
             }
 
@@ -213,11 +247,29 @@ waitForJob:
                 // Batch counter update (every 512 hashes)
                 if (++localCount >= 512) {
                     counter.fetch_add(localCount, std::memory_order_relaxed);
+                    // Per-thread counter for adaptive thread management
+                    if (tid > 0 && tid < MAX_MINING_THREADS) {
+                        thread_counters[tid].fetch_add(localCount, std::memory_order_relaxed);
+                    }
                     localCount = 0;
+
+                    // Adaptive: check if this thread was culled
+                    if (tid > 0 && tid < MAX_MINING_THREADS && thread_stop[tid].load(std::memory_order_relaxed)) {
+                        if (worker && !pooled_worker) { free_huge_pages(worker); }
+                        worker = nullptr;
+                        pooled_worker = false;
+                        return;
+                    }
+
+                    // Thermal pacing: if governor detects throttling, yield briefly
+                    // to prevent cliff-throttling. Cost: one atomic load per 512 hashes.
+                    if (thermal::should_thermal_yield()) {
+                        thermal::do_thermal_yield();
+                    }
                 }
 
                 // Check if hash meets difficulty
-                if (CheckHash(powHash.data(), cmpDiff, ALGO_ASTROBWTV3)) {
+                if (CheckHashBytes(powHash.data(), cmpTarget.data())) {
                     // OPTIMIZATION: Lock-free check if someone else is submitting
                     while (submitting) {
                         if (jobCounter != localJob.counter) {
@@ -272,6 +324,14 @@ jobChanged:
         }
 
         if (!isConnected) break;
+    }
+
+    // Adaptive: exit cleanly if this thread was culled
+    if (tid > 0 && tid < MAX_MINING_THREADS && thread_stop[tid].load(std::memory_order_relaxed)) {
+        if (worker && !pooled_worker) { free_huge_pages(worker); }
+        worker = nullptr;
+        pooled_worker = false;
+        return;
     }
 
     goto waitForJob;

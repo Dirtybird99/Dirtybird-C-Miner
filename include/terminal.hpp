@@ -24,7 +24,11 @@ namespace po = boost::program_options;
 #define SCRIPT_EXTENSION ".sh"
 #endif
 
-static const char *versionString = XSTR(DIRTYBIRD_VERSION);
+#ifndef DIRTYBIRD_VERSION_STR
+#define DIRTYBIRD_VERSION_STR ""
+#endif
+
+static const char *versionString = DIRTYBIRD_VERSION_STR;
 static const char *consoleLine = " DIRTYBIRD-MINER ";
 static const char *targetArch = XSTR(CPU_ARCHTARGET);
 
@@ -101,13 +105,22 @@ inline po::options_description get_prog_opts() {
     po::options_description g("General", w);
     g.add_options()
         ("help", "Show help")
+        ("broadcast", "Enable HTTP stats broadcast server")
         ("daemon-address", po::value<std::string>(), "Node/pool address")
         ("port", po::value<int>(), "Connection port")
         ("wallet", po::value<std::string>(), "Wallet address")
-        ("threads", po::value<int>(), "Mining threads (default: 1)")
+        ("threads", po::value<int>(), "Mining threads (default: auto-detect logical CPU threads)")
+        ("report-interval", po::value<int>(), "Status update interval in seconds (default: 1)")
         ("no-lock", "Disable CPU affinity")
+        ("force-lock", "Force CPU affinity even if config disables it")
+        ("no-per-thread-affinity", "Use process-level affinity only (DeroLuna style)")
+        ("no-cpu-auto", "Disable automatic CPU/runtime profile selection")
         ("p-cores-only", "P-cores only (hybrid CPUs)")
         ("differential-affinity", po::value<int>()->default_value(0), "Affinity: 0=default, 1=P-first, 2=physical, 3=balanced")
+        ("show-affinity", "Display detailed CPU affinity assignments")
+        ("ignore-wallet", "Skip wallet validation checks")
+        ("gpu", "Mine with GPU instead of CPU")
+        ("batch-size", po::value<int>(), "(GPU) Batch size")
         ("quiet", "Quiet mode");
     po::options_description s("Stratum", w);
     s.add_options()
@@ -118,14 +131,53 @@ inline po::options_description get_prog_opts() {
     a.add_options()
         ("tune-warmup", po::value<int>()->default_value(1), "Warmup seconds")
         ("tune-duration", po::value<int>()->default_value(2), "Tune duration per algo")
-        ("no-tune", po::value<std::string>(), "Skip tuning: branch|lookup|avx2|wolf|aarch64")
+        ("no-tune", po::value<std::string>(), "Skip tuning: lookup|hybrid|wolf|wolf_memopt|aarch64")
+        ("auto-tune", "Run startup kernel autotune (legacy behavior)")
         ("mine-time", po::value<int>()->default_value(0), "Mine duration (0=infinite)")
-        ("no-spsa", "Disable SPSA")
-        ("omp-threads", po::value<int>()->default_value(0), "OpenMP threads (0=auto)");
+        ("lookup", "Force lookup compute path")
+        ("lookup-mode", po::value<std::string>()->default_value("auto"), "Lookup table mode: auto|1d|3d|full|hybrid|smart")
+        ("lookup-smart-threshold", po::value<int>()->default_value(12), "Smart lookup span threshold (0..32, default 12)")
+        ("lookup-smart-telemetry", "Enable smart lookup path telemetry")
+        ("spsa", po::value<std::string>(), "SPSA path: on|off (default: auto, CPU profile dependent)")
+        ("local-spsa", "Use integrated C++ SPSA path (default)")
+        ("library-spsa", "Use legacy SPSA library path instead of the integrated C++ path")
+        ("spsa-stamp-fast", po::value<std::string>()->default_value("on"), "SPSA decode fast path: on|off")
+        ("spsa-decode-bases", po::value<std::string>()->default_value("off"), "SPSA decode layout: on=use stamp base offsets, off=use start chunks")
+        ("spsa-bucket-prefetch", po::value<std::string>()->default_value("off"), "SPSA bucket prefetch policy: off|light|full")
+        ("spsa-max-data-len", po::value<int>()->default_value(0), "Use SPSA only up to this data_len; larger jobs use direct SA (0=disabled)")
+        ("spsa-hit-counters", po::value<std::string>()->default_value("on"), "SPSA hit/miss atomic counters: on|off")
+        ("spsa-sha-profile", po::value<std::string>()->default_value("off"), "SPSA SHA call-family telemetry: on|off")
+        ("spsa-sha-pair", po::value<std::string>()->default_value("off"), "Pair large SPSA SHA updates across threads: on|off")
+        ("spsa-sha-zeroize", po::value<std::string>()->default_value("on"), "Zero SHA256 context in Final: on|off")
+        ("runtime-parity", po::value<std::string>()->default_value("off"), "Runtime parity preset: off|deroluna")
+        ("no-spsa", "Disable SPSA (legacy alias for --spsa off)")
+        ("verbose-tune", "Print detailed autotune results")
+        ("cache-batch", "Enable cache-focused batched mining")
+        ("cache-batch-hybrid", "Auto-select between standard and cache-batched mining")
+        ("bench-cache-batch", "Run cache-batching benchmark and exit")
+        ("omp-threads", po::value<int>()->default_value(0), "OpenMP threads (0=auto)")
+        ("sa-tune", "Enable SA prefetch autotuning")
+        ("sa-prefetch", po::value<std::string>(), "Set SA prefetch tuple manually (sa,text,bucket)")
+        ("no-sa-tune", "Disable SA prefetch autotuning")
+        ("adaptive", po::value<int>()->implicit_value(0), "Over-provision threads, cull slowest after warmup (0=auto 2x)")
+        ("adaptive-warmup", po::value<int>()->default_value(15), "Adaptive warmup seconds before culling")
+        ("pace-interval", po::value<int>()->default_value(0), "Duty-cycle pacer: hashes between sleeps (0=off)")
+        ("pace-sleep-us", po::value<int>()->default_value(0), "Duty-cycle pacer: microseconds to sleep")
+        ("thermal-yield", po::value<std::string>(), "Thread-side thermal governor backoff: on|off (default: off)")
+        ("interleaved", "2 miners per thread (DeroLuna ILP)")
+        ("lockfree", "Lock-free mining (Go-style thread coordination)")
+        ("bench-interleaved", "Benchmark interleaved vs standard")
+        ("array-telemetry", "Print array-path telemetry (kernel/lookup/SA/SPSA stats)")
+        ("phase-telemetry", "Print per-phase AstroBWT telemetry (prep/wolf/SPSA/SA/hash)")
+        ("print-runtime-config", "Print detailed resolved runtime config at startup")
+        ("no-runtime-config", "Disable detailed runtime config startup print (default)")
+        ("no-power-override", "Disable all power management overrides (RAPL, HWP, EPP, power plan)");
     po::options_description t("Testing", w);
     t.add_options()
         ("test-dero", "Run AstroBWTv3 tests")
-        ("sabench", "SA benchmark");
+        ("sabench", "SA benchmark")
+        ("op", po::value<int>(), "Debug: force specific branch op in test path")
+        ("len", po::value<int>(), "Debug: force specific branch length in test path");
     g.add(s); g.add(a); g.add(t);
     return g;
 }

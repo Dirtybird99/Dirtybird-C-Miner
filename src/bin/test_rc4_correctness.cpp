@@ -1,5 +1,5 @@
 /**
- * Test FastRc4 correctness against OpenSSL RC4
+ * Test FastRc4 and CryptogamsRc4 correctness against OpenSSL RC4
  */
 
 #include <cstdio>
@@ -7,6 +7,7 @@
 #include <cstring>
 #include <openssl/rc4.h>
 #include "crypto/astrobwtv3/rc4_avx512.hpp"
+#include "rc4_cryptogams.hpp"
 
 void print_hex(const char* label, const uint8_t* data, size_t len) {
     printf("%s: ", label);
@@ -143,5 +144,62 @@ int main() {
     print_hex("FastRc4 result", chunk2_fast, 32);
     printf("Match (miner pattern): %s\n", match3 ? "YES" : "NO");
 
-    return (match && match2 && match3) ? 0 : 1;
+    // Test 6: CryptogamsRc4 correctness
+    printf("\n=== CryptogamsRc4 Tests ===\n");
+
+    uint8_t out_cryptogams[256];
+    memcpy(out_cryptogams, input, 256);
+
+    rc4_cryptogams::CryptogamsRc4 cryptogams_key;
+    cryptogams_key.set_key(key, 256);
+    cryptogams_key.apply_keystream_256(out_cryptogams);
+
+    // Compare with OpenSSL (need to reset openssl output)
+    memcpy(out_openssl, input, 256);
+    RC4_set_key(&openssl_key, 256, key);
+    RC4(&openssl_key, 256, out_openssl, out_openssl);
+
+    bool match_cryptogams = memcmp(out_openssl, out_cryptogams, 256) == 0;
+    print_hex("OpenSSL output    ", out_openssl, 32);
+    print_hex("Cryptogams output", out_cryptogams, 32);
+    printf("Match (CryptogamsRc4): %s\n", match_cryptogams ? "YES" : "NO");
+
+    if (!match_cryptogams) {
+        printf("\nFirst differences (CryptogamsRc4):\n");
+        int diff_count = 0;
+        for (int i = 0; i < 256; i++) {
+            if (out_openssl[i] != out_cryptogams[i]) {
+                printf("  [%3d] openssl=0x%02x cryptogams=0x%02x\n",
+                       i, out_openssl[i], out_cryptogams[i]);
+                if (++diff_count >= 10) {
+                    printf("  ... (more differences)\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Test 7: CryptogamsRc4 S-box comparison
+    printf("\n=== CryptogamsRc4 S-box after key setup ===\n");
+    rc4_cryptogams::CryptogamsRc4 cryptogams_key2;
+    cryptogams_key2.set_key(key, 256);
+
+    RC4_set_key(&openssl_key2, 256, key);
+
+    printf("CryptogamsRc4 i=%d, j=%d\n", cryptogams_key2.i, cryptogams_key2.j);
+    printf("CryptogamsRc4 S[0..15]: ");
+    for (int i = 0; i < 16; i++) printf("%02x ", cryptogams_key2.S[i]);
+    printf("\n");
+
+    // Compare S-boxes by doing another encryption and comparing
+    uint8_t test_data1[256], test_data2[256];
+    for (int i = 0; i < 256; i++) {
+        test_data1[i] = test_data2[i] = (uint8_t)i;
+    }
+    RC4(&openssl_key2, 256, test_data1, test_data1);
+    cryptogams_key2.apply_keystream_256(test_data2);
+    bool sbox_match = memcmp(test_data1, test_data2, 256) == 0;
+    printf("S-box functional match: %s\n", sbox_match ? "YES" : "NO");
+
+    return (match && match2 && match3 && match_cryptogams) ? 0 : 1;
 }

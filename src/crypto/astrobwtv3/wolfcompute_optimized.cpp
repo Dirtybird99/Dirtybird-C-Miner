@@ -20,13 +20,45 @@
 #include <xxhash64.h>
 #include <highwayhash/sip_hash.h>
 
+#include <cstdlib>
 #include <openssl/rc4.h>
 #include "rc4_avx512.hpp"
+#include "lookup_tables.hpp"
 
 // Minimum prefix length for template optimization (from astrobwtv3.cpp)
 #ifndef MINPREFLEN
   #define MINPREFLEN 4
 #endif
+
+static inline bool memoptNonbranchedLutEnabled() {
+    static const bool enabled = []() {
+        const char* raw = std::getenv("DIRTYBIRD_MEMOPT_LUT");
+        if (raw == nullptr || raw[0] == '\0') {
+            return true;
+        }
+        const char c = raw[0];
+        return !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
+    }();
+    return enabled;
+}
+
+static inline uint8_t memoptNonbranchedLutSpanMax() {
+    static const uint8_t span_max = []() {
+        const char* raw = std::getenv("DIRTYBIRD_MEMOPT_LUT_SPAN_MAX");
+        if (raw == nullptr || raw[0] == '\0') {
+            return static_cast<uint8_t>(255);
+        }
+        const int value = std::atoi(raw);
+        if (value < 0) {
+            return static_cast<uint8_t>(0);
+        }
+        if (value > 255) {
+            return static_cast<uint8_t>(255);
+        }
+        return static_cast<uint8_t>(value);
+    }();
+    return span_max;
+}
 
 // External declarations
 extern uint16_t* CodeLUT_16;
@@ -141,6 +173,9 @@ void wolfCompute_memopt(workerData &worker, bool isTest, int wIndex)
 
     uint8_t lp1 = 0;
     uint8_t lp2 = 255;
+    const bool phaseTelemetry = isPhaseTelemetryEnabled();
+    std::array<uint64_t, 4> phase_spsa_op_family_calls{0, 0, 0, 0};
+    std::array<uint64_t, 4> phase_spsa_op_family_bytes{0, 0, 0, 0};
 
     worker.tries[wIndex] = 0;
 
@@ -180,6 +215,14 @@ void wolfCompute_memopt(workerData &worker, bool isTest, int wIndex)
 
         worker.pos1 = p1;
         worker.pos2 = p2;
+        const uint8_t span = (worker.pos2 > worker.pos1)
+            ? static_cast<uint8_t>(worker.pos2 - worker.pos1)
+            : 0;
+        if (phaseTelemetry) {
+            const size_t family = classifySpsaOpFamilyForTelemetry(worker.op);
+            phase_spsa_op_family_calls[family] += 1;
+            phase_spsa_op_family_bytes[family] += span;
+        }
 
         worker.chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 1) * 256];
 
@@ -204,6 +247,7 @@ void wolfCompute_memopt(workerData &worker, bool isTest, int wIndex)
         __m256i data = _mm256_loadu_si256((__m256i*)&worker.prev_chunk[worker.pos1]);
         (void)data;  // suppress unused warning - load is for prefetch
 #endif
+        bool used_lookup1d = false;
 
         if (worker.op == 253)
         {
@@ -223,14 +267,51 @@ void wolfCompute_memopt(workerData &worker, bool isTest, int wIndex)
         }
 
         if (worker.op >= 254) {
-#if USE_FAST_RC4
+#if USE_CRYPTOGAMS_RC4_DUAL
+            worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+            RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);  // Keep for SPSA S-box access
+#elif USE_FAST_RC4
             rc4_avx512::fast_rc4_set_key_dual(worker.fast_rc4_key[wIndex], &worker.key[wIndex], 256, worker.prev_chunk);
 #else
             RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
 #endif
         }
 
-        wolfPermute(worker.prev_chunk, worker.chunk, worker.op, worker.pos1, worker.pos2, worker);
+        if (memoptNonbranchedLutEnabled() &&
+            span <= memoptNonbranchedLutSpanMax() &&
+            worker.op < 253 &&
+            g_lookup_tables_initialized &&
+            lookup1D_global != nullptr &&
+            g_is_branched[worker.op] == 0) {
+            const uint8_t* lut = &lookup1D_global[static_cast<size_t>(g_reg_idx[worker.op]) * 256];
+            int i = worker.pos1;
+            for (; i + 15 < worker.pos2; i += 16) {
+                worker.chunk[i]    = lut[worker.prev_chunk[i]];
+                worker.chunk[i+1]  = lut[worker.prev_chunk[i+1]];
+                worker.chunk[i+2]  = lut[worker.prev_chunk[i+2]];
+                worker.chunk[i+3]  = lut[worker.prev_chunk[i+3]];
+                worker.chunk[i+4]  = lut[worker.prev_chunk[i+4]];
+                worker.chunk[i+5]  = lut[worker.prev_chunk[i+5]];
+                worker.chunk[i+6]  = lut[worker.prev_chunk[i+6]];
+                worker.chunk[i+7]  = lut[worker.prev_chunk[i+7]];
+                worker.chunk[i+8]  = lut[worker.prev_chunk[i+8]];
+                worker.chunk[i+9]  = lut[worker.prev_chunk[i+9]];
+                worker.chunk[i+10] = lut[worker.prev_chunk[i+10]];
+                worker.chunk[i+11] = lut[worker.prev_chunk[i+11]];
+                worker.chunk[i+12] = lut[worker.prev_chunk[i+12]];
+                worker.chunk[i+13] = lut[worker.prev_chunk[i+13]];
+                worker.chunk[i+14] = lut[worker.prev_chunk[i+14]];
+                worker.chunk[i+15] = lut[worker.prev_chunk[i+15]];
+            }
+            for (; i < worker.pos2; ++i) {
+                worker.chunk[i] = lut[worker.prev_chunk[i]];
+            }
+            used_lookup1d = true;
+        }
+
+        if (!used_lookup1d) {
+            wolfPermute(worker.prev_chunk, worker.chunk, worker.op, worker.pos1, worker.pos2, worker);
+        }
 
         if (!worker.op) {
             if ((worker.pos2 - worker.pos1) % 2 == 1) {
@@ -254,29 +335,37 @@ after:
         worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
         worker.A = (256 + (worker.A % 256)) % 256;
 
-        if (worker.A < 0x10)
-        { // 6.25 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
-        }
-
-        if (worker.A < 0x20)
-        { // 12.5 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
-        }
-
-        if (worker.A < 0x30)
-        { // 18.75 % probability
-            worker.prev_lhash = worker.lhash + worker.prev_lhash;
-            HH_ALIGNAS(16)
-            const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
-            worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+        // Branchless hash dispatch: single selector + switch/fallthrough
+        // replaces 3 unpredictable cascading if/else branches
+        {
+          const int hash_sel = (worker.A < 0x30) + (worker.A < 0x20) + (worker.A < 0x10);
+          switch (hash_sel) {
+            case 3:  // A < 0x10: XXHash + FNV + SipHash
+              worker.prev_lhash = worker.lhash + worker.prev_lhash;
+              worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
+              [[fallthrough]];
+            case 2:  // A < 0x20: FNV + SipHash
+              worker.prev_lhash = worker.lhash + worker.prev_lhash;
+              worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
+              [[fallthrough]];
+            case 1:  // A < 0x30: SipHash only
+              {
+                worker.prev_lhash = worker.lhash + worker.prev_lhash;
+                HH_ALIGNAS(16)
+                const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
+                worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+              }
+              break;
+            default:  // hash_sel == 0, A >= 0x30: no hash (~81%)
+              break;
+          }
         }
 
         if (worker.A <= 0x40)
         { // 25% probability
-#if USE_FAST_RC4
+#if USE_CRYPTOGAMS_RC4_DUAL
+            worker.cryptogams_rc4[wIndex].apply_keystream_256(worker.chunk);
+#elif USE_FAST_RC4
             rc4_avx512::fast_rc4_dual(worker.fast_rc4_key[wIndex], &worker.key[wIndex], 256, worker.chunk, worker.chunk);
 #else
             RC4(&worker.key[wIndex], 256, worker.chunk, worker.chunk);
@@ -338,6 +427,9 @@ after:
     }
 
     worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
+    if (phaseTelemetry) {
+        addSpsaOpFamilyTelemetryBatch(phase_spsa_op_family_calls, phase_spsa_op_family_bytes);
+    }
 }
 
 // ============================================================================

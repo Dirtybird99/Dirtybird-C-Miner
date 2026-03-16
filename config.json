@@ -1,5 +1,5 @@
 {
-  "daemon-address": "dero-node-ch4k1pu.mysrv.cloud:10300",
-  "wallet": "DERO_WALLET_PLACEHOLDER",
-  "threads": -1
+  "daemon-address": "pool.example.com:10100",
+  "wallet": "YOUR_DERO_WALLET_ADDRESS",
+  "threads": 20
 }

@@ -3,10 +3,16 @@ if (WITH_ASTROBWTV3)
 
     message(STATUS "Building with AstroBWTv3 support (DERO-only)")
 
-    # Custom SA-IS algorithm option (for 70KB inputs)
-    if (USE_CUSTOM_SA)
+    # SA backend selection
+    if (USE_DLUNA_RADIX_SA)
+        add_definitions(-DUSE_DLUNA_RADIX_SA)
+        message(STATUS "Using DeroLuna-style 24-bit radix suffix array")
+    elseif (USE_CUSTOM_SA)
         add_definitions(-DUSE_CUSTOM_SA)
         message(STATUS "Using custom 70KB SA-IS algorithm instead of divsufsort")
+    elseif (USE_LIBSAIS)
+        add_definitions(-DUSE_LIBSAIS)
+        message(STATUS "Using libsais 2.10.4 for suffix array construction (state-of-the-art)")
     else()
         message(STATUS "Using divsufsort for suffix array construction")
     endif()
@@ -29,13 +35,32 @@ if (WITH_ASTROBWTV3)
       src/net/dero/*.cpp
     )
 
+    # Exclude test/benchmark files from production build (saves ~1.5 MB)
+    list(FILTER astroSources EXCLUDE REGEX ".*optimization_tests\\.cpp$")
+    list(FILTER astroSources EXCLUDE REGEX ".*sa_benchmark\\.cpp$")
+    list(FILTER astroSources EXCLUDE REGEX ".*sa_instrumentation\\.c$")
+
     list(APPEND astroSources
+      src/coins/dero_worker_pool.cpp
       src/coins/mine_dero.cpp
       src/coins/mine_dero_batched.cpp
       src/coins/mine_dero_interleaved.cpp
       src/coins/mine_dero_lockfree.cpp
+      src/crypto/sha256_override.cpp
       src/crypto/salsa20_simd.c
     )
+
+    # libsais for faster suffix array construction
+    if (USE_LIBSAIS)
+        set(LIBSAIS_DIR "${CMAKE_SOURCE_DIR}/../libsais-2.10.4")
+        if (EXISTS "${LIBSAIS_DIR}/src/libsais.c")
+            list(APPEND astroSources "${LIBSAIS_DIR}/src/libsais.c")
+            include_directories("${LIBSAIS_DIR}/include")
+            message(STATUS "libsais source added: ${LIBSAIS_DIR}/src/libsais.c")
+        else()
+            message(FATAL_ERROR "libsais not found at ${LIBSAIS_DIR}. Please ensure dero-miner-main/libsais-2.10.4 exists.")
+        endif()
+    endif()
 
     list(APPEND HEADERS_CRYPTO
       ${astroHeaders}

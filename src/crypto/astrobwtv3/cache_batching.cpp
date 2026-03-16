@@ -26,11 +26,33 @@ extern "C" {
   #ifdef USE_CUSTOM_SA
     #include "custom_sa_70kb.h"
   #endif
+  #ifdef USE_LIBSAIS
+    #include "libsais.h"
+  #endif
 }
 
-/* SA_FUNCTION: Dispatch to custom_sa_70kb or divsufsort based on compile-time flag */
-#ifdef USE_CUSTOM_SA
+/* SA_FUNCTION: Dispatch to best available suffix array implementation */
+#ifdef USE_DLUNA_RADIX_SA
+  #include "dluna_radix_sa.h"
+  #define SA_FUNCTION dluna_radix_sa::radix_sort_sa
+#elif defined(USE_BUCKET_SA)
+  #include "bucket_sa.h"
+  #define SA_FUNCTION bucket_sa::bucket_sort_sa
+#elif defined(USE_RADIX_SA)
+  #include "radix_sa.h"
+  #define SA_FUNCTION radix_sa::radix_sort_sa
+#elif defined(USE_CUSTOM_SA)
   #define SA_FUNCTION custom_sa_70kb
+#elif defined(USE_LIBSAIS)
+  static inline int32_t libsais_wrapper_cb(const uint8_t* T, int32_t* SA, int32_t n,
+                                           int32_t* /*bucket_A*/, int32_t* /*bucket_B*/) {
+    static thread_local void* tl_sais_ctx = nullptr;
+    if (tl_sais_ctx == nullptr) {
+      tl_sais_ctx = libsais_create_ctx();
+    }
+    return libsais_ctx(tl_sais_ctx, T, SA, n, 0, nullptr);
+  }
+  #define SA_FUNCTION libsais_wrapper_cb
 #else
   #define SA_FUNCTION divsufsort
 #endif
@@ -184,15 +206,23 @@ void CacheFocusedBatcher::prepareBuffer(int idx, workerData& worker) {
     uint8_t scratch[384] = {0};
     hashSHA256(worker.sha256, buf.input, &scratch[320], buf.inputLen);
 
-    // Step 2: Initialize Salsa20 with SHA256 output
+    // Step 2-3: Salsa20 keystream (SHA256 output as key)
+#if USE_SIMD_SALSA20
+    // SIMD Salsa20 - AVX2 optimized (~2-5% faster)
+    salsa20_simd_process(&scratch[320], &scratch[256], worker.salsaInput, scratch, 256);
+#else
     worker.salsa20.setKey(&scratch[320]);
     worker.salsa20.setIv(&scratch[256]); // IV is zeros
-
-    // Step 3: Salsa20 keystream -> scratch buffer
     worker.salsa20.processBytes(worker.salsaInput, scratch, 256);
+#endif
 
     // Step 4: RC4 encryption of scratch buffer
-#if USE_FAST_RC4
+#if USE_CRYPTOGAMS_RC4_DUAL
+    // CRYPTOGAMS RC4 for fast encryption, sync OpenSSL key for SPSA S-box access
+    worker.cryptogams_rc4[0].set_key(scratch, 256);
+    RC4_set_key(&worker.key[0], 256, scratch);  // Keep for SPSA S-box access
+    worker.cryptogams_rc4[0].apply_keystream_256(scratch);
+#elif USE_FAST_RC4
     // Sync to OpenSSL key for SPSA compatibility
     rc4_avx512::fast_rc4_set_key_dual(worker.fast_rc4_key[0], &worker.key[0], 256, scratch);
     rc4_avx512::fast_rc4_dual(worker.fast_rc4_key[0], &worker.key[0], 256, scratch, scratch);

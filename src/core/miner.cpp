@@ -2,6 +2,7 @@
 #include "dirtybird-common.hpp"
 #include "dirtybird-hugepages.hpp"
 #include "numa_optimizer.hpp"
+#include "thermal_governor.hpp"
 #include "msr.hpp"
 #include "gpulibs.h"
 #include "hipkill.h"
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <string>
 #include <numeric>
+#include <sstream>
 
 #include "miner.h"
 
@@ -29,7 +31,8 @@
 #endif
 
 #include <chrono>
-
+#include <cmath>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <libcubwt.cuh>
@@ -44,11 +47,27 @@
 
 #include <exception>
 
+#if defined(_WIN32)
+#include <timeapi.h>
+#include <cstdio>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#  if defined(_MSC_VER)
+#    include <intrin.h>
+#  else
+#    include <cpuid.h>
+#  endif
+#endif
+
 #include "reporter.hpp"
 
 #include <coins/miners.hpp>
+#include <coins/dero_worker_pool.hpp>
 #include <astrobwtv3/cache_batching.hpp>
 #include <astrobwtv3/interleaved_miner.hpp>
+#include <astrobwtv3/lookup_full.hpp>
+#include <lookup_mode.hpp>
 #include <dirtybird_hip/core/devInfo.hip.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/json.hpp>
@@ -65,6 +84,10 @@
   #include "spsa.hpp"
 #endif
 
+#if USE_LOOKUP_TABLES
+  #include "lookup_tables.hpp"
+#endif
+
 // DERO Miner: uint256_t for difficulty calculations
 using boost::multiprecision::uint256_t;
 
@@ -72,7 +95,7 @@ using boost::multiprecision::uint256_t;
 algo_config_t current_algo_config;
 
 int reportCounter = 0;
-int reportInterval = 3;
+int reportInterval = 1;
 int threads = 0;
 
 bool ABORT_MINER = false;
@@ -97,8 +120,8 @@ std::vector<std::vector<int64_t>> HIP_rates5min(32);
 std::vector<std::vector<int64_t>> HIP_rates1min(32);
 std::vector<std::vector<int64_t>> HIP_rates30sec(32);
 
-std::atomic<int64_t> counter = 0;
-boost::asio::io_context my_context;
+alignas(64) std::atomic<int64_t> counter = 0;
+alignas(64) boost::asio::io_context my_context;
 boost::asio::steady_timer update_timer = boost::asio::steady_timer(my_context);
 std::chrono::time_point<std::chrono::steady_clock> g_start_time = std::chrono::steady_clock::now();
 int mine_time = 0;
@@ -127,8 +150,14 @@ int miniBlockCounter;
 int rejected;
 int accepted;
 
+#if defined(_WIN32)
 bool lockThreads = true;
-bool g_pcores_only = false;  // Limit mining to P-cores only (for hybrid CPUs)
+#else
+bool lockThreads = false;
+#endif
+bool g_no_per_thread_affinity = false;
+bool g_pcores_only = false;
+  // Limit mining to P-cores only (for hybrid CPUs)
 int g_pcore_count = 0;       // Number of P-core logical processors detected
 int g_differential_affinity = 0;  // Differential affinity mode (0=default, 1=P-first, 2=physical-only, 3=balanced)
 bool g_show_affinity = false;     // Show detailed core assignments
@@ -138,6 +167,196 @@ std::vector<uint32_t> g_ecore_logical_ids;  // Logical core IDs for E-cores
 int detectPCores();  // Forward declaration
 #endif
 int g_omp_threads = 0;  // OpenMP threads per mining thread (0 = auto)
+bool g_no_power_override = false;  // --no-power-override: disable all power management
+bool g_is_laptop = false;          // Auto-detected: system has a battery
+bool g_on_battery_power = false;   // Auto-detected: battery-capable system is off AC power
+
+// Adaptive thread management (DeroLuna-style over-provisioning)
+std::atomic<int64_t> thread_counters[MAX_MINING_THREADS] = {};
+std::atomic<bool> thread_stop[MAX_MINING_THREADS] = {};
+bool g_adaptive_threads = false;
+int g_adaptive_warmup_secs = 15;
+int g_overprovision_count = 0;
+
+#if defined(_WIN32)
+// Detect whether the system is battery-capable and whether it is currently off AC power.
+static void detectPowerState() {
+    g_is_laptop = false;
+    g_on_battery_power = false;
+
+    SYSTEM_POWER_STATUS sps;
+    if (GetSystemPowerStatus(&sps)) {
+        // BatteryFlag 128 = no battery, 255 = unknown.
+        g_is_laptop = (sps.BatteryFlag != 128 && sps.BatteryFlag != 255);
+        // ACLineStatus: 0 = offline, 1 = online, 255 = unknown.
+        // Treat unknown as battery mode on mobile systems so we fail safe.
+        g_on_battery_power = g_is_laptop && sps.ACLineStatus != 1;
+    }
+}
+
+// Power plan save/restore
+static char g_saved_power_scheme[64] = {0};
+
+static void savePowerScheme() {
+    FILE* pipe = _popen("powercfg /getactivescheme 2>nul", "r");
+    if (pipe) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), pipe)) {
+            char* start = strchr(buf, ':');
+            if (start) {
+                start += 2;
+                char* end = strchr(start, ' ');
+                if (end) {
+                    size_t len = end - start;
+                    if (len < sizeof(g_saved_power_scheme)) {
+                        strncpy(g_saved_power_scheme, start, len);
+                        g_saved_power_scheme[len] = '\0';
+                    }
+                }
+            }
+        }
+        _pclose(pipe);
+    }
+}
+
+static void applyHighPerformancePower() {
+    savePowerScheme();
+
+    if (g_on_battery_power) {
+        // Battery power: use Balanced power plan with moderate tuning
+        // Avoids draining the battery and fighting the platform's battery policy.
+        system("powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e >nul 2>&1");
+        // Allow full range but don't force minimum to 100%
+        system("powercfg -setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 5 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100 >nul 2>&1");
+        // Moderate boost
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFBOOSTMODE 2 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFBOOSTPOL 60 >nul 2>&1");
+        // EPP = 128 (balanced) instead of 0 (max perf) — lets CPU manage thermals
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFEPP 128 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFINCPOL 2 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFDECPOL 1 >nul 2>&1");
+        system("powercfg -setactive scheme_current >nul 2>&1");
+
+        setcolor(CYAN);
+        printf("Power: Battery power detected - using balanced profile (EPP=128)\n");
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+    } else {
+        // AC power: use the aggressive performance path on both desktops and plugged-in laptops.
+        system("powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 100 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFBOOSTMODE 2 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFBOOSTPOL 100 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFEPP 0 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFINCPOL 2 >nul 2>&1");
+        system("powercfg -setacvalueindex scheme_current sub_processor PERFDECPOL 1 >nul 2>&1");
+        system("powercfg -setactive scheme_current >nul 2>&1");
+
+        if (g_is_laptop) {
+            setcolor(CYAN);
+            printf("Power: AC power detected on battery-capable system - using performance profile (EPP=0)\n");
+            fflush(stdout);
+            setcolor(BRIGHT_WHITE);
+        }
+    }
+}
+
+static void restorePowerScheme() {
+    if (g_saved_power_scheme[0]) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "powercfg /setactive %s >nul 2>&1", g_saved_power_scheme);
+        system(cmd);
+    }
+}
+
+// MSR-based HWP optimization (per-core)
+static void applyMSRPerformanceOptimizations() {
+    // Try to initialize MSR access via WinRing0
+    if (!initMSRAccess()) return;
+
+    int numCores = std::thread::hardware_concurrency();
+
+    // Read and report RAPL power limits
+    {
+        uint64_t unitRaw = 0;
+        if (readMSR(0x606, unitRaw, 0)) {
+            double powerUnit = 1.0 / (1 << (unitRaw & 0xF));
+            double timeUnit = 1.0 / (1 << ((unitRaw >> 16) & 0xF));
+
+            uint64_t pkgLimit = 0;
+            if (readMSR(0x610, pkgLimit, 0)) {
+                bool locked = (pkgLimit >> 63) & 1;
+                double pl1 = (pkgLimit & 0x7FFF) * powerUnit;
+                double pl2 = ((pkgLimit >> 32) & 0x7FFF) * powerUnit;
+
+                uint32_t pl2_time_raw = (pkgLimit >> 49) & 0x7F;
+                uint32_t pl2_y = pl2_time_raw & 0x1F;
+                uint32_t pl2_z = (pl2_time_raw >> 5) & 0x3;
+                double pl2_tau = pow(2.0, pl2_y) * (1.0 + pl2_z / 4.0) * timeUnit;
+
+                setcolor(CYAN);
+                printf("RAPL: PL1=%.0fW PL2=%.0fW tau=%.1fs %s\n",
+                       pl1, pl2, pl2_tau, locked ? "[LOCKED]" : "[UNLOCKED]");
+                fflush(stdout);
+                setcolor(BRIGHT_WHITE);
+
+                // On battery power: do NOT override RAPL PL1.
+                // On AC power: raise PL1 to match PL2 for stable peak performance.
+                if (!locked && !g_on_battery_power) {
+                    uint64_t pl2_raw_val = (pkgLimit >> 32) & 0x7FFF;
+                    uint64_t newValue = pl2_raw_val          // PL1 power = PL2 power
+                                      | (1ULL << 15)         // PL1 enable
+                                      | (1ULL << 16)         // PL1 clamp
+                                      | (0x7FULL << 17)      // PL1 max time window
+                                      | (pl2_raw_val << 32)  // PL2 power unchanged
+                                      | (1ULL << 47)         // PL2 enable
+                                      | (1ULL << 48)         // PL2 clamp
+                                      | (0x7FULL << 49);     // PL2 max time window
+                    if (writeMSR(0x610, newValue, 0)) {
+                        setcolor(BRIGHT_GREEN);
+                        printf("RAPL: Raised PL1 to %.0fW (was %.0fW), max time windows\n", pl2, pl1);
+                        fflush(stdout);
+                        setcolor(BRIGHT_WHITE);
+                    }
+                } else if (!locked && g_on_battery_power) {
+                    setcolor(CYAN);
+                    printf("RAPL: Battery mode - preserving PL1=%.0fW (not raising to PL2)\n", pl1);
+                    fflush(stdout);
+                    setcolor(BRIGHT_WHITE);
+                }
+            }
+        }
+    }
+
+    // Set HWP performance on all cores
+    // Battery mode: EPP=128 (balanced), AC mode: EPP=0 (max performance)
+    uint8_t epp = g_on_battery_power ? 0x80 : 0x00;
+    for (int core = 0; core < numCores; core++) {
+        uint64_t caps = 0;
+        if (readMSR(0x771, caps, core)) {
+            uint8_t highest = caps & 0xFF;
+            uint64_t hwp = (uint64_t)highest
+                         | ((uint64_t)highest << 8)
+                         | ((uint64_t)highest << 16)
+                         | ((uint64_t)epp << 24);
+            writeMSR(0x774, hwp, core);
+        }
+        // Energy perf bias: battery=8 (balanced), AC=0 (max performance)
+        writeMSR(0x1B0, g_on_battery_power ? 0x8 : 0x0, core);
+    }
+
+    setcolor(CYAN);
+    if (g_on_battery_power) {
+        printf("MSR: HWP balanced (EPP=%d) applied to %d cores\n", epp, numCores);
+    } else {
+        printf("MSR: HWP max performance + EPP=0 applied to %d cores\n", numCores);
+    }
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+}
+#endif
 
 //static int firstRejected;
 
@@ -156,9 +375,23 @@ bool useLookupMine = false;
 std::string devWallet = "";
 double devFee = 0.0;
 
-// SPSA control - can be disabled with --no-spsa for benchmarking
-bool g_use_spsa = true;
+// SPSA control - default OFF until replay/test parity is restored.
+// Use --spsa on to opt back into the library fast path for live tuning.
+bool g_use_spsa = false;
+bool g_use_local_spsa = true; // Default to the integrated C++ SPSA path; current live tests show it is both correct and faster
+bool g_spsa_stamp_fast = true;
+bool g_spsa_decode_bases = true;
+int g_spsa_bucket_prefetch = 0;
+int g_spsa_max_data_len = 0;
+bool g_spsa_hit_counters = true;
+bool g_spsa_sha_profile = false;
+bool g_spsa_sha_pair = false;
+bool g_spsa_sha_zeroize = true;  // Enabled by default: current live probes keep the SPSA core slightly faster with zeroize on
 bool g_verbose_tune = false;
+bool g_array_telemetry = false;
+bool g_phase_telemetry = false;
+int g_lookup_smart_threshold = 12;
+bool g_lookup_smart_telemetry = false;
 
 std::vector<int64_t> rate5min;
 std::vector<int64_t> rate1min;
@@ -176,8 +409,9 @@ bool beQuiet = false;
 /* Start definitions from astrobwtv3.h */
 #if defined(DIRTYBIRD_ASTROBWTV3)
 AstroFunc allAstroFuncs[] = {
-  // {"branch", branchComputeCPU},
-  // {"lookup", lookupCompute},
+#if USE_LOOKUP_TABLES
+  {"lookup", lookupCompute},  // Memory-bound lookup tables (reduced thermal throttling)
+#endif
   {"wolf", wolfCompute},
   {"wolf_memopt", wolfCompute_memopt},  // Memory-optimized version with incremental copy
 #if defined(__AVX2__)
@@ -199,10 +433,237 @@ boost::mutex mutex;
 boost::mutex reportMutex;
 boost::mutex jobMutex;  // Protects job-related globals (ourHeight, isConnected, etc.)
 
-uint16_t *lookup2D_global; // Storage for computed values of 2-byte chunks
-byte *lookup3D_global;     // Storage for deterministically computed values of 1-byte chunks
+uint8_t *lookup1D_global;  // Regular ops: 152 x 256 = 38 KB (L1 cache)
+byte *lookup3D_global;     // Optional branched table: 104 x 256 x 256 = 6.5 MB
+bool g_print_runtime_config = false;
+std::string g_runtime_parity = "off";
+bool g_cpu_auto_profile = true;
+std::string g_auto_default_astro_kernel = "wolf_memopt";
+static const char* lookupModeToString(LookupMode mode);
 
 using byte = unsigned char;
+
+namespace {
+
+struct CpuRuntimeProfileSummary {
+  std::string vendor;
+  std::string vendor_name;
+  std::string brand;
+  unsigned logical_threads = 0;
+  int p_logical = 0;
+  int e_logical = 0;
+  bool hybrid = false;
+  bool avx2 = false;
+  bool avx512f = false;
+  bool aes = false;
+  bool sha = false;
+};
+
+bool optionExplicit(const po::variables_map& vm, const char* name) {
+  auto it = vm.find(name);
+  return it != vm.end() && !it->second.defaulted();
+}
+
+std::string collapseWhitespace(std::string value) {
+  std::istringstream iss(value);
+  std::ostringstream oss;
+  std::string token;
+  bool first = true;
+  while (iss >> token) {
+    if (!first) {
+      oss << ' ';
+    }
+    oss << token;
+    first = false;
+  }
+  return oss.str();
+}
+
+void cpuidQuery(uint32_t level, uint32_t count, uint32_t* abcd) {
+#if defined(__x86_64__) || defined(_M_X64)
+#  if defined(_MSC_VER)
+  int regs[4] = {};
+  __cpuidex(regs, static_cast<int>(level), static_cast<int>(count));
+  for (int i = 0; i < 4; ++i) {
+    abcd[i] = static_cast<uint32_t>(regs[i]);
+  }
+#  else
+  uint32_t a = 0;
+  uint32_t b = 0;
+  uint32_t c = 0;
+  uint32_t d = 0;
+  __cpuid_count(level, count, a, b, c, d);
+  abcd[0] = a;
+  abcd[1] = b;
+  abcd[2] = c;
+  abcd[3] = d;
+#  endif
+#else
+  abcd[0] = abcd[1] = abcd[2] = abcd[3] = 0;
+  (void)level;
+  (void)count;
+#endif
+}
+
+std::string detectCpuVendorString() {
+#if defined(__x86_64__) || defined(_M_X64)
+  uint32_t abcd[4] = {};
+  cpuidQuery(0, 0, abcd);
+  char vendor[13] = {};
+  std::memcpy(vendor, &abcd[1], 4);
+  std::memcpy(vendor + 4, &abcd[3], 4);
+  std::memcpy(vendor + 8, &abcd[2], 4);
+  vendor[12] = '\0';
+  return collapseWhitespace(vendor);
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return "ARM64";
+#else
+  return dirtybirdTargetArch;
+#endif
+}
+
+std::string detectCpuBrandString() {
+#if defined(__x86_64__) || defined(_M_X64)
+  uint32_t abcd[4] = {};
+  cpuidQuery(0x80000000U, 0, abcd);
+  if (abcd[0] < 0x80000004U) {
+    return detectCpuVendorString();
+  }
+
+  char brand[49] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    cpuidQuery(0x80000002U + i, 0, abcd);
+    std::memcpy(brand + (i * 16), abcd, sizeof(abcd));
+  }
+  brand[48] = '\0';
+  return collapseWhitespace(brand);
+#else
+  return detectCpuVendorString();
+#endif
+}
+
+std::string normalizeCpuVendorName(const std::string& vendor) {
+  if (vendor == "GenuineIntel") {
+    return "Intel";
+  }
+  if (vendor == "AuthenticAMD") {
+    return "AMD";
+  }
+  if (vendor == "ARM64") {
+    return "ARM64";
+  }
+  if (!vendor.empty()) {
+    return vendor;
+  }
+  return dirtybirdTargetArch;
+}
+
+CpuRuntimeProfileSummary detectCpuRuntimeProfileSummary() {
+  CpuRuntimeProfileSummary cpu{};
+  cpu.vendor = detectCpuVendorString();
+  cpu.vendor_name = normalizeCpuVendorName(cpu.vendor);
+  cpu.brand = detectCpuBrandString();
+  cpu.logical_threads = processor_count > 0 ? processor_count : 1;
+
+#if defined(__x86_64__) || defined(_M_X64)
+  cpu.avx2 = __builtin_cpu_supports("avx2");
+  cpu.avx512f = __builtin_cpu_supports("avx512f");
+  cpu.aes = __builtin_cpu_supports("aes");
+#endif
+  cpu.sha = has_sha_ni_support_cached();
+
+#if defined(_WIN32)
+  if (g_pcore_count == 0) {
+    detectPCores();
+  }
+  cpu.p_logical = g_pcore_count;
+  cpu.e_logical = static_cast<int>(g_ecore_logical_ids.size());
+  cpu.hybrid = cpu.p_logical > 0 && cpu.e_logical > 0;
+#endif
+
+  return cpu;
+}
+
+void applyCpuRuntimeProfile(const po::variables_map& vm, const CpuRuntimeProfileSummary& cpu) {
+  if (!g_cpu_auto_profile || g_runtime_parity != "off") {
+    return;
+  }
+
+  const bool explicit_kernel =
+      optionExplicit(vm, "lookup") ||
+      optionExplicit(vm, "no-tune") ||
+      optionExplicit(vm, "auto-tune") ||
+      optionExplicit(vm, "interleaved") ||
+      optionExplicit(vm, "lockfree") ||
+      optionExplicit(vm, "cache-batch") ||
+      optionExplicit(vm, "cache-batch-hybrid");
+
+  if (!explicit_kernel && cpu.avx2) {
+    useLookupMine = true;
+    g_auto_default_astro_kernel = "lookup";
+    if (!optionExplicit(vm, "lookup-mode")) {
+      g_lookup_mode = LOOKUP_MODE_3D;
+    }
+  }
+
+  if (!optionExplicit(vm, "spsa") && !optionExplicit(vm, "no-spsa")) {
+    g_use_spsa = true;
+  }
+
+  if (!optionExplicit(vm, "local-spsa") && !optionExplicit(vm, "library-spsa")) {
+    g_use_local_spsa = true;
+  }
+}
+
+std::string buildCpuSummaryLine(const CpuRuntimeProfileSummary& cpu) {
+  std::ostringstream oss;
+  oss << (cpu.vendor_name.empty() ? cpu.vendor : cpu.vendor_name)
+      << " | " << cpu.logical_threads << " threads";
+
+  if (cpu.hybrid) {
+    oss << " | hybrid P" << cpu.p_logical << "/E" << cpu.e_logical;
+  }
+
+  if (!cpu.brand.empty() &&
+      cpu.brand != cpu.vendor &&
+      cpu.brand != cpu.vendor_name) {
+    oss << " | " << cpu.brand;
+  }
+
+  return oss.str();
+}
+
+std::string buildRuntimeSummaryLine() {
+  std::ostringstream oss;
+  oss << "kernel=" << getCurrentAstroAlgoName();
+  if (useLookupMine) {
+    oss << "/" << lookupModeToString(g_lookup_mode);
+  }
+  oss << " | spsa=";
+  if (g_use_spsa) {
+    oss << (g_use_local_spsa ? "local" : "library");
+  } else {
+    oss << "off";
+  }
+  oss << " | threads=" << threads;
+#ifdef DIRTYBIRD_OPENMP
+  oss << " | omp=" << (g_omp_threads > 0 ? g_omp_threads : get_auto_omp_threads_for_mining(threads > 0 ? threads : 1));
+#endif
+#if defined(_WIN32)
+  if (!lockThreads) {
+    oss << " | affinity=off";
+  } else if (g_no_per_thread_affinity) {
+    oss << " | affinity=process";
+  } else {
+    oss << " | affinity=per-thread";
+  }
+#else
+  oss << " | affinity=" << (lockThreads ? "on" : "off");
+#endif
+  return oss.str();
+}
+
+} // namespace
 
 //------------------------------------------------------------------------------
 
@@ -260,11 +721,16 @@ void hipKill() {
 }
 
 void onExit() {
+  #if defined(_WIN32)
+  timeEndPeriod(1);
+  restorePowerScheme();
+  #endif
   hipKill();
   ABORT_MINER = true;
   setcolor(BRIGHT_WHITE);
   if(printHashrateOnExit) {
-    printf("\n\n%s: %d threads @ %2.2f with %d shares accepted (built with ", miningProfile.coin.coinPrettyName.c_str(), threads, latest_hashrate, accepted);
+    printf("\n\n%s: %d threads @ %2.2f with %d miniblocks and %d blocks (built with ",
+           miningProfile.coin.coinPrettyName.c_str(), threads, latest_hashrate, accepted, blockCounter);
 #ifdef __clang__
     std::cout << "Clang "
               << __clang_major__ << "."
@@ -424,6 +890,13 @@ bool loadConfig(const std::string& configPath, po::variables_map& vm) {
     insertString("password");
     insertString("no-tune");
     insertString("sa-prefetch");
+    insertString("lookup-mode");
+    insertString("spsa");
+    insertString("spsa-stamp-fast");
+    insertString("spsa-decode-bases");
+    insertString("spsa-bucket-prefetch");
+    insertString("thermal-yield");
+    insertString("runtime-parity");
 
     // Load integer options
     insertInt("port");
@@ -437,6 +910,10 @@ bool loadConfig(const std::string& configPath, po::variables_map& vm) {
     insertInt("mine-time");
     insertInt("dero-benchmark");
     insertInt("omp-threads");
+    insertInt("pace-interval");
+    insertInt("pace-sleep-us");
+    insertInt("adaptive-warmup");
+    insertInt("lookup-smart-threshold");
 
     // Load boolean options (these are flags, so we only set if true in config)
     if (obj.contains("no-lock") && !vm.count("no-lock")) {
@@ -465,6 +942,11 @@ bool loadConfig(const std::string& configPath, po::variables_map& vm) {
             vm.insert(std::make_pair("lookup", po::variable_value()));
         }
     }
+    if (obj.contains("auto-tune") && !vm.count("auto-tune")) {
+        if (obj.at("auto-tune").is_bool() && obj.at("auto-tune").as_bool()) {
+            vm.insert(std::make_pair("auto-tune", po::variable_value()));
+        }
+    }
     if (obj.contains("stratum") && !vm.count("stratum")) {
         if (obj.at("stratum").is_bool() && obj.at("stratum").as_bool()) {
             vm.insert(std::make_pair("stratum", po::variable_value()));
@@ -488,6 +970,90 @@ bool loadConfig(const std::string& configPath, po::variables_map& vm) {
     if (obj.contains("no-sa-tune") && !vm.count("no-sa-tune")) {
         if (obj.at("no-sa-tune").is_bool() && obj.at("no-sa-tune").as_bool()) {
             vm.insert(std::make_pair("no-sa-tune", po::variable_value()));
+        }
+    }
+    if (obj.contains("cache-batch") && !vm.count("cache-batch")) {
+        if (obj.at("cache-batch").is_bool() && obj.at("cache-batch").as_bool()) {
+            vm.insert(std::make_pair("cache-batch", po::variable_value()));
+        }
+    }
+    if (obj.contains("cache-batch-hybrid") && !vm.count("cache-batch-hybrid")) {
+        if (obj.at("cache-batch-hybrid").is_bool() && obj.at("cache-batch-hybrid").as_bool()) {
+            vm.insert(std::make_pair("cache-batch-hybrid", po::variable_value()));
+        }
+    }
+    if (obj.contains("bench-cache-batch") && !vm.count("bench-cache-batch")) {
+        if (obj.at("bench-cache-batch").is_bool() && obj.at("bench-cache-batch").as_bool()) {
+            vm.insert(std::make_pair("bench-cache-batch", po::variable_value()));
+        }
+    }
+    if (obj.contains("interleaved") && !vm.count("interleaved")) {
+        if (obj.at("interleaved").is_bool() && obj.at("interleaved").as_bool()) {
+            vm.insert(std::make_pair("interleaved", po::variable_value()));
+        }
+    }
+    if (obj.contains("bench-interleaved") && !vm.count("bench-interleaved")) {
+        if (obj.at("bench-interleaved").is_bool() && obj.at("bench-interleaved").as_bool()) {
+            vm.insert(std::make_pair("bench-interleaved", po::variable_value()));
+        }
+    }
+    if (obj.contains("lockfree") && !vm.count("lockfree")) {
+        if (obj.at("lockfree").is_bool() && obj.at("lockfree").as_bool()) {
+            vm.insert(std::make_pair("lockfree", po::variable_value()));
+        }
+    }
+    if (obj.contains("print-runtime-config") && !vm.count("print-runtime-config")) {
+        if (obj.at("print-runtime-config").is_bool() && obj.at("print-runtime-config").as_bool()) {
+            vm.insert(std::make_pair("print-runtime-config", po::variable_value()));
+        }
+    }
+    if (obj.contains("array-telemetry") && !vm.count("array-telemetry")) {
+        if (obj.at("array-telemetry").is_bool() && obj.at("array-telemetry").as_bool()) {
+            vm.insert(std::make_pair("array-telemetry", po::variable_value()));
+        }
+    }
+    if (obj.contains("phase-telemetry") && !vm.count("phase-telemetry")) {
+        if (obj.at("phase-telemetry").is_bool() && obj.at("phase-telemetry").as_bool()) {
+            vm.insert(std::make_pair("phase-telemetry", po::variable_value()));
+        }
+    }
+    if (obj.contains("lookup-smart-telemetry") && !vm.count("lookup-smart-telemetry")) {
+        if (obj.at("lookup-smart-telemetry").is_bool() && obj.at("lookup-smart-telemetry").as_bool()) {
+            vm.insert(std::make_pair("lookup-smart-telemetry", po::variable_value()));
+        }
+    }
+    if (obj.contains("local-spsa") && !vm.count("local-spsa")) {
+        if (obj.at("local-spsa").is_bool() && obj.at("local-spsa").as_bool()) {
+            vm.insert(std::make_pair("local-spsa", po::variable_value()));
+        }
+    }
+    if (obj.contains("library-spsa") && !vm.count("library-spsa")) {
+        if (obj.at("library-spsa").is_bool() && obj.at("library-spsa").as_bool()) {
+            vm.insert(std::make_pair("library-spsa", po::variable_value()));
+        }
+    }
+    if (obj.contains("spsa") && !vm.count("spsa")) {
+        if (obj.at("spsa").is_bool()) {
+            vm.insert(std::make_pair(
+                "spsa",
+                po::variable_value(std::string(obj.at("spsa").as_bool() ? "on" : "off"), false)));
+        }
+    }
+    if (obj.contains("spsa-max-data-len") && !vm.count("spsa-max-data-len")) {
+        if (obj.at("spsa-max-data-len").is_int64()) {
+            vm.insert(std::make_pair("spsa-max-data-len", po::variable_value(obj.at("spsa-max-data-len").as_int64(), false)));
+        } else if (obj.at("spsa-max-data-len").is_uint64()) {
+            vm.insert(std::make_pair("spsa-max-data-len", po::variable_value(static_cast<int64_t>(obj.at("spsa-max-data-len").as_uint64()), false)));
+        }
+    }
+    if (obj.contains("no-runtime-config") && !vm.count("no-runtime-config")) {
+        if (obj.at("no-runtime-config").is_bool() && obj.at("no-runtime-config").as_bool()) {
+            vm.insert(std::make_pair("no-runtime-config", po::variable_value()));
+        }
+    }
+    if (obj.contains("no-cpu-auto") && !vm.count("no-cpu-auto")) {
+        if (obj.at("no-cpu-auto").is_bool() && obj.at("no-cpu-auto").as_bool()) {
+            vm.insert(std::make_pair("no-cpu-auto", po::variable_value()));
         }
     }
 
@@ -534,9 +1100,225 @@ std::string findConfigFile() {
     return "";  // No config file found
 }
 
+static const char* lookupModeToString(LookupMode mode) {
+  switch (mode) {
+    case LOOKUP_MODE_1D: return "1d";
+    case LOOKUP_MODE_3D: return "3d";
+    case LOOKUP_MODE_FULL: return "full";
+    case LOOKUP_MODE_HYBRID: return "hybrid";
+    case LOOKUP_MODE_SMART: return "smart";
+    default: return "unknown";
+  }
+}
+
+static const char* deroModeToString(DeroMiningMode mode) {
+  switch (mode) {
+    case DERO_MINE_STANDARD: return "standard";
+    case DERO_MINE_BATCHED: return "cache-batch";
+    case DERO_MINE_HYBRID: return "cache-batch-hybrid";
+    case DERO_MINE_INTERLEAVED: return "interleaved";
+    case DERO_MINE_LOCKFREE: return "lockfree";
+    default: return "unknown";
+  }
+}
+
+static const char* spsaBucketPrefetchModeToString(int mode) {
+  switch (mode) {
+    case 0: return "off";
+    case 1: return "light";
+    case 2: return "full";
+    default: return "off";
+  }
+}
+
+static LookupMode parseLookupMode(const std::string& rawValue) {
+  std::string value = rawValue;
+  boost::algorithm::to_lower(value);
+
+  if (value == "auto") {
+    return LOOKUP_MODE_HYBRID;
+  }
+  if (value == "1d") {
+    return LOOKUP_MODE_1D;
+  }
+  if (value == "3d") {
+    return LOOKUP_MODE_3D;
+  }
+  if (value == "full") {
+    return LOOKUP_MODE_FULL;
+  }
+  if (value == "hybrid") {
+    return LOOKUP_MODE_HYBRID;
+  }
+  if (value == "smart") {
+    return LOOKUP_MODE_SMART;
+  }
+
+  throw po::validation_error(po::validation_error::invalid_option_value, "lookup-mode");
+}
+
+static int parseSpsaBucketPrefetchMode(const std::string& rawValue) {
+  std::string value = rawValue;
+  boost::algorithm::to_lower(value);
+
+  if (value == "off" || value == "0") {
+    return 0;
+  }
+  if (value == "light" || value == "1") {
+    return 1;
+  }
+  if (value == "full" || value == "2") {
+    return 2;
+  }
+
+  throw po::validation_error(po::validation_error::invalid_option_value, "spsa-bucket-prefetch");
+}
+
+static bool parseOnOffValue(const std::string& rawValue, const char* optionName) {
+  std::string value = rawValue;
+  boost::algorithm::to_lower(value);
+  if (value == "on" || value == "true" || value == "1") {
+    return true;
+  }
+  if (value == "off" || value == "false" || value == "0") {
+    return false;
+  }
+  throw po::validation_error(po::validation_error::invalid_option_value, optionName);
+}
+
+static bool applyRuntimeParityPreset(const po::variables_map& vm, bool quiet) {
+  if (g_runtime_parity.empty() || g_runtime_parity == "off") {
+    return true;
+  }
+
+  if (g_runtime_parity != "deroluna") {
+    setcolor(YELLOW);
+    std::cerr << "Warning: unknown runtime-parity preset '" << g_runtime_parity
+              << "', using 'off'\n";
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+    g_runtime_parity = "off";
+    return true;
+  }
+
+  // Preserve explicit user flags; only fill in defaults.
+  if (!vm.count("lookup")) {
+    useLookupMine = true;
+  }
+  if (!vm.count("lookup-mode")) {
+    g_lookup_mode = LOOKUP_MODE_HYBRID;
+  }
+  if (!vm.count("omp-threads")) {
+    g_omp_threads = 1;
+  }
+  if (!vm.count("adaptive")) {
+    g_adaptive_threads = false;
+    g_overprovision_count = 0;
+  }
+  if (vm.count("no-lock")) {
+    lockThreads = false;
+  }
+  if (vm.count("no-per-thread-affinity")) {
+    g_no_per_thread_affinity = true;
+    #ifdef _WIN32
+    // Set process affinity to all available cores (DeroLuna style)
+    // This allows the OS to migrate threads for thermal balance.
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    SetProcessAffinityMask(GetCurrentProcess(), sysInfo.dwActiveProcessorMask);
+    #endif
+  }
+
+#if defined(_WIN32)
+  if (!vm.count("differential-affinity")) {
+    g_differential_affinity = 3;  // Balanced mode
+    if (g_pcore_count == 0) {
+      detectPCores();
+    }
+  }
+#endif
+
+  g_print_runtime_config = true;
+
+  if (!quiet) {
+    setcolor(CYAN);
+    std::cout << "Runtime parity preset applied: deroluna" << std::endl;
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+  }
+  return true;
+}
+
+static bool initializeFullLookupTable() {
+#if USE_LOOKUP_TABLES
+  if (lookup_full::g_lookup3D != nullptr) {
+    return true;
+  }
+
+  lookup_full::g_lookup3D = static_cast<uint8_t*>(
+      malloc_huge_pages(lookup_full::LOOKUP3D_SIZE));
+  if (lookup_full::g_lookup3D == nullptr) {
+    lookup_full::g_lookup3D = static_cast<uint8_t*>(std::malloc(lookup_full::LOOKUP3D_SIZE));
+  }
+  if (lookup_full::g_lookup3D == nullptr) {
+    setcolor(RED);
+    std::cerr << "Failed to allocate full lookup table (16 MB)\n";
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+    return false;
+  }
+
+  setcolor(CYAN);
+  std::cout << "Initializing full lookup table (16 MB)..." << std::endl;
+  fflush(stdout);
+  setcolor(BRIGHT_WHITE);
+
+  lookup_full::generate_lookup3D(lookup_full::g_lookup3D);
+  return true;
+#else
+  return false;
+#endif
+}
+
+static void printResolvedRuntimeConfig(int miningThreads) {
+  if (!g_print_runtime_config) {
+    return;
+  }
+
+  std::ostringstream line;
+  line << "mode=" << deroModeToString(g_deroMiningMode)
+       << " kernel=" << getCurrentAstroAlgoName()
+       << " lookup_mode=" << lookupModeToString(g_lookup_mode)
+       << " lookup_smart_threshold=" << g_lookup_smart_threshold
+       << " lookup_smart_telemetry=" << (g_lookup_smart_telemetry ? "1" : "0")
+       << " thermal_yield=" << (thermal::thermal_yield_enabled() ? "on" : "off")
+       << " parity=" << g_runtime_parity
+       << " lookup_enabled=" << (useLookupMine ? "1" : "0")
+       << " lookup3d_table=" << (lookup3D_global != nullptr ? "1" : "0")
+       << " full_lookup_table=" << (lookup_full::g_lookup3D != nullptr ? "1" : "0")
+       << " sa_backend=" << getSABackendName()
+       << " spsa=" << (g_use_spsa ? "on" : "off")
+       << " spsa_impl=" << (g_use_local_spsa ? "local" : "library")
+       << " spsa_stamp_fast=" << (g_spsa_stamp_fast ? "on" : "off")
+       << " spsa_decode_bases=" << (g_spsa_decode_bases ? "on" : "off")
+       << " spsa_bucket_prefetch=" << spsaBucketPrefetchModeToString(g_spsa_bucket_prefetch)
+       << " spsa_max_data_len=" << g_spsa_max_data_len
+       << " spsa_hit_counters=" << (g_spsa_hit_counters ? "on" : "off")
+       << " spsa_sha_profile=" << (g_spsa_sha_profile ? "on" : "off")
+       << " spsa_sha_pair=" << (g_spsa_sha_pair ? "on" : "off")
+       << " spsa_sha_zeroize=" << (g_spsa_sha_zeroize ? "on" : "off")
+       << " lock_threads=" << (lockThreads ? "1" : "0")
+       << " array_telemetry=" << (g_array_telemetry ? "1" : "0")
+       << " phase_telemetry=" << (g_phase_telemetry ? "1" : "0")
+       << " omp_threads=" << g_omp_threads
+       << " threads=" << miningThreads;
+  logInfo(line.str());
+}
+
 int dirtybird_main(int argc, char** argv)
 {
   // test_cshake256();
+  CpuRuntimeProfileSummary cpu_profile;
 
   #ifdef DIRTYBIRD_HIP
   GPUTest();
@@ -562,8 +1344,29 @@ int dirtybird_main(int argc, char** argv)
   #endif
 
   // Check command line arguments.
-  lookup2D_global = (uint16_t *)malloc_huge_pages(regOps_size * (256 * 256) * sizeof(uint16_t));
-  lookup3D_global = (byte *)malloc_huge_pages(branchedOps_size * (256 * 256) * sizeof(byte));
+#if USE_LOOKUP_TABLES
+  lookup1D_global = (uint8_t *)malloc_huge_pages(regOps_size * 256 * sizeof(uint8_t));
+  if (lookup1D_global == nullptr) {
+    lookup1D_global = (uint8_t *)std::malloc(regOps_size * 256 * sizeof(uint8_t));
+  }
+  if (lookup1D_global == nullptr) {
+    setcolor(RED);
+    std::cerr << "Failed to allocate 1D lookup table\n";
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+    return -1;
+  }
+  // HYBRID is the default: 38KB 1D table + AVX2 ALU for branched ops.
+  // Skip 6.5MB 3D table allocation to preserve L3 cache at 20+ threads.
+  // Users can still request 3D via --lookup-mode 3d (lazy allocation).
+  static bool lookup3D_from_hugepages = false;
+  lookup3D_global = nullptr;
+  printf("Initializing lookup tables for memory-bound branch operations...\n");
+  lookup_tables::generateTables(lookup1D_global, nullptr);
+  printf("Lookup tables initialized (1D: %zu KB, hybrid mode — 3D table skipped)\n",
+         (size_t)regOps_size * 256 / 1024);
+  g_lookup_mode = LOOKUP_MODE_HYBRID;
+#endif
 
   if (!NUMAOptimizer::initialize()) {
     std::cerr << "NUMA optimization unavailable, falling back to default" << std::endl;
@@ -605,6 +1408,34 @@ int dirtybird_main(int argc, char** argv)
       hInput = GetStdHandle(STD_INPUT_HANDLE);
       GetConsoleMode(hInput, &prev_mode);
       SetConsoleMode(hInput, ENABLE_EXTENDED_FLAGS | (prev_mode & ~ENABLE_QUICK_EDIT_MODE));
+
+      // Detect power source before applying power overrides.
+      detectPowerState();
+
+      // Check for --no-power-override flag
+      g_no_power_override = vm.count("no-power-override") > 0;
+
+      if (!g_no_power_override) {
+          // Elevate process priority (same as DeroLuna's Start-Optimized.bat)
+          SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+
+          // Reduce timer resolution for tighter scheduling
+          timeBeginPeriod(1);
+
+          // Apply High Performance power plan + processor tuning
+          applyHighPerformancePower();
+
+          // Apply MSR-level optimizations (HWP, EPP, RAPL if unlocked)
+          applyMSRPerformanceOptimizations();
+      } else {
+          // Still set timer resolution (needed for pacer accuracy)
+          timeBeginPeriod(1);
+
+          setcolor(CYAN);
+          printf("Power: All power overrides disabled (--no-power-override)\n");
+          fflush(stdout);
+          setcolor(BRIGHT_WHITE);
+      }
     #endif
       setcolor(BRIGHT_WHITE);
       if(vm.count("quiet")) {
@@ -685,6 +1516,13 @@ int dirtybird_main(int argc, char** argv)
     setcolor(BRIGHT_WHITE);
     return -1;
   }
+
+  if (vm.count("help"))
+  {
+    std::cout << opts << std::endl;
+    boost::this_thread::sleep_for(boost::chrono::seconds(1));
+    return 0;
+  }
   
 #if defined(_WIN32)
   SetConsoleOutputCP(CP_UTF8);
@@ -716,13 +1554,6 @@ int dirtybird_main(int argc, char** argv)
   //   print_yespower_benchmark_results(results, num_results);
   // }
   // #endif
-
-  if (vm.count("help"))
-  {
-    std::cout << opts << std::endl;
-    boost::this_thread::sleep_for(boost::chrono::seconds(1));
-    return 0;
-  }
 
   #define UNSUPPORTED_ALGO_ERROR(ERROR_MSG) \
     setcolor(RED); \
@@ -818,6 +1649,10 @@ int dirtybird_main(int argc, char** argv)
   {
     reportInterval = vm["report-interval"].as<int>();
   }
+  if (vm.count("no-cpu-auto"))
+  {
+    g_cpu_auto_profile = false;
+  }
   // Dev fee completely disabled - all hashrate goes to user
   if (vm.count("password"))
   {
@@ -832,6 +1667,92 @@ int dirtybird_main(int argc, char** argv)
       setcolor(BRIGHT_WHITE);
     }
     lockThreads = false;
+  }
+  if (vm.count("runtime-parity"))
+  {
+    g_runtime_parity = vm["runtime-parity"].as<std::string>();
+    boost::algorithm::to_lower(g_runtime_parity);
+  }
+  if (vm.count("spsa"))
+  {
+    g_use_spsa = parseOnOffValue(vm["spsa"].as<std::string>(), "spsa");
+    if (!beQuiet) {
+      setcolor(CYAN);
+      printf("SPSA optimization %s\n", g_use_spsa ? "enabled" : "disabled");
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+  if (vm.count("local-spsa") && vm.count("library-spsa"))
+  {
+    throw po::validation_error(po::validation_error::invalid_option_value, "library-spsa");
+  }
+  if (vm.count("local-spsa"))
+  {
+    g_use_local_spsa = true;
+    if (!beQuiet) {
+      setcolor(CYAN);
+      printf("Integrated C++ SPSA path enabled\n");
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+  if (vm.count("library-spsa"))
+  {
+    g_use_local_spsa = false;
+    if (!beQuiet) {
+      setcolor(CYAN);
+      printf("Legacy SPSA library path enabled\n");
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+  if (vm.count("spsa-stamp-fast"))
+  {
+    g_spsa_stamp_fast = parseOnOffValue(vm["spsa-stamp-fast"].as<std::string>(), "spsa-stamp-fast");
+  }
+  if (vm.count("spsa-decode-bases"))
+  {
+    g_spsa_decode_bases = parseOnOffValue(vm["spsa-decode-bases"].as<std::string>(), "spsa-decode-bases");
+  }
+  if (vm.count("spsa-bucket-prefetch"))
+  {
+    g_spsa_bucket_prefetch = parseSpsaBucketPrefetchMode(vm["spsa-bucket-prefetch"].as<std::string>());
+  }
+  if (vm.count("spsa-max-data-len"))
+  {
+    g_spsa_max_data_len = vm["spsa-max-data-len"].as<int>();
+    if (g_spsa_max_data_len < 0) {
+      throw po::validation_error(po::validation_error::invalid_option_value, "spsa-max-data-len");
+    }
+  }
+  if (vm.count("spsa-hit-counters"))
+  {
+    g_spsa_hit_counters = parseOnOffValue(vm["spsa-hit-counters"].as<std::string>(), "spsa-hit-counters");
+  }
+  if (vm.count("spsa-sha-profile"))
+  {
+    g_spsa_sha_profile = parseOnOffValue(vm["spsa-sha-profile"].as<std::string>(), "spsa-sha-profile");
+  }
+  if (vm.count("spsa-sha-pair"))
+  {
+    g_spsa_sha_pair = parseOnOffValue(vm["spsa-sha-pair"].as<std::string>(), "spsa-sha-pair");
+  }
+  if (vm.count("spsa-sha-zeroize"))
+  {
+    g_spsa_sha_zeroize = parseOnOffValue(vm["spsa-sha-zeroize"].as<std::string>(), "spsa-sha-zeroize");
+  }
+  if (vm.count("lookup-smart-threshold"))
+  {
+    g_lookup_smart_threshold = vm["lookup-smart-threshold"].as<int>();
+    if (g_lookup_smart_threshold < 0 || g_lookup_smart_threshold > 32) {
+      throw po::validation_error(po::validation_error::invalid_option_value, "lookup-smart-threshold");
+    }
+  }
+  if (vm.count("lookup-smart-telemetry"))
+  {
+    g_lookup_smart_telemetry = true;
+    g_array_telemetry = true;
   }
 #if defined(_WIN32)
   // P-core detection and affinity (for hybrid Intel CPUs like i7-13700HX)
@@ -903,6 +1824,53 @@ int dirtybird_main(int argc, char** argv)
     g_omp_threads = vm["omp-threads"].as<int>();
     if (g_omp_threads < 0) g_omp_threads = 0;  // Treat negative as auto
   }
+  if (vm.count("adaptive"))
+  {
+    g_adaptive_threads = true;
+    g_overprovision_count = vm["adaptive"].as<int>();
+    // 0 = auto (2x threads), >0 = explicit start count
+    g_adaptive_warmup_secs = vm["adaptive-warmup"].as<int>();
+    if (g_adaptive_warmup_secs < 5) g_adaptive_warmup_secs = 5;
+    lockThreads = false;  // Over-provisioning requires free OS scheduling
+    if (!beQuiet) {
+      setcolor(CYAN);
+      printf("Adaptive mode: over-provision + cull (warmup: %ds)\n", g_adaptive_warmup_secs);
+      printf("CPU affinity has been disabled\n");
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+
+  if (vm.count("force-lock"))
+  {
+    if (g_adaptive_threads) {
+      setcolor(YELLOW);
+      printf("Warning: --force-lock ignored because adaptive mode requires free scheduling\n");
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    } else {
+      lockThreads = true;
+      g_no_per_thread_affinity = false;
+      if (!beQuiet) {
+        setcolor(CYAN);
+        printf("CPU affinity forced on\n");
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+      }
+    }
+  }
+
+  applyRuntimeParityPreset(vm, beQuiet);
+  cpu_profile = detectCpuRuntimeProfileSummary();
+  applyCpuRuntimeProfile(vm, cpu_profile);
+
+  {
+    bool thermalYield = false;
+    if (vm.count("thermal-yield")) {
+      thermalYield = parseOnOffValue(vm["thermal-yield"].as<std::string>(), "thermal-yield");
+    }
+    thermal::set_thermal_yield_enabled(thermalYield);
+  }
 
 #ifdef DIRTYBIRD_OPENMP
   // Initialize OpenMP thread count globally before mining starts
@@ -911,13 +1879,12 @@ int dirtybird_main(int argc, char** argv)
   // affects the calling thread, not worker threads created by std::thread
   {
     int omp_threads;
+    int mining_threads = threads > 0 ? threads : static_cast<int>(std::thread::hardware_concurrency());
     if (g_omp_threads > 0) {
       omp_threads = g_omp_threads;
     } else {
-      // Auto mode: use 1 OMP thread for less oversubscription
-      // Testing shows OMP=1 performs better than OMP=2 for this workload
-      omp_threads = 1;
-      g_omp_threads = 1;  // Update global so mine_dero.cpp uses consistent value
+      omp_threads = get_auto_omp_threads_for_mining(mining_threads);
+      g_omp_threads = omp_threads;  // Update global so mining threads use a single resolved value
     }
 
     // Set environment variable - this affects ALL threads including worker threads
@@ -936,7 +1903,6 @@ int dirtybird_main(int argc, char** argv)
 
     if (!beQuiet) {
       setcolor(CYAN);
-      int mining_threads = threads > 0 ? threads : static_cast<int>(std::thread::hardware_concurrency());
       printf("OpenMP: %d threads per miner (max ~%d total with %d miners)\n",
              omp_threads, mining_threads * omp_threads, mining_threads);
       fflush(stdout);
@@ -944,6 +1910,23 @@ int dirtybird_main(int argc, char** argv)
     }
   }
 #endif
+
+  // Duty-cycle pacer: insert micro-sleeps to prevent thermal throttling
+  {
+    int pace_interval = 0;
+    int pace_sleep_ms = 0;
+    if (vm.count("pace-interval")) pace_interval = vm["pace-interval"].as<int>();
+    if (vm.count("pace-sleep-us")) pace_sleep_ms = vm["pace-sleep-us"].as<int>();  // Reusing CLI name for now
+    if (pace_interval > 0 && pace_sleep_ms > 0) {
+      thermal::init_pacer(static_cast<uint32_t>(pace_interval), static_cast<uint32_t>(pace_sleep_ms));
+      if (!beQuiet) {
+        setcolor(CYAN);
+        printf("Duty-cycle pacer: Sleep(%d ms) every %d hashes (timeBeginPeriod=1)\n", pace_sleep_ms, pace_interval);
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+      }
+    }
+  }
 
   if (vm.count("verbose-tune"))
   {
@@ -980,12 +1963,108 @@ int dirtybird_main(int argc, char** argv)
     }
     useLookupMine = true;
   }
+  if (vm.count("lookup-mode"))
+  {
+    if (optionExplicit(vm, "lookup-mode") ||
+        g_auto_default_astro_kernel == "wolf_memopt" ||
+        !g_cpu_auto_profile ||
+        g_runtime_parity != "off") {
+      g_lookup_mode = parseLookupMode(vm["lookup-mode"].as<std::string>());
+    }
+    if (g_lookup_mode == LOOKUP_MODE_3D && lookup3D_global == nullptr) {
+      // Keep large-page budget for workerData. The 3D LUT is read-only and tolerates
+      // regular pages better than the per-thread scratch/SA working set does.
+      lookup3D_global = (byte *)std::malloc(branchedOps_size * (256 * 256) * sizeof(byte));
+      lookup3D_from_hugepages = false;
+      if (lookup3D_global != nullptr) {
+        lookup_tables::generateTables(lookup1D_global, lookup3D_global);
+        setcolor(CYAN);
+        std::cout << "Allocated 3D lookup table on demand (6.5 MB)" << std::endl;
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+      } else {
+        setcolor(YELLOW);
+        std::cerr << "lookup-mode=3d requested but 3D table allocation failed. Falling back to hybrid.\n";
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+        g_lookup_mode = LOOKUP_MODE_HYBRID;
+      }
+    }
+    if (g_lookup_mode == LOOKUP_MODE_FULL) {
+      useLookupMine = true;
+      if (!initializeFullLookupTable()) {
+        setcolor(YELLOW);
+        std::cerr << "lookup-mode=full unavailable (allocation/init failed). Falling back to hybrid.\n";
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+        g_lookup_mode = LOOKUP_MODE_HYBRID;
+      }
+    }
+    if (g_lookup_mode == LOOKUP_MODE_HYBRID) {
+      useLookupMine = true;
+      // Free the 6.5MB 3D branched table — hybrid uses 1D LUT + AVX2 ALU
+      if (lookup3D_global != nullptr) {
+        if (lookup3D_from_hugepages) free_huge_pages(lookup3D_global);
+        else std::free(lookup3D_global);
+        lookup3D_global = nullptr;
+        setcolor(CYAN);
+        std::cout << "Hybrid mode: freed 3D lookup table (6.5 MB saved)" << std::endl;
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+      }
+    }
+  }
+
+  if (vm.count("no-runtime-config")) {
+    g_print_runtime_config = false;
+  }
+  if (vm.count("print-runtime-config")) {
+    g_print_runtime_config = true;
+  }
+  if (vm.count("array-telemetry")) {
+    g_array_telemetry = true;
+    if (!beQuiet) {
+      setcolor(CYAN);
+      std::cout << "Array telemetry enabled (15s interval)" << std::endl;
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+  if (vm.count("phase-telemetry")) {
+    g_phase_telemetry = true;
+    if (!beQuiet) {
+      setcolor(CYAN);
+      std::cout << "Phase telemetry enabled (15s interval)" << std::endl;
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+  if (vm.count("lookup-smart-telemetry")) {
+    if (!beQuiet) {
+      setcolor(CYAN);
+      std::cout << "Smart lookup telemetry enabled (15s interval)" << std::endl;
+      setcolor(BRIGHT_WHITE);
+    }
+  }
 
   // We can do this because we've set default in terminal.hpp
   tuneWarmupSec = vm["tune-warmup"].as<int>();
   tuneDurationSec = vm["tune-duration"].as<int>();
 
   mine_time = vm["mine-time"].as<int>();
+
+  // Reject ambiguous mode selections so benchmark runs are reproducible.
+  int deroModeFlags =
+      (vm.count("interleaved") ? 1 : 0) +
+      (vm.count("cache-batch") ? 1 : 0) +
+      (vm.count("cache-batch-hybrid") ? 1 : 0) +
+      (vm.count("lockfree") ? 1 : 0);
+  if (deroModeFlags > 1) {
+    setcolor(RED);
+    std::cerr << "Error: choose only one mining mode flag from "
+                 "--interleaved, --cache-batch, --cache-batch-hybrid, --lockfree\n";
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+    return -1;
+  }
 
   // Ensure we capture *all* of the other options before we start using goto
   if (vm.count("test-dero"))
@@ -996,7 +2075,9 @@ int dirtybird_main(int argc, char** argv)
     // end of temporary section
 
     #if defined(USE_ASTRO_SPSA)
-      initSPSA();
+      if (g_use_spsa) {
+        initSPSA();
+      }
     #endif
     int rc = DeroTesting(testOp, testLen, useLookupMine);
     if(rc > 255) {
@@ -1033,11 +2114,59 @@ int dirtybird_main(int argc, char** argv)
   if (miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3) {
     if (vm.count("no-tune")) {
       std::string noTune = vm["no-tune"].as<std::string>();
-      if(!setAstroAlgo(noTune)) {
+      if (noTune == "hybrid") {
+        // --no-tune hybrid: use lookupCompute with HYBRID mode (38KB 1D + AVX2 ALU)
+        if (!setAstroAlgo("lookup")) {
+          throw po::validation_error(po::validation_error::invalid_option_value, "no-tune");
+        }
+        if (!vm.count("lookup-mode")) {
+          g_lookup_mode = LOOKUP_MODE_HYBRID;
+          useLookupMine = true;
+          if (lookup3D_global != nullptr) {
+            if (lookup3D_from_hugepages) free_huge_pages(lookup3D_global);
+            else std::free(lookup3D_global);
+            lookup3D_global = nullptr;
+          }
+          setcolor(CYAN);
+          std::cout << "Hybrid mode: 1D LUT (38 KB) + AVX2 ALU for branched ops" << std::endl;
+          fflush(stdout);
+          setcolor(BRIGHT_WHITE);
+        }
+      } else if(!setAstroAlgo(noTune)) {
         throw po::validation_error(po::validation_error::invalid_option_value, "no-tune");
       }
-    } else {
+      if (noTune == "lookup") {
+        // Respect the explicit lookup kernel request even when the caller also
+        // pins a lookup-mode like 3d/full. The old logic only enabled
+        // useLookupMine when lookup-mode was omitted, which left the runtime in
+        // a contradictory "kernel=lookup, lookup_enabled=0" state.
+        useLookupMine = true;
+        // When --no-tune lookup is specified without explicit --lookup-mode,
+        // default to the safer hybrid lookup layout.
+        if (!vm.count("lookup-mode")) {
+          g_lookup_mode = LOOKUP_MODE_HYBRID;
+          if (lookup3D_global != nullptr) {
+            if (lookup3D_from_hugepages) free_huge_pages(lookup3D_global);
+            else std::free(lookup3D_global);
+            lookup3D_global = nullptr;
+          }
+          setcolor(CYAN);
+          std::cout << "Hybrid mode (default for lookup): 1D LUT (38 KB) + AVX2 ALU for branched ops" << std::endl;
+          fflush(stdout);
+          setcolor(BRIGHT_WHITE);
+        }
+      }
+    } else if (vm.count("auto-tune")) {
       astroTune(threads, tuneWarmupSec, tuneDurationSec);
+    } else {
+      // Deterministic default: keep lookup tables enabled, but only switch the
+      // kernel itself when the caller explicitly asked for --lookup.
+      useLookupMine = true;
+      const char* default_kernel = vm.count("lookup") ? "lookup" : g_auto_default_astro_kernel.c_str();
+      if (!setAstroAlgo(default_kernel)) {
+        // Safety fallback if kernel naming changes in a future build.
+        astroTune(threads, tuneWarmupSec, tuneDurationSec);
+      }
     }
 
     // SA prefetch configuration (manual override or autotuning)
@@ -1053,6 +2182,14 @@ int dirtybird_main(int argc, char** argv)
       saTune(threads, tuneWarmupSec, tuneDurationSec);
     }
     // If neither is specified, default SA config is used
+    #else
+    if (vm.count("sa-prefetch") || (vm.count("sa-tune") && !vm.count("no-sa-tune"))) {
+      setcolor(YELLOW);
+      std::cerr << "SA prefetch tuning flags are ignored: backend is not USE_CUSTOM_SA (current: "
+                << getSABackendName() << ")\n";
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
     #endif
   }
   fflush(stdout);
@@ -1126,6 +2263,15 @@ int dirtybird_main(int argc, char** argv)
   printf("\n");
 
   printHashrateOnExit = true;
+  setPhaseTelemetryEnabled(g_phase_telemetry);
+  if (g_phase_telemetry) {
+    resetPhaseTelemetry();
+  }
+  if (g_lookup_smart_telemetry) {
+    resetLookupTelemetry();
+  }
+
+  printResolvedRuntimeConfig(threads);
 
   // Clean startup display (DeroLuna style)
   if (!beQuiet) {
@@ -1138,6 +2284,10 @@ int dirtybird_main(int argc, char** argv)
     logInfoPair("Server", serverStr);
     logInfoPair("Wallet", miningProfile.wallet);
     logInfoPair("Threads", threadStr);
+    logInfoPair("CPU", buildCpuSummaryLine(cpu_profile));
+    if (g_print_runtime_config) {
+      logInfoPair("Runtime", buildRuntimeSummaryLine());
+    }
     printf("\n");
   }
 
@@ -1152,7 +2302,7 @@ int dirtybird_main(int argc, char** argv)
     return rc;
   }
   #if defined(USE_ASTRO_SPSA)
-    if (miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3) {
+    if (g_use_spsa && miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3) {
       initSPSA();
     }
   #endif
@@ -1162,8 +2312,52 @@ int dirtybird_main(int argc, char** argv)
 
   boost::thread GETWORK(getWork_v2, &miningProfile);
 
-  // Create worker threads and set CPU affinity
-  boost::thread minerThreads[threads];
+  // Calculate actual thread count (with adaptive over-provisioning)
+  int start_threads = threads;
+  if (g_adaptive_threads && !gpuMine) {
+    if (g_overprovision_count > 0) {
+      start_threads = g_overprovision_count;
+    } else {
+      start_threads = threads * 2;  // Default: 2x over-provision
+    }
+    if (start_threads > MAX_MINING_THREADS - 1) start_threads = MAX_MINING_THREADS - 1;
+  }
+
+  // Initialize per-thread counters and stop flags
+  for (int i = 0; i < start_threads; i++) {
+    thread_counters[i + 1].store(0, std::memory_order_relaxed);
+    thread_stop[i + 1].store(false, std::memory_order_relaxed);
+  }
+
+  if (!gpuMine &&
+      miningProfile.coin.miningAlgo == ALGO_ASTROBWTV3 &&
+      (g_deroMiningMode == DERO_MINE_STANDARD || g_deroMiningMode == DERO_MINE_LOCKFREE)) {
+    if (!initializeDeroWorkerPool(start_threads)) {
+      setcolor(RED);
+      std::cerr << "Failed to initialize DERO worker pool" << std::endl << std::flush;
+      setcolor(BRIGHT_WHITE);
+      return EXIT_FAILURE;
+    }
+
+    if (!beQuiet) {
+      const auto& worker_pool_stats = getDeroWorkerPoolStats();
+      setcolor(worker_pool_stats.regular_workers == 0 ? CYAN : YELLOW);
+      printf("Worker pool: %d workers (%d large-2MB, %d large-1GB, %d regular, %d locked, %.1f MB requested)\n",
+             worker_pool_stats.requested_workers,
+             worker_pool_stats.large_2mb_workers,
+             worker_pool_stats.large_1gb_workers,
+             worker_pool_stats.regular_workers,
+             worker_pool_stats.virtual_locked_workers,
+             static_cast<double>(worker_pool_stats.requested_bytes) / (1024.0 * 1024.0));
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+  }
+
+  // Create worker threads
+  std::vector<boost::thread> minerThreads(start_threads);
+  std::vector<bool> thread_alive(start_threads, true);
+
   if (gpuMine)
   {
     threads = 0;
@@ -1177,12 +2371,19 @@ int dirtybird_main(int argc, char** argv)
     return -1;
     #endif
   } else {
-    // Start worker threads silently (thread count already shown in startup info)
-    for (int i = 0; i < threads; i++)
+    if (g_adaptive_threads && start_threads > threads) {
+      setcolor(CYAN);
+      printf("Starting %d threads (will cull to %d after %ds warmup)\n",
+             start_threads, threads, g_adaptive_warmup_secs);
+      fflush(stdout);
+      setcolor(BRIGHT_WHITE);
+    }
+
+    for (int i = 0; i < start_threads; i++)
     {
       minerThreads[i] = boost::thread(getMiningFunc(miningProfile.coin.miningAlgo, false), i + 1);
 
-      if (lockThreads)
+      if (lockThreads && !g_no_per_thread_affinity)
       {
         setAffinity(minerThreads[i].native_handle(), i);
       }
@@ -1198,6 +2399,67 @@ int dirtybird_main(int argc, char** argv)
   while (!isConnected)
   {
     boost::this_thread::yield();
+  }
+
+  // Adaptive thread culling: spawn a watcher that culls slowest threads after warmup
+  boost::thread* cull_thread_ptr = nullptr;
+  if (g_adaptive_threads && start_threads > threads && !gpuMine) {
+    int target_threads = threads;  // Capture before lambda
+    cull_thread_ptr = new boost::thread(
+      [&minerThreads, &thread_alive, start_threads, target_threads]() {
+        // Wait for warmup period
+        for (int s = 0; s < g_adaptive_warmup_secs; s++) {
+          boost::this_thread::sleep_for(boost::chrono::seconds(1));
+          if (ABORT_MINER) return;
+        }
+        if (ABORT_MINER) return;
+
+        // Collect per-thread hash counts (accumulated over warmup)
+        std::vector<std::pair<int64_t, int>> rates;
+        for (int i = 0; i < start_threads; i++) {
+          int tid = i + 1;
+          int64_t hashes = thread_counters[tid].load(std::memory_order_relaxed);
+          rates.push_back({hashes, tid});
+        }
+
+        // Sort ascending (slowest first)
+        std::sort(rates.begin(), rates.end());
+
+        int to_kill = start_threads - target_threads;
+
+        setcolor(CYAN);
+        printf("\n[ADAPTIVE] Warmup done. Culling %d slowest threads:\n", to_kill);
+        for (int i = 0; i < to_kill; i++) {
+          int tid = rates[i].second;
+          double rate_kh = (double)rates[i].first / g_adaptive_warmup_secs / 1000.0;
+          printf("  Stop T%02d (%.1f KH/s)\n", tid, rate_kh);
+          thread_stop[tid].store(true, std::memory_order_release);
+        }
+
+        // Join culled threads (they exit quickly after seeing stop flag)
+        for (int i = 0; i < to_kill; i++) {
+          int tid = rates[i].second;
+          int idx = tid - 1;
+          if (minerThreads[idx].joinable()) {
+            minerThreads[idx].join();
+          }
+          thread_alive[idx] = false;
+        }
+
+        printf("[ADAPTIVE] Kept best %d threads:", target_threads);
+        for (int i = to_kill; i < (int)rates.size(); i++) {
+          double rate_kh = (double)rates[i].first / g_adaptive_warmup_secs / 1000.0;
+          printf(" T%02d(%.1f)", rates[i].second, rate_kh);
+        }
+        printf("\n");
+        fflush(stdout);
+        setcolor(BRIGHT_WHITE);
+
+        // Reset global counter to get clean post-cull measurement
+        counter.store(0, std::memory_order_relaxed);
+        rate30sec.clear();
+      }
+    );
   }
 
   if(mine_time > 5) {
@@ -1235,10 +2497,23 @@ int dirtybird_main(int argc, char** argv)
   if (!beQuiet) {
     std::cout << "Interrupting all threads...\n";
   }
-  for (unsigned i = 0; i < threads; ++i) {
-    minerThreads[i].interrupt();
-    minerThreads[i].join();
+  // Shutdown: interrupt and join only threads that are still alive
+  for (int i = 0; i < start_threads; ++i) {
+    if (thread_alive[i] && minerThreads[i].joinable()) {
+      minerThreads[i].interrupt();
+      minerThreads[i].join();
+    }
   }
+  // Clean up cull thread
+  if (cull_thread_ptr) {
+    if (cull_thread_ptr->joinable()) {
+      cull_thread_ptr->interrupt();
+      cull_thread_ptr->join();
+    }
+    delete cull_thread_ptr;
+  }
+
+  shutdownDeroWorkerPool();
 
   return EXIT_SUCCESS;
 }
@@ -1382,154 +2657,191 @@ int detectPCores() {
 
 #endif
 
-void setAffinity(boost::thread::native_handle_type t, uint64_t core)
-{
 #if defined(_WIN32)
+static std::vector<CoreInfo>& getCachedCoreTopology() {
   static std::vector<CoreInfo> topology = getCoreTopology();
+  return topology;
+}
+
+static std::vector<DWORD>& getCachedAffinityOrder() {
   static std::vector<DWORD> affinityOrder;
+  return affinityOrder;
+}
+
+static int& getCachedAffinityMode() {
   static int cachedMode = -1;
+  return cachedMode;
+}
 
-  // Rebuild affinity order if mode changed or first time
-  if (cachedMode != g_differential_affinity || affinityOrder.empty()) {
-    cachedMode = g_differential_affinity;
-    affinityOrder.clear();
+static void ensureAffinityOrder() {
+  auto& topology = getCachedCoreTopology();
+  auto& affinityOrder = getCachedAffinityOrder();
+  int& cachedMode = getCachedAffinityMode();
 
-    std::map<DWORD, std::vector<DWORD>> pCoreMap, eCoreMap;
+  if (cachedMode == g_differential_affinity && !affinityOrder.empty()) {
+    return;
+  }
 
-    // Group logical cores by physical core, separating P and E cores
-    for (size_t i = 0; i < topology.size(); i++) {
-      if (topology[i].isPCore) {
-        pCoreMap[topology[i].physicalCore].push_back(static_cast<DWORD>(i));
-      } else {
-        eCoreMap[topology[i].physicalCore].push_back(static_cast<DWORD>(i));
-      }
-    }
+  cachedMode = g_differential_affinity;
+  affinityOrder.clear();
 
-    // Build ordering based on differential affinity mode
-    switch (g_differential_affinity) {
-      case 1:  // P-cores first: P-primaries -> P-HT -> E-cores
-        // P-core primary threads
-        for (auto& pair : pCoreMap) {
-          affinityOrder.push_back(pair.second[0]);
-        }
-        // P-core hyperthreads
-        for (auto& pair : pCoreMap) {
-          for (size_t i = 1; i < pair.second.size(); i++) {
-            affinityOrder.push_back(pair.second[i]);
-          }
-        }
-        // E-cores last (unless p-cores-only)
-        if (!g_pcores_only) {
-          for (auto& pair : eCoreMap) {
-            affinityOrder.push_back(pair.second[0]);
-          }
-        }
-        break;
-
-      case 2:  // Physical only: P-primaries -> E-cores (no HT)
-        // P-core primary threads only
-        for (auto& pair : pCoreMap) {
-          affinityOrder.push_back(pair.second[0]);
-        }
-        // E-cores (unless p-cores-only)
-        if (!g_pcores_only) {
-          for (auto& pair : eCoreMap) {
-            affinityOrder.push_back(pair.second[0]);
-          }
-        }
-        // Skip hyperthreads entirely
-        break;
-
-      case 3:  // Balanced: interleave P and E cores
-        {
-          // Interleave P-primary and E-cores first
-          auto pIt = pCoreMap.begin();
-          auto eIt = eCoreMap.begin();
-          while (pIt != pCoreMap.end() || (eIt != eCoreMap.end() && !g_pcores_only)) {
-            if (pIt != pCoreMap.end()) {
-              affinityOrder.push_back(pIt->second[0]);
-              ++pIt;
-            }
-            if (eIt != eCoreMap.end() && !g_pcores_only) {
-              affinityOrder.push_back(eIt->second[0]);
-              ++eIt;
-            }
-          }
-          // Then P-core hyperthreads
-          for (auto& pair : pCoreMap) {
-            for (size_t i = 1; i < pair.second.size(); i++) {
-              affinityOrder.push_back(pair.second[i]);
-            }
-          }
-        }
-        break;
-
-      case 0:  // Default: P-primaries -> E-cores -> P-HT
-      default:
-        // P-core primary threads
-        for (auto& pair : pCoreMap) {
-          affinityOrder.push_back(pair.second[0]);
-        }
-        // E-cores (unless p-cores-only)
-        if (!g_pcores_only) {
-          for (auto& pair : eCoreMap) {
-            affinityOrder.push_back(pair.second[0]);
-          }
-        }
-        // P-core hyperthreads last
-        for (auto& pair : pCoreMap) {
-          for (size_t i = 1; i < pair.second.size(); i++) {
-            affinityOrder.push_back(pair.second[i]);
-          }
-        }
-        break;
-    }
-
-    // Print affinity order if show-affinity is enabled
-    if (g_show_affinity && !affinityOrder.empty()) {
-      setcolor(CYAN);
-      printf("\nDifferential Affinity Mode %d - Core Assignment Order:\n", g_differential_affinity);
-      printf("Thread -> Logical Core (Type)\n");
-      for (size_t i = 0; i < affinityOrder.size(); i++) {
-        DWORD idx = affinityOrder[i];
-        printf("  T%02zu -> Core %2u (%s%s)\n",
-               i + 1,
-               topology[idx].logicalCore,
-               topology[idx].isPCore ? "P-core" : "E-core",
-               topology[idx].isHyperthread ? " HT" : "");
-      }
-      printf("\n");
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
+  std::map<DWORD, std::vector<DWORD>> pCoreMap, eCoreMap;
+  for (size_t i = 0; i < topology.size(); i++) {
+    if (topology[i].isPCore) {
+      pCoreMap[topology[i].physicalCore].push_back(static_cast<DWORD>(i));
+    } else {
+      eCoreMap[topology[i].physicalCore].push_back(static_cast<DWORD>(i));
     }
   }
 
-  // In P-cores-only mode, use the pre-computed P-core logical IDs directly
-  DWORD targetCore;
-  DWORD logicalCoreIndex;
+  switch (g_differential_affinity) {
+    case 1:
+      for (auto& pair : pCoreMap) {
+        affinityOrder.push_back(pair.second[0]);
+      }
+      for (auto& pair : pCoreMap) {
+        for (size_t i = 1; i < pair.second.size(); i++) {
+          affinityOrder.push_back(pair.second[i]);
+        }
+      }
+      if (!g_pcores_only) {
+        for (auto& pair : eCoreMap) {
+          affinityOrder.push_back(pair.second[0]);
+        }
+      }
+      break;
+
+    case 2:
+      for (auto& pair : pCoreMap) {
+        affinityOrder.push_back(pair.second[0]);
+      }
+      if (!g_pcores_only) {
+        for (auto& pair : eCoreMap) {
+          affinityOrder.push_back(pair.second[0]);
+        }
+      }
+      for (auto& pair : pCoreMap) {
+        for (size_t i = 1; i < pair.second.size(); i++) {
+          affinityOrder.push_back(pair.second[i]);
+        }
+      }
+      break;
+
+    case 3: {
+      auto pIt = pCoreMap.begin();
+      auto eIt = eCoreMap.begin();
+      while (pIt != pCoreMap.end() || (eIt != eCoreMap.end() && !g_pcores_only)) {
+        if (pIt != pCoreMap.end()) {
+          affinityOrder.push_back(pIt->second[0]);
+          ++pIt;
+        }
+        if (eIt != eCoreMap.end() && !g_pcores_only) {
+          affinityOrder.push_back(eIt->second[0]);
+          ++eIt;
+        }
+      }
+      for (auto& pair : pCoreMap) {
+        for (size_t i = 1; i < pair.second.size(); i++) {
+          affinityOrder.push_back(pair.second[i]);
+        }
+      }
+      break;
+    }
+
+    case 0:
+    default:
+      for (auto& pair : pCoreMap) {
+        affinityOrder.push_back(pair.second[0]);
+      }
+      if (!g_pcores_only) {
+        for (auto& pair : eCoreMap) {
+          affinityOrder.push_back(pair.second[0]);
+        }
+      }
+      for (auto& pair : pCoreMap) {
+        for (size_t i = 1; i < pair.second.size(); i++) {
+          affinityOrder.push_back(pair.second[i]);
+        }
+      }
+      break;
+  }
+
+  if (g_show_affinity && !affinityOrder.empty()) {
+    setcolor(CYAN);
+    printf("\nDifferential Affinity Mode %d - Core Assignment Order:\n", g_differential_affinity);
+    printf("Thread -> Logical Core (Type)\n");
+    for (size_t i = 0; i < affinityOrder.size(); i++) {
+      DWORD idx = affinityOrder[i];
+      printf("  T%02zu -> Core %2u (%s%s)\n",
+             i + 1,
+             topology[idx].logicalCore,
+             topology[idx].isPCore ? "P-core" : "E-core",
+             topology[idx].isHyperthread ? " HT" : "");
+    }
+    printf("\n");
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+  }
+}
+
+static bool resolveThreadPlacementTarget(uint64_t core, DWORD& targetCore, DWORD& logicalCoreIndex) {
+  auto& topology = getCachedCoreTopology();
+  auto& affinityOrder = getCachedAffinityOrder();
+  ensureAffinityOrder();
 
   if (g_pcores_only && core < g_pcore_logical_ids.size()) {
-    // Direct mapping to P-core logical IDs
     targetCore = g_pcore_logical_ids[core];
-    logicalCoreIndex = 0;  // Not used in this path
-
-    // Find the topology entry for this core
+    logicalCoreIndex = 0;
     for (size_t i = 0; i < topology.size(); i++) {
       if (topology[i].logicalCore == targetCore) {
         logicalCoreIndex = static_cast<DWORD>(i);
-        break;
+        return true;
       }
     }
   } else if (core < affinityOrder.size()) {
-    // Use the differential affinity ordering
     logicalCoreIndex = affinityOrder[core];
     targetCore = topology[logicalCoreIndex].logicalCore;
-  } else {
-    setcolor(RED);
-    std::cerr << "Core ID " << core << " exceeds available cores ("
-              << (g_pcores_only ? g_pcore_logical_ids.size() : affinityOrder.size()) << ")" << std::endl;
-    fflush(stdout);
-    setcolor(BRIGHT_WHITE);
+    return true;
+  }
+
+  setcolor(RED);
+  std::cerr << "Core ID " << core << " exceeds available cores ("
+            << (g_pcores_only ? g_pcore_logical_ids.size() : affinityOrder.size()) << ")" << std::endl;
+  fflush(stdout);
+  setcolor(BRIGHT_WHITE);
+  return false;
+}
+
+static bool logicalCoreToProcessorGroup(DWORD targetCore, WORD& group, DWORD& processorInGroup) {
+  DWORD numGroups = GetActiveProcessorGroupCount();
+  DWORD remaining = targetCore;
+
+  for (DWORD i = 0; i < numGroups; i++) {
+    DWORD groupSize = GetMaximumProcessorCount(i);
+    if (remaining < groupSize) {
+      group = static_cast<WORD>(i);
+      processorInGroup = remaining;
+      return true;
+    }
+    remaining -= groupSize;
+  }
+
+  setcolor(RED);
+  std::cerr << "Logical core ID " << targetCore
+            << " exceeds available logical cores" << std::endl;
+  fflush(stdout);
+  setcolor(BRIGHT_WHITE);
+  return false;
+}
+#endif
+
+void setAffinity(boost::thread::native_handle_type t, uint64_t core)
+{
+#if defined(_WIN32)
+  auto& topology = getCachedCoreTopology();
+  DWORD targetCore;
+  DWORD logicalCoreIndex;
+  if (!resolveThreadPlacementTarget(core, targetCore, logicalCoreIndex)) {
     return;
   }
 
@@ -1540,58 +2852,25 @@ void setAffinity(boost::thread::native_handle_type t, uint64_t core)
     threadToPhysicalCore[core] = topology[logicalCoreIndex].physicalCore;
   }
 
-  // Get the total logical processor count across all groups
-  DWORD numGroups = GetActiveProcessorGroupCount();
-  DWORD totalProcessors = 0;
-
-  for (DWORD i = 0; i < numGroups; i++) {
-    totalProcessors += GetMaximumProcessorCount(i);
+  WORD group = 0;
+  DWORD processorInGroup = 0;
+  if (!logicalCoreToProcessorGroup(targetCore, group, processorInGroup)) {
+    return;
   }
 
-  if (targetCore < totalProcessors) {
-    // Calculate group and processor within the group
-    DWORD group = 0;
-    DWORD processorInGroup = targetCore;
+  GROUP_AFFINITY groupAffinity = {0};
+  groupAffinity.Group = group;
+  groupAffinity.Mask = 1ULL << processorInGroup;
 
-    // Find the correct group
-    for (DWORD i = 0; i < numGroups; i++) {
-      DWORD groupSize = GetMaximumProcessorCount(i);
-      if (processorInGroup < groupSize) {
-        group = i;
-        break;
-      }
-      processorInGroup -= groupSize;
-    }
-
-    if (group >= numGroups) {
-      setcolor(RED);
-      std::cerr << "Invalid processor group calculated" << std::endl;
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
-      return;
-    }
-
-    // Use group affinity for all cases for consistency
-    GROUP_AFFINITY groupAffinity = {0};
-    groupAffinity.Group = static_cast<WORD>(group);
-    groupAffinity.Mask = 1ULL << processorInGroup;
-
-    GROUP_AFFINITY previousAffinity;
-    if (!SetThreadGroupAffinity(threadHandle, &groupAffinity, &previousAffinity)) {
-      DWORD error = GetLastError();
-      setcolor(RED);
-      std::cerr << "Failed to set CPU affinity for thread " << core
-                << " to physical core " << topology[logicalCoreIndex].physicalCore
-                << ", logical core " << targetCore
-                << " (group " << group << ", mask " << std::hex << groupAffinity.Mask
-                << std::dec << "). Error: " << error << std::endl;
-      fflush(stdout);
-      setcolor(BRIGHT_WHITE);
-    }
-  } else {
+  GROUP_AFFINITY previousAffinity;
+  if (!SetThreadGroupAffinity(threadHandle, &groupAffinity, &previousAffinity)) {
+    DWORD error = GetLastError();
     setcolor(RED);
-    std::cerr << "Logical core ID " << targetCore
-              << " exceeds available logical cores (" << totalProcessors << ")" << std::endl;
+    std::cerr << "Failed to set CPU affinity for thread " << core
+              << " to physical core " << topology[logicalCoreIndex].physicalCore
+              << ", logical core " << targetCore
+              << " (group " << group << ", mask " << std::hex << groupAffinity.Mask
+              << std::dec << "). Error: " << error << std::endl;
     fflush(stdout);
     setcolor(BRIGHT_WHITE);
   }

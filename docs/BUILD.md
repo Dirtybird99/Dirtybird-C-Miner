@@ -108,6 +108,11 @@ cmake --build --preset release
 | `CMAKE_BUILD_TYPE` | Release | Build type (Release, Debug, RelWithDebInfo) |
 | `WITH_ASTROBWTV3` | ON | Enable AstroBWTv3 algorithm |
 | `USE_ASTRO_SPSA` | ON | Use Astro-SPSA suffix array library |
+| `USE_DLUNA_RADIX_SA` | OFF | Use DeroLuna-style 24-bit radix + collision sort SA backend |
+| `USE_RADIX_SA` | OFF | Use DeroHE-style 2-pass radix SA backend |
+| `USE_BUCKET_SA` | OFF | Use 2-byte prefix bucket SA backend |
+| `USE_LIBSAIS` | ON | Use libsais SA backend |
+| `USE_CUSTOM_SA` | OFF | Use custom 70KB SA-IS backend |
 | `DISABLE_LTO` | OFF | Disable Link-Time Optimization |
 | `WITH_PROFILING` | OFF | Enable profiling for developers |
 
@@ -197,6 +202,18 @@ cmake --build build-cuda --parallel
 ```bash
 ./build/bin/dirtybird-miner-cpu --benchmark 10
 ```
+
+### Runtime Phase Telemetry
+
+Use this when comparing Dirtybird internals against DeroLuna phase traces:
+
+```bash
+./build/bin/dirtybird-miner-cpu --dero --phase-telemetry --array-telemetry \
+  --daemon-address <node:port> --wallet <wallet> --threads 20
+```
+
+The miner prints `[PHASE]` lines every 15s with per-hash timings for prep, wolf,
+SPSA call, SA fallback, final hash, and optional SA subphase breakdown.
 
 ### Using Test Script (Windows)
 

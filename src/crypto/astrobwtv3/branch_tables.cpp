@@ -6,6 +6,7 @@
 
 #include "branch_tables.hpp"
 #include <algorithm>
+#include <array>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -242,11 +243,19 @@ bool avx2_available() {
 
 #if defined(__AVX2__)
 
-// Static constant for value 3 broadcast to all bytes
-alignas(32) static const int8_t VEC_3_BYTES[32] = {
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3
-};
+// Precomputed AVX2 blend masks for lengths 0..32.
+// Each row has 0xFF in [0, len) and 0x00 in [len, 32).
+constexpr std::array<std::array<uint8_t, 32>, 33> make_blend_mask_table() {
+    std::array<std::array<uint8_t, 32>, 33> table{};
+    for (size_t len = 0; len < table.size(); ++len) {
+        for (size_t i = 0; i < table[len].size(); ++i) {
+            table[len][i] = (i < len) ? static_cast<uint8_t>(0xFF) : static_cast<uint8_t>(0x00);
+        }
+    }
+    return table;
+}
+
+alignas(32) static constexpr auto BLEND_MASK_TABLE = make_blend_mask_table();
 
 // ============================================================================
 // SIMD Helper Functions
@@ -454,14 +463,14 @@ static inline __m256i op_and_pos2val(__m256i input, __m256i pos2_val) {
 
 /// Op 6: variable left shift (val << (val & 3))
 static inline __m256i op_sllv(__m256i input) {
-    __m256i vec_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(VEC_3_BYTES));
+    __m256i vec_3 = _mm256_set1_epi8(3);
     __m256i count = _mm256_and_si256(input, vec_3);
     return mm256_sllv_epi8(input, count);
 }
 
 /// Op 7: variable right shift (val >> (val & 3))
 static inline __m256i op_srlv(__m256i input) {
-    __m256i vec_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(VEC_3_BYTES));
+    __m256i vec_3 = _mm256_set1_epi8(3);
     __m256i count = _mm256_and_si256(input, vec_3);
     return mm256_srlv_epi8(input, count);
 }
@@ -559,12 +568,10 @@ static inline __m256i apply_wolf_insn(__m256i input, __m256i pos2_val, uint8_t i
 }
 
 void gen_mask_avx2(uint8_t bytes, uint8_t mask[32]) {
-    __m256i sequence = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    uint8_t clamped = std::min<uint8_t>(bytes, 32);
+    __m256i result = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(BLEND_MASK_TABLE[clamped].data())
     );
-    __m256i count = _mm256_set1_epi8(static_cast<int8_t>(bytes));
-    __m256i result = _mm256_cmpgt_epi8(count, sequence);
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(mask), result);
 }
 
@@ -594,13 +601,11 @@ void wolf_permute_avx2(
     }
 
     // Generate blend mask for [0, pos2-pos1) range
-    uint8_t bytes_to_update = (pos2 > pos1) ? (pos2 - pos1) : 0;
-    __m256i sequence = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    uint8_t bytes_to_update = (pos2 > pos1) ? static_cast<uint8_t>(pos2 - pos1) : 0;
+    bytes_to_update = std::min<uint8_t>(bytes_to_update, 32);
+    __m256i mask = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(BLEND_MASK_TABLE[bytes_to_update].data())
     );
-    __m256i count = _mm256_set1_epi8(static_cast<int8_t>(bytes_to_update));
-    __m256i mask = _mm256_cmpgt_epi8(count, sequence);
 
     // Blend: keep old data where mask is 0, use new data where mask is 0xFF
     result = _mm256_blendv_epi8(old, result, mask);

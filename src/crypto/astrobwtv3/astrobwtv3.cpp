@@ -21,7 +21,7 @@
 #include "astrotest.hpp"
 #include "memory_optimized.hpp"
 #include "derobwt.hpp"
-// #include "branched_AVX2.h"
+#include "branched_AVX2.h"
 
 #include <unordered_map>
 #include <array>
@@ -46,8 +46,20 @@
 #include <filesystem>
 #include <functional>
 #include "lookupcompute.h"
+#include "lookup_full.hpp"
+#include "lookup_mode.hpp"
+#include "branch_tables.hpp"
+#if USE_LOOKUP_TABLES
+  #include "lookup_tables.hpp"
+#endif
+
+LookupMode g_lookup_mode = LOOKUP_MODE_3D;
+extern bool useLookupMine;
+
 #if defined(USE_ASTRO_SPSA)
   #include "spsa.hpp"
+  static std::atomic<uint64_t> spsa_hits_total{0};
+  static std::atomic<uint64_t> spsa_misses_total{0};
 
   // SPSA_STATS: Set to 1 to enable atomic statistics tracking (small perf overhead)
   #ifndef SPSA_STATS
@@ -109,28 +121,141 @@
         fflush(stdout);
       }
     }
-    #define SPSA_HIT() spsa_hits.fetch_add(1, std::memory_order_relaxed)
-    #define SPSA_MISS() spsa_misses.fetch_add(1, std::memory_order_relaxed)
+    #define SPSA_HIT() do { \
+      if (g_spsa_hit_counters) { \
+        spsa_hits.fetch_add(1, std::memory_order_relaxed); \
+        spsa_hits_total.fetch_add(1, std::memory_order_relaxed); \
+      } \
+    } while (0)
+    #define SPSA_MISS() do { \
+      if (g_spsa_hit_counters) { \
+        spsa_misses.fetch_add(1, std::memory_order_relaxed); \
+        spsa_misses_total.fetch_add(1, std::memory_order_relaxed); \
+      } \
+    } while (0)
     #define SPSA_LOG_ENABLED() log_spsa_enabled()
     #define SPSA_LOG_STATS() log_spsa_stats()
   #else
     // No-op macros when stats are disabled for maximum performance
-    static bool spsa_banner_printed = false;
+    static std::atomic<bool> spsa_banner_printed{false};
     static inline void print_spsa_banner_once() {
-      if (!spsa_banner_printed) {
+      bool expected = false;
+      if (spsa_banner_printed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         printf("\n*** SPSA ENABLED - Using Stamped Permutation Suffix Array ***\n");
         fflush(stdout);
-        spsa_banner_printed = true;
       }
     }
-    #define SPSA_HIT() ((void)0)
-    #define SPSA_MISS() ((void)0)
+    #define SPSA_HIT() do { \
+      if (g_spsa_hit_counters) { \
+        spsa_hits_total.fetch_add(1, std::memory_order_relaxed); \
+      } \
+    } while (0)
+    #define SPSA_MISS() do { \
+      if (g_spsa_hit_counters) { \
+        spsa_misses_total.fetch_add(1, std::memory_order_relaxed); \
+      } \
+    } while (0)
     #define SPSA_LOG_ENABLED() print_spsa_banner_once()
     #define SPSA_LOG_STATS() ((void)0)
   #endif
 #else
   #define MINPREFLEN 4
 #endif
+
+#if defined(USE_ASTRO_SPSA)
+static inline void prefetchSpsaBucketArrays(workerData &worker) {
+  if (g_spsa_bucket_prefetch == SPSA_BUCKET_PREFETCH_OFF) {
+    return;
+  }
+
+  // "light" touches fewer pages, "full" touches every 16 rows.
+  const int stride = (g_spsa_bucket_prefetch == SPSA_BUCKET_PREFETCH_FULL) ? 16 : 64;
+  for (int pf = 0; pf < 256; pf += stride) {
+    __builtin_prefetch(&worker.buckets_d[pf][0], 1, 2);
+    __builtin_prefetch(&worker.bHeads[pf][0], 1, 2);
+    __builtin_prefetch(&worker.bHeadIdx[pf][0], 1, 2);
+  }
+}
+
+static inline int classifySpsaCoreLenBin(int data_len) {
+  if (data_len < 65536) {
+    return 0;
+  }
+  if (data_len < 67584) {
+    return 1;
+  }
+  if (data_len < 69632) {
+    return 2;
+  }
+  return 3;
+}
+#endif
+
+namespace {
+constexpr size_t kSpsaOpFamilyNonBranched = 0;
+constexpr size_t kSpsaOpFamilyBranched = 1;
+constexpr size_t kSpsaOpFamilyOp253 = 2;
+constexpr size_t kSpsaOpFamilyRc4 = 3;
+constexpr size_t kSpsaOpFamilyCount = 4;
+
+static std::atomic<bool> g_phase_telemetry_enabled{false};
+static std::atomic<uint64_t> g_phase_hashes_total{0};
+static std::atomic<uint64_t> g_phase_data_len_sum_total{0};
+static std::atomic<uint64_t> g_phase_prep_ns_total{0};
+static std::atomic<uint64_t> g_phase_wolf_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_prefetch_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_hit_copy_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_miss_hash_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_core_ns_total{0};
+static std::atomic<uint64_t> g_phase_spsa_core_calls_total{0};
+static std::array<std::atomic<uint64_t>, 4> g_phase_spsa_core_bin_calls_total{};
+static std::array<std::atomic<uint64_t>, 4> g_phase_spsa_core_bin_ns_total{};
+static std::array<std::atomic<uint64_t>, kSpsaOpFamilyCount> g_phase_spsa_op_family_calls_total{};
+static std::array<std::atomic<uint64_t>, kSpsaOpFamilyCount> g_phase_spsa_op_family_bytes_total{};
+static std::atomic<uint64_t> g_phase_sa_ns_total{0};
+static std::atomic<uint64_t> g_phase_hash_ns_total{0};
+static std::atomic<uint64_t> g_phase_total_ns_total{0};
+static std::atomic<uint64_t> g_phase_sa_encode_ns_total{0};
+static std::atomic<uint64_t> g_phase_sa_radix_ns_total{0};
+static std::atomic<uint64_t> g_phase_sa_collision_ns_total{0};
+static std::atomic<uint64_t> g_phase_sa_copy_ns_total{0};
+static std::atomic<uint64_t> g_lookup_smart_branched_total{0};
+static std::atomic<uint64_t> g_lookup_smart_path_lut{0};
+static std::atomic<uint64_t> g_lookup_smart_path_avx2{0};
+static std::array<std::atomic<uint64_t>, 33> g_lookup_smart_span_hist{};
+
+static inline size_t classifySpsaOpFamily(uint8_t op) {
+  if (op == 253) {
+    return kSpsaOpFamilyOp253;
+  }
+  if (op >= 254) {
+    return kSpsaOpFamilyRc4;
+  }
+  return g_is_branched[op] ? kSpsaOpFamilyBranched : kSpsaOpFamilyNonBranched;
+}
+
+static bool lookupSmartAvx2Available() {
+#if defined(__x86_64__) || defined(_M_X64)
+  static const bool has_avx2 = branch_tables::avx2_available();
+  return has_avx2;
+#else
+  return false;
+#endif
+}
+}  // namespace
+
+size_t classifySpsaOpFamilyForTelemetry(uint8_t op) {
+  return classifySpsaOpFamily(op);
+}
+
+void addSpsaOpFamilyTelemetryBatch(const std::array<uint64_t, 4>& calls,
+                                   const std::array<uint64_t, 4>& bytes) {
+  for (size_t i = 0; i < kSpsaOpFamilyCount; ++i) {
+    g_phase_spsa_op_family_calls_total[i].fetch_add(calls[i], std::memory_order_relaxed);
+    g_phase_spsa_op_family_bytes_total[i].fetch_add(bytes[i], std::memory_order_relaxed);
+  }
+}
 
 extern "C"
 {
@@ -140,11 +265,45 @@ extern "C"
   #ifdef USE_CUSTOM_SA
     #include "custom_sa_70kb.h"
   #endif
+  #ifdef USE_LIBSAIS
+    #include "libsais.h"
+  #endif
 }
 
-/* SA_FUNCTION: Dispatch to custom_sa_70kb or divsufsort based on compile-time flag */
-#ifdef USE_CUSTOM_SA
+/* SA_FUNCTION: Dispatch to best available suffix array implementation
+ * Priority:
+ * USE_DLUNA_RADIX_SA > USE_BUCKET_SA > USE_RADIX_SA > USE_CUSTOM_SA > USE_LIBSAIS > divsufsort
+ *
+ * libsais 2.10.4 is state-of-the-art SA construction (2021-2025)
+ * - No external bucket arrays needed (handles internally)
+ * - Supports context reuse for memory efficiency
+ * - ~10-20% faster than divsufsort for our workload size
+ */
+#ifdef USE_DLUNA_RADIX_SA
+  #include "dluna_radix_sa.h"
+  #define SA_FUNCTION dluna_radix_sa::radix_sort_sa
+#elif defined(USE_BUCKET_SA)
+  #include "bucket_sa.h"
+  #define SA_FUNCTION bucket_sa::bucket_sort_sa
+#elif defined(USE_RADIX_SA)
+  #include "radix_sa.h"
+  #define SA_FUNCTION radix_sa::radix_sort_sa
+#elif defined(USE_CUSTOM_SA)
   #define SA_FUNCTION custom_sa_70kb
+#elif defined(USE_LIBSAIS)
+  // libsais wrapper: adapts libsais API to match divsufsort signature
+  // The bucket arrays (bA, bB) are unused - libsais handles them internally
+  static inline int32_t libsais_wrapper(const uint8_t* T, int32_t* SA, int32_t n,
+                                        int32_t* /*bucket_A*/, int32_t* /*bucket_B*/) {
+    // Thread-local context for memory reuse across calls
+    static thread_local void* tl_sais_ctx = nullptr;
+    if (tl_sais_ctx == nullptr) {
+      tl_sais_ctx = libsais_create_ctx();
+    }
+    // fs=0: no extra space needed, freq=NULL: don't compute frequencies
+    return libsais_ctx(tl_sais_ctx, T, SA, n, 0, nullptr);
+  }
+  #define SA_FUNCTION libsais_wrapper
 #else
   #define SA_FUNCTION divsufsort
 #endif
@@ -154,6 +313,7 @@ extern "C"
 #include <hex.h>
 #include <openssl/rc4.h>
 #include "rc4_avx512.hpp"
+#include "spsa_state.hpp"
 
 #include <fstream>
 
@@ -179,7 +339,7 @@ int ops[256];
 
 // DERO Miner: Removed unused static lookup tables that caused startup failure
 // These were ~27MB of BSS that Windows couldn't allocate at load time
-// The dynamic allocations in miner.cpp (lookup2D_global, lookup3D_global) are used instead
+// The dynamic allocations in miner.cpp (lookup1D_global, lookup3D_global) are used instead
 
 std::vector<byte> opsA;
 std::vector<byte> opsB;
@@ -236,7 +396,158 @@ void detectAVX512() {
 #endif
 }
 
+// Default to wolfCompute - AVX2 branch processing is faster than lookup tables.
+// Lookup tables available via --no-tune lookup but benchmark shows AVX2 wins
+// because wolf_permute_avx2 processes 32 bytes/instruction vs 1 byte/lookup.
 void (*astroCompFunc)(workerData &worker, bool isTest, int wIndex) = wolfCompute;
+
+const char* getCurrentAstroAlgoName() {
+  for (size_t i = 0; i < numAstroFuncs; i++) {
+    if (allAstroFuncs[i].funcPtr == astroCompFunc) {
+      return allAstroFuncs[i].funcName.c_str();
+    }
+  }
+  return "unknown";
+}
+
+const char* getSABackendName() {
+#if defined(USE_DLUNA_RADIX_SA)
+  return "dluna-radix";
+#elif defined(USE_BUCKET_SA)
+  return "bucket";
+#elif defined(USE_RADIX_SA)
+  return "radix";
+#elif defined(USE_CUSTOM_SA)
+  return "custom-sa";
+#elif defined(USE_LIBSAIS)
+  return "libsais";
+#else
+  return "divsufsort";
+#endif
+}
+
+uint64_t getSPSAHits() {
+#if defined(USE_ASTRO_SPSA)
+  return spsa_hits_total.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
+
+uint64_t getSPSAMisses() {
+#if defined(USE_ASTRO_SPSA)
+  return spsa_misses_total.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
+
+void setPhaseTelemetryEnabled(bool enabled) {
+  g_phase_telemetry_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool isPhaseTelemetryEnabled() {
+  return g_phase_telemetry_enabled.load(std::memory_order_relaxed);
+}
+
+void resetPhaseTelemetry() {
+  g_phase_hashes_total.store(0, std::memory_order_relaxed);
+  g_phase_data_len_sum_total.store(0, std::memory_order_relaxed);
+  g_phase_prep_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_wolf_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_prefetch_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_hit_copy_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_miss_hash_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_core_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_spsa_core_calls_total.store(0, std::memory_order_relaxed);
+  for (size_t i = 0; i < g_phase_spsa_core_bin_calls_total.size(); ++i) {
+    g_phase_spsa_core_bin_calls_total[i].store(0, std::memory_order_relaxed);
+    g_phase_spsa_core_bin_ns_total[i].store(0, std::memory_order_relaxed);
+  }
+  for (size_t i = 0; i < g_phase_spsa_op_family_calls_total.size(); ++i) {
+    g_phase_spsa_op_family_calls_total[i].store(0, std::memory_order_relaxed);
+    g_phase_spsa_op_family_bytes_total[i].store(0, std::memory_order_relaxed);
+  }
+  g_phase_sa_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_hash_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_total_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_sa_encode_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_sa_radix_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_sa_collision_ns_total.store(0, std::memory_order_relaxed);
+  g_phase_sa_copy_ns_total.store(0, std::memory_order_relaxed);
+}
+
+void resetLookupTelemetry() {
+  g_lookup_smart_branched_total.store(0, std::memory_order_relaxed);
+  g_lookup_smart_path_lut.store(0, std::memory_order_relaxed);
+  g_lookup_smart_path_avx2.store(0, std::memory_order_relaxed);
+  for (size_t i = 0; i < g_lookup_smart_span_hist.size(); ++i) {
+    g_lookup_smart_span_hist[i].store(0, std::memory_order_relaxed);
+  }
+}
+
+void addSABreakdownTelemetry(uint64_t encode_ns, uint64_t radix_ns, uint64_t collision_ns, uint64_t copy_ns) {
+  if (!isPhaseTelemetryEnabled()) {
+    return;
+  }
+
+  g_phase_sa_encode_ns_total.fetch_add(encode_ns, std::memory_order_relaxed);
+  g_phase_sa_radix_ns_total.fetch_add(radix_ns, std::memory_order_relaxed);
+  g_phase_sa_collision_ns_total.fetch_add(collision_ns, std::memory_order_relaxed);
+  g_phase_sa_copy_ns_total.fetch_add(copy_ns, std::memory_order_relaxed);
+}
+
+AstroPhaseTelemetrySnapshot getPhaseTelemetrySnapshot() {
+  AstroPhaseTelemetrySnapshot snapshot{};
+  snapshot.hashes = g_phase_hashes_total.load(std::memory_order_relaxed);
+  snapshot.data_len_sum = g_phase_data_len_sum_total.load(std::memory_order_relaxed);
+  snapshot.spsa_hits = getSPSAHits();
+  snapshot.spsa_misses = getSPSAMisses();
+  snapshot.prep_ns = g_phase_prep_ns_total.load(std::memory_order_relaxed);
+  snapshot.wolf_ns = g_phase_wolf_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_call_ns = g_phase_spsa_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_prefetch_ns = g_phase_spsa_prefetch_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_hit_copy_ns = g_phase_spsa_hit_copy_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_miss_hash_ns = g_phase_spsa_miss_hash_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_core_ns = g_phase_spsa_core_ns_total.load(std::memory_order_relaxed);
+  snapshot.spsa_core_calls = g_phase_spsa_core_calls_total.load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin0_calls = g_phase_spsa_core_bin_calls_total[0].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin0_ns = g_phase_spsa_core_bin_ns_total[0].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin1_calls = g_phase_spsa_core_bin_calls_total[1].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin1_ns = g_phase_spsa_core_bin_ns_total[1].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin2_calls = g_phase_spsa_core_bin_calls_total[2].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin2_ns = g_phase_spsa_core_bin_ns_total[2].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin3_calls = g_phase_spsa_core_bin_calls_total[3].load(std::memory_order_relaxed);
+  snapshot.spsa_core_bin3_ns = g_phase_spsa_core_bin_ns_total[3].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_nonbranched_calls = g_phase_spsa_op_family_calls_total[kSpsaOpFamilyNonBranched].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_nonbranched_bytes = g_phase_spsa_op_family_bytes_total[kSpsaOpFamilyNonBranched].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_branched_calls = g_phase_spsa_op_family_calls_total[kSpsaOpFamilyBranched].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_branched_bytes = g_phase_spsa_op_family_bytes_total[kSpsaOpFamilyBranched].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_op253_calls = g_phase_spsa_op_family_calls_total[kSpsaOpFamilyOp253].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_op253_bytes = g_phase_spsa_op_family_bytes_total[kSpsaOpFamilyOp253].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_rc4_calls = g_phase_spsa_op_family_calls_total[kSpsaOpFamilyRc4].load(std::memory_order_relaxed);
+  snapshot.spsa_op_family_rc4_bytes = g_phase_spsa_op_family_bytes_total[kSpsaOpFamilyRc4].load(std::memory_order_relaxed);
+  snapshot.sa_fallback_ns = g_phase_sa_ns_total.load(std::memory_order_relaxed);
+  snapshot.final_hash_ns = g_phase_hash_ns_total.load(std::memory_order_relaxed);
+  snapshot.total_ns = g_phase_total_ns_total.load(std::memory_order_relaxed);
+  snapshot.sa_encode_ns = g_phase_sa_encode_ns_total.load(std::memory_order_relaxed);
+  snapshot.sa_radix_ns = g_phase_sa_radix_ns_total.load(std::memory_order_relaxed);
+  snapshot.sa_collision_ns = g_phase_sa_collision_ns_total.load(std::memory_order_relaxed);
+  snapshot.sa_copy_ns = g_phase_sa_copy_ns_total.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+AstroLookupTelemetrySnapshot getLookupTelemetrySnapshot() {
+  AstroLookupTelemetrySnapshot snapshot{};
+  snapshot.smart_branched_total = g_lookup_smart_branched_total.load(std::memory_order_relaxed);
+  snapshot.smart_path_lut = g_lookup_smart_path_lut.load(std::memory_order_relaxed);
+  snapshot.smart_path_avx2 = g_lookup_smart_path_avx2.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < g_lookup_smart_span_hist.size(); ++i) {
+    snapshot.smart_span_hist[i] = g_lookup_smart_span_hist[i].load(std::memory_order_relaxed);
+  }
+  return snapshot;
+}
 
 void saveBufferToFile(const std::string& filename, const byte* buffer, size_t size) {
     // Generate unique filename using timestamp
@@ -822,14 +1133,30 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
       __builtin_prefetch(&worker.sData[ASTRO_SCRATCH_SIZE*i + 128], 1, 3);
       __builtin_prefetch(&worker.sData[ASTRO_SCRATCH_SIZE*i + 192], 1, 3);
 
+#if USE_SIMD_SALSA20
+      // SIMD Salsa20 - AVX2 optimized (~2-5% faster)
+      // Key at offset 320 (SHA256 output), IV at offset 256 (zeros)
+      salsa20_simd_process(&worker.sData[ASTRO_SCRATCH_SIZE*i + 320],
+                           &worker.sData[ASTRO_SCRATCH_SIZE*i + 256],
+                           worker.salsaInput,
+                           &worker.sData[ASTRO_SCRATCH_SIZE*i], 256);
+#else
+      worker.salsa20.setKey(&worker.sData[ASTRO_SCRATCH_SIZE*i + 320]);
+      worker.salsa20.setIv(&worker.sData[ASTRO_SCRATCH_SIZE*i + 256]);
       worker.salsa20.processBytes(worker.salsaInput, &worker.sData[ASTRO_SCRATCH_SIZE*i], 256);
+#endif
 
       __builtin_prefetch(&worker.key[i] + 8, 1, 3);
       __builtin_prefetch(&worker.key[i] + 8+64, 1, 3);
       __builtin_prefetch(&worker.key[i] + 8+128, 1, 3);
       __builtin_prefetch(&worker.key[i] + 8+192, 1, 3);
 
-#if USE_FAST_RC4
+#if USE_CRYPTOGAMS_RC4_DUAL
+      // Dual-state: Initialize both CRYPTOGAMS (fast) and OpenSSL (SPSA compat)
+      worker.cryptogams_rc4[i].set_key(&worker.sData[ASTRO_SCRATCH_SIZE*i], 256);
+      RC4_set_key(&worker.key[i], 256, &worker.sData[ASTRO_SCRATCH_SIZE*i]);
+      worker.cryptogams_rc4[i].apply_keystream_256(&worker.sData[ASTRO_SCRATCH_SIZE*i]);
+#elif USE_FAST_RC4
       // Use optimized RC4 implementation with SPSA sync
       rc4_avx512::fast_rc4_set_key_dual(worker.fast_rc4_key[i], &worker.key[i], 256, &worker.sData[ASTRO_SCRATCH_SIZE*i]);
       rc4_avx512::fast_rc4_dual(worker.fast_rc4_key[i], &worker.key[i], 256, &worker.sData[ASTRO_SCRATCH_SIZE*i], &worker.sData[ASTRO_SCRATCH_SIZE*i]);
@@ -863,7 +1190,7 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
     // auto end = std::chrono::steady_clock::now();
 
     /*
-    if (lookupMine) {
+    if (useLookupMine) {
       // start = std::chrono::steady_clock::now();
       lookupCompute(worker, false);
       // end = std::chrono::steady_clock::now();
@@ -909,7 +1236,7 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
     // syncTag.wait(syncTarget);
 
     // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end-start);
-    // if (!lookupMine) printf("AVX2: ");
+    // if (!useLookupMine) printf("AVX2: ");
     // else printf("Lookup: ");
     // printf("branched section took %dns\n", time.count());
     // if (debugOpOrder) {
@@ -943,28 +1270,32 @@ void AstroBWTv3_batch(byte *input, int inputLen, byte *outputhash, workerData &w
       // divsufsort(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.sa, worker.data_len, worker.bA, worker.bB);
       #if defined(USE_ASTRO_SPSA)
         if (g_use_spsa) SPSA_LOG_ENABLED();
-        if(g_use_spsa && SPSA(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker)) {
+        prefetchSpsaBucketArrays(worker);
+        if(shouldUseSpsaForDataLen(worker.data_len) && SPSA(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker)) {
           SPSA_HIT();
           memcpy(outputhash, worker.padding, 32);
         } else {
           SPSA_MISS();
-          // Use thread-local buffers when SPSA is disabled at runtime
-          #if USE_DEROBWT
+          #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
           derobwt::compute_sa_threadsafe(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker.sa);
-          #else
-          static thread_local int tl_bA[256];
-          static thread_local int tl_bB[256*256];
-          SA_FUNCTION(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.sa, worker.data_len, tl_bA, tl_bB);
+      #else
+          int32_t *bucketA = nullptr;
+          int32_t *bucketB = nullptr;
+          getSABucketScratch(worker, bucketA, bucketB);
+          SA_FUNCTION(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.sa, worker.data_len, bucketA, bucketB);
           #endif
           byte *B = reinterpret_cast<byte *>(worker.sa);
           hashSHA256(worker.sha256, B, (outputhash + 32*i), worker.data_len*4);
         }
         SPSA_LOG_STATS();
       #else
-        #if USE_DEROBWT
+        #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
           derobwt::compute_sa_threadsafe(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.data_len, worker.sa);
         #else
-          SA_FUNCTION(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.sa, worker.data_len, worker.bA, worker.bB);
+          int32_t *bucketA = nullptr;
+          int32_t *bucketB = nullptr;
+          getSABucketScratch(worker, bucketA, bucketB);
+          SA_FUNCTION(&worker.sData[i * ASTRO_SCRATCH_SIZE], worker.sa, worker.data_len, bucketA, bucketB);
         #endif
         #ifdef ENABLE_SA_INSTRUMENTATION
         {
@@ -1046,19 +1377,51 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
 
   try
   {
+    const bool phaseTelemetry = isPhaseTelemetryEnabled();
+    const auto phase_now_ns = []() -> uint64_t {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    uint64_t phase_t0 = 0;
+    uint64_t phase_t1 = 0;
+    uint64_t phase_t2 = 0;
+    uint64_t phase_spsa_ns = 0;
+    uint64_t phase_spsa_prefetch_ns = 0;
+    uint64_t phase_spsa_hit_copy_ns = 0;
+    uint64_t phase_spsa_miss_hash_ns = 0;
+    uint64_t phase_spsa_core_ns = 0;
+    uint64_t phase_spsa_core_calls = 0;
+    std::array<uint64_t, 4> phase_spsa_core_bin_calls{0, 0, 0, 0};
+    std::array<uint64_t, 4> phase_spsa_core_bin_ns{0, 0, 0, 0};
+    uint64_t phase_sa_ns = 0;
+    uint64_t phase_hash_ns = 0;
+    if (phaseTelemetry) {
+      phase_t0 = phase_now_ns();
+    }
+
 #if SPSA_PROFILE && defined(USE_ASTRO_SPSA)
     auto t0 = std::chrono::steady_clock::now();
 #endif
 
-    uint8_t scratch[384] = {0};
+    alignas(32) uint8_t scratch[384] = {0};
+    memset(worker.sData, 0, ASTRO_SCRATCH_SIZE);
 
     hashSHA256(worker.sha256, input, &scratch[320], inputLen);
+#if USE_SIMD_SALSA20
+    // SIMD Salsa20 - AVX2 optimized (~2-5% faster)
+    salsa20_simd_process(&scratch[320], &scratch[256], worker.salsaInput, scratch, 256);
+#else
     worker.salsa20.setKey(&scratch[320]);
     worker.salsa20.setIv(&scratch[256]);
-
     worker.salsa20.processBytes(worker.salsaInput, scratch, 256);
+#endif
 
-#if USE_FAST_RC4
+#if USE_CRYPTOGAMS_RC4_DUAL
+    // Dual-state: CRYPTOGAMS for fast encryption, OpenSSL for SPSA S-box access
+    worker.cryptogams_rc4[0].set_key(scratch, 256);
+    RC4_set_key(&worker.key[0], 256, scratch);
+    worker.cryptogams_rc4[0].apply_keystream_256(scratch);
+#elif USE_FAST_RC4
     // Use optimized RC4 implementation with SPSA sync
     rc4_avx512::fast_rc4_set_key_dual(worker.fast_rc4_key[0], &worker.key[0], 256, scratch);
     rc4_avx512::fast_rc4_dual(worker.fast_rc4_key[0], &worker.key[0], 256, scratch, scratch);
@@ -1076,6 +1439,10 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
 
     memcpy(worker.sData, scratch, 256);
 
+    if (phaseTelemetry) {
+      phase_t1 = phase_now_ns();
+    }
+
 #if SPSA_PROFILE && defined(USE_ASTRO_SPSA)
     auto t1 = std::chrono::steady_clock::now();
 #endif
@@ -1088,7 +1455,7 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
     // auto end = std::chrono::steady_clock::now();
 
     /*
-    if (lookupMine) {
+    if (useLookupMine) {
       // start = std::chrono::steady_clock::now();
       lookupCompute(worker, false);
       // end = std::chrono::steady_clock::now();
@@ -1109,12 +1476,16 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
 
     astroCompFunc(worker, false, 0);
 
+    if (phaseTelemetry) {
+      phase_t2 = phase_now_ns();
+    }
+
 #if SPSA_PROFILE && defined(USE_ASTRO_SPSA)
     auto t2 = std::chrono::steady_clock::now();
 #endif
 
     // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end-start);
-    // if (!lookupMine) printf("AVX2: ");
+    // if (!useLookupMine) printf("AVX2: ");
     // else printf("Lookup: ");
     // printf("branched section took %dns\n", time.count());
     // if (debugOpOrder) {
@@ -1140,29 +1511,108 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
     // auto start = std::chrono::steady_clock::now();
     // divsufsort(worker.sData, worker.sa, worker.data_len, worker.bA, worker.bB);
     #if defined(USE_ASTRO_SPSA)
-      // TNN-style direct SPSA path: minimal overhead, no runtime checks
-      bool alreadySha = SPSA(worker.sData, worker.data_len, worker);
-      if(alreadySha) {
-        memcpy(outputhash, worker.padding, 32);
+      if (shouldUseSpsaForDataLen(worker.data_len)) {
+        SPSA_LOG_ENABLED();
+        if (phaseTelemetry) {
+          const uint64_t prefetch_start_ns = phase_now_ns();
+          prefetchSpsaBucketArrays(worker);
+          phase_spsa_prefetch_ns += (phase_now_ns() - prefetch_start_ns);
+        } else {
+          prefetchSpsaBucketArrays(worker);
+        }
+        uint64_t phase_spsa_start_ns = 0;
+        if (phaseTelemetry) {
+          phase_spsa_start_ns = phase_now_ns();
+        }
+        // TNN-style direct SPSA path: SPSA prepares SA and may also compute final SHA.
+        bool alreadySha = false;
+        if (g_use_local_spsa) {
+          alreadySha = spsa::SPSA_Integrated(worker.sData, worker.data_len, worker, outputhash);
+        } else {
+          alreadySha = SPSA(worker.sData, worker.data_len, worker);
+          if (alreadySha) {
+            SPSA_HIT();
+            uint64_t phase_hit_copy_start_ns = 0;
+            if (phaseTelemetry) {
+              phase_hit_copy_start_ns = phase_now_ns();
+            }
+            memcpy(outputhash, worker.padding, 32);
+            if (phaseTelemetry) {
+              phase_spsa_hit_copy_ns += (phase_now_ns() - phase_hit_copy_start_ns);
+            }
+          }
+        }
+
+        if (phaseTelemetry) {
+          phase_spsa_ns += (phase_now_ns() - phase_spsa_start_ns);
+        }
+        
+        if (alreadySha) {
+          if (!g_use_local_spsa) {
+            // Already handled above for library path
+          } else {
+            SPSA_HIT();
+          }
+        } else {
+          SPSA_MISS();
+          if (g_verbose_tune) {
+            printf("AstroBWTv3: SPSA fallback!\n");
+          }
+          if (g_use_local_spsa) {
+            int32_t *bucketA = nullptr, *bucketB = nullptr;
+            getSABucketScratch(worker, bucketA, bucketB);
+            SA_FUNCTION(worker.sData, worker.sa, worker.data_len, bucketA, bucketB);
+          }
+          byte *B = reinterpret_cast<byte *>(worker.sa);
+          uint64_t phase_hash_start_ns = 0;
+          if (phaseTelemetry) {
+            phase_hash_start_ns = phase_now_ns();
+          }
+          hashSHA256(worker.sha256, B, outputhash, worker.data_len * 4);
+          if (phaseTelemetry) {
+            const uint64_t miss_hash_ns = phase_now_ns() - phase_hash_start_ns;
+            phase_hash_ns += miss_hash_ns;
+            phase_spsa_miss_hash_ns += miss_hash_ns;
+          }
+        }
+        #if SPSA_PROFILE
+        {
+          auto t3 = std::chrono::steady_clock::now();
+          profile_setup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+          profile_wolf_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+          profile_spsa_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
+          log_profile_stats();
+        }
+        #endif
       } else {
-        byte *B = reinterpret_cast<byte *>(worker.sa);
-        hashSHA256(worker.sha256, B, outputhash, worker.data_len*4);
-      }
-      #if SPSA_PROFILE
-      {
-        auto t3 = std::chrono::steady_clock::now();
-        profile_setup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        profile_wolf_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
-        profile_spsa_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
-        log_profile_stats();
-      }
+    #endif
+      #ifdef USE_RADIX_SA
+        // Zero padding after data for deterministic radix sort reads near end
+        memset(worker.sData + worker.data_len, 0, 16);
       #endif
-    #else
-      #if USE_DEROBWT
+      #if USE_DEROBWT && !defined(USE_DLUNA_RADIX_SA) && !defined(USE_RADIX_SA) && !defined(USE_BUCKET_SA)
         // DeroBWT: Custom tiered fingerprint sorting for AstroBWTv3
         derobwt::compute_sa_threadsafe(worker.sData, worker.data_len, worker.sa);
       #else
-        SA_FUNCTION(worker.sData, worker.sa, worker.data_len, worker.bA, worker.bB);
+        int32_t *bucketA = nullptr;
+        int32_t *bucketB = nullptr;
+        getSABucketScratch(worker, bucketA, bucketB);
+        uint64_t phase_sa_start_ns = 0;
+        if (phaseTelemetry) {
+          phase_sa_start_ns = phase_now_ns();
+        }
+        if (g_verbose_tune) {
+          printf("  [Std] Prep phase done, data_len=%u\n", worker.data_len);
+          fflush(stdout);
+        }
+        SA_FUNCTION(worker.sData, worker.sa, worker.data_len, bucketA, bucketB);
+        if (g_verbose_tune) {
+          printf("  [Std] SA phase done\n");
+          fflush(stdout);
+        }
+        if (phaseTelemetry) {
+          phase_sa_ns += (phase_now_ns() - phase_sa_start_ns);
+        }
       #endif
       #ifdef ENABLE_SA_INSTRUMENTATION
       {
@@ -1171,8 +1621,56 @@ void AstroBWTv3(byte *input, int inputLen, byte *outputhash, workerData &worker,
       }
       #endif
       byte *B = reinterpret_cast<byte *>(worker.sa);
+      uint64_t phase_hash_start_ns = 0;
+      if (phaseTelemetry) {
+        phase_hash_start_ns = phase_now_ns();
+      }
       hashSHA256(worker.sha256, B, outputhash, worker.data_len*4);
+      if (g_verbose_tune) {
+        printf("  [Std] Final hash done\n");
+        fflush(stdout);
+      }
+      if (phaseTelemetry) {
+        phase_hash_ns += (phase_now_ns() - phase_hash_start_ns);
+      }
+    #if defined(USE_ASTRO_SPSA)
+      }
     #endif
+
+    if (phaseTelemetry && phase_spsa_ns > 0) {
+      phase_spsa_core_calls = 1;
+      uint64_t core_ns = phase_spsa_ns;
+      core_ns = (core_ns > phase_spsa_prefetch_ns) ? (core_ns - phase_spsa_prefetch_ns) : 0;
+      core_ns = (core_ns > phase_spsa_hit_copy_ns) ? (core_ns - phase_spsa_hit_copy_ns) : 0;
+      core_ns = (core_ns > phase_spsa_miss_hash_ns) ? (core_ns - phase_spsa_miss_hash_ns) : 0;
+      phase_spsa_core_ns = core_ns;
+
+      const int core_bin = classifySpsaCoreLenBin(worker.data_len);
+      phase_spsa_core_bin_calls[core_bin] = 1;
+      phase_spsa_core_bin_ns[core_bin] = core_ns;
+    }
+
+    if (phaseTelemetry) {
+      const uint64_t phase_end = phase_now_ns();
+      g_phase_hashes_total.fetch_add(1, std::memory_order_relaxed);
+      g_phase_data_len_sum_total.fetch_add(static_cast<uint64_t>(worker.data_len), std::memory_order_relaxed);
+      g_phase_prep_ns_total.fetch_add(phase_t1 - phase_t0, std::memory_order_relaxed);
+      g_phase_wolf_ns_total.fetch_add(phase_t2 - phase_t1, std::memory_order_relaxed);
+      g_phase_spsa_ns_total.fetch_add(phase_spsa_ns, std::memory_order_relaxed);
+      g_phase_spsa_prefetch_ns_total.fetch_add(phase_spsa_prefetch_ns, std::memory_order_relaxed);
+      g_phase_spsa_hit_copy_ns_total.fetch_add(phase_spsa_hit_copy_ns, std::memory_order_relaxed);
+      g_phase_spsa_miss_hash_ns_total.fetch_add(phase_spsa_miss_hash_ns, std::memory_order_relaxed);
+      g_phase_spsa_core_ns_total.fetch_add(phase_spsa_core_ns, std::memory_order_relaxed);
+      g_phase_spsa_core_calls_total.fetch_add(phase_spsa_core_calls, std::memory_order_relaxed);
+      for (size_t i = 0; i < phase_spsa_core_bin_calls.size(); ++i) {
+        g_phase_spsa_core_bin_calls_total[i].fetch_add(phase_spsa_core_bin_calls[i], std::memory_order_relaxed);
+        g_phase_spsa_core_bin_ns_total[i].fetch_add(phase_spsa_core_bin_ns[i], std::memory_order_relaxed);
+      }
+      g_phase_sa_ns_total.fetch_add(phase_sa_ns, std::memory_order_relaxed);
+      g_phase_hash_ns_total.fetch_add(phase_hash_ns, std::memory_order_relaxed);
+      g_phase_total_ns_total.fetch_add(phase_end - phase_t0, std::memory_order_relaxed);
+    }
+
     // auto end = std::chrono::steady_clock::now();
     // auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end-start);
     // printf("SA section took %dns\n", time.count());
@@ -1231,3318 +1729,3318 @@ byte *B = reinterpret_cast<byte *>(worker.sa);
 
 DIRTYBIRD_TARGETS
 void branchComputeCPU(workerData &worker, bool isTest, int wIndex)
-{}
-// {
-//   worker.templateIdx = 0;
-//   uint8_t chunkCount = 1;
-//   int firstChunk = 0;
 
-//   uint8_t lp1 = 0;
-//   uint8_t lp2 = 255;
+{
+  worker.templateIdx = 0;
+  uint8_t chunkCount = 1;
+  int firstChunk = 0;
 
-//   while (true)
-//   {
-//     if(isTest) {
+  uint8_t lp1 = 0;
+  uint8_t lp2 = 255;
 
-//     } else {
-//       worker.tries[wIndex]++;
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder) printf("t: 0x%hx p: 0x%llx l: 0x%llx\n", worker.tries[wIndex], worker.prev_lhash, worker.lhash);
-//       #endif
-//       worker.random_switcher = worker.prev_lhash ^ worker.lhash ^ worker.tries[wIndex];
-//       // __builtin_prefetch(&worker.random_switcher,0,3);
-//       // printf("%d worker.random_switcher %d %08jx\n", worker.tries[wIndex], worker.random_switcher, worker.random_switcher);
+  while (true)
+  {
+    if(isTest) {
 
-//       worker.op = static_cast<byte>(worker.random_switcher);
-//       //if (debugOpOrder) worker.opsA.push_back(worker.op);
+    } else {
+      worker.tries[wIndex]++;
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder) printf("t: 0x%hx p: 0x%llx l: 0x%llx\n", worker.tries[wIndex], worker.prev_lhash, worker.lhash);
+      #endif
+      worker.random_switcher = worker.prev_lhash ^ worker.lhash ^ worker.tries[wIndex];
+      // __builtin_prefetch(&worker.random_switcher,0,3);
+      // printf("%d worker.random_switcher %d %08jx\n", worker.tries[wIndex], worker.random_switcher, worker.random_switcher);
 
-//       // printf("op: %d\n", worker.op);
+      worker.op = static_cast<byte>(worker.random_switcher);
+      //if (debugOpOrder) worker.opsA.push_back(worker.op);
 
-//       worker.pos1 = static_cast<byte>(worker.random_switcher >> 8);
-//       worker.pos2 = static_cast<byte>(worker.random_switcher >> 16);
+      // printf("op: %d\n", worker.op);
 
-//       if (worker.pos1 > worker.pos2)
-//       {
-//         std::swap(worker.pos1, worker.pos2);
-//       }
+      worker.pos1 = static_cast<byte>(worker.random_switcher >> 8);
+      worker.pos2 = static_cast<byte>(worker.random_switcher >> 16);
 
-//       if (worker.pos2 - worker.pos1 > 32)
-//       {
-//         worker.pos2 = worker.pos1 + ((worker.pos2 - worker.pos1) & 0x1f);
-//       }
+      if (worker.pos1 > worker.pos2)
+      {
+        std::swap(worker.pos1, worker.pos2);
+      }
 
-//       if (worker.tries[wIndex] > 0) {
-//         lp1 = std::min(lp1, worker.pos1);
-//         lp2 = std::max(lp2, worker.pos2);
-//       }
+      if (worker.pos2 - worker.pos1 > 32)
+      {
+        worker.pos2 = worker.pos1 + ((worker.pos2 - worker.pos1) & 0x1f);
+      }
 
-//       worker.chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 1) * 256];
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder) printf("worker.op: %03d p1: %03d p2: %03d\n", worker.op, worker.pos1, worker.pos2);
-//       #endif
+      if (worker.tries[wIndex] > 0) {
+        lp1 = std::min(lp1, worker.pos1);
+        lp2 = std::max(lp2, worker.pos2);
+      }
 
-//       if (worker.tries[wIndex] == 1) {
-//         worker.prev_chunk = worker.chunk;
-//       } else {
-//         worker.prev_chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 2) * 256];
-//       }
+      worker.chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 1) * 256];
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder) printf("worker.op: %03d p1: %03d p2: %03d\n", worker.op, worker.pos1, worker.pos2);
+      #endif
 
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder) {
-//         printf("tries: %03hu chunk_before[  0->%03d]: ", worker.tries[wIndex], worker.pos2);
-//         for (int x = 0; x <= worker.pos2+16 && worker.pos2+16 < 256; x++) {
-//           printf("%02x", worker.chunk[x]);
-//         }
-//         printf("\n");
-//       }
-//       #endif
+      if (worker.tries[wIndex] == 1) {
+        worker.prev_chunk = worker.chunk;
+      } else {
+        worker.prev_chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 2) * 256];
+      }
 
-//       memcpy(worker.chunk, worker.prev_chunk, 256);
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder) {
-//         printf("tries: %03hu  chunk_fixed[  0->%03d]: ", worker.tries[wIndex], worker.pos2);
-//         for (int x = 0; x <= worker.pos2+16 && worker.pos2+16 < 256; x++) {
-//           //printf("%d \n", x);
-//           printf("%02x", worker.chunk[x]);
-//         }
-//         printf("\n");
-//       }
-//       #endif
-//     }
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder) {
+        printf("tries: %03hu chunk_before[  0->%03d]: ", worker.tries[wIndex], worker.pos2);
+        for (int x = 0; x <= worker.pos2+16 && worker.pos2+16 < 256; x++) {
+          printf("%02x", worker.chunk[x]);
+        }
+        printf("\n");
+      }
+      #endif
 
-//     switch (worker.op)
-//     {
-//     case 0:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+      memcpy(worker.chunk, worker.prev_chunk, 256);
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder) {
+        printf("tries: %03hu  chunk_fixed[  0->%03d]: ", worker.tries[wIndex], worker.pos2);
+        for (int x = 0; x <= worker.pos2+16 && worker.pos2+16 < 256; x++) {
+          //printf("%d \n", x);
+          printf("%02x", worker.chunk[x]);
+        }
+        printf("\n");
+      }
+      #endif
+    }
 
-//         // INSERT_RANDOM_CODE_END
-//         worker.t1 = worker.chunk[worker.pos1];
-//         worker.t2 = worker.chunk[worker.pos2];
-//         worker.chunk[worker.pos1] = reverse8(worker.t2);
-//         worker.chunk[worker.pos2] = reverse8(worker.t1);
-//       }
-//       break;
-//     case 1:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 2:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 3:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 4:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 5:
-//     {
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
+    switch (worker.op)
+    {
+    case 0:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
 
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        // INSERT_RANDOM_CODE_END
+        worker.t1 = worker.chunk[worker.pos1];
+        worker.t2 = worker.chunk[worker.pos2];
+        worker.chunk[worker.pos1] = reverse8(worker.t2);
+        worker.chunk[worker.pos2] = reverse8(worker.t1);
+      }
+      break;
+    case 1:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] += worker.chunk[i];                             // +
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 2:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 3:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 4:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 5:
+    {
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
 
-//         // INSERT_RANDOM_CODE_END
-//       }
-//     }
-//     break;
-//     case 6:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
 
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 7:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 8:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);// rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 9:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 10:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 11:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);            // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 12:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 13:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 14:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 15:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 16:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 17:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 18:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 9);  // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);         // rotate  bits by 5
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 19:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 20:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 21:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 22:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 23:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);                           // rotate  bits by 1
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 24:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 25:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 26:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                 // *
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 27:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 28:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 29:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 30:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 31:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 32:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 33:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 34:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 35:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 36:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 37:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 38:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 39:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 40:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 41:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 42:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 43:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 44:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 45:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);                       // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 46:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 47:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 48:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         // worker.chunk[i] = ~worker.chunk[i];                    // binary NOT operator
-//         // worker.chunk[i] = ~worker.chunk[i];                    // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 49:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 50:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 51:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 52:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 53:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 54:
+        // INSERT_RANDOM_CODE_END
+      }
+    }
+    break;
+    case 6:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
 
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//         // worker.chunk[i] = ~worker.chunk[i];    // binary NOT operator
-//         // worker.chunk[i] = ~worker.chunk[i];    // binary NOT operator
-//         // INSERT_RANDOM_CODE_END
-//       }
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 7:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 8:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);// rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 9:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 10:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] *= worker.chunk[i];              // *
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] *= worker.chunk[i];              // *
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 11:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);            // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 12:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 13:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 14:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 15:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 16:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 17:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] *= worker.chunk[i];              // *
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 18:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 9);  // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);         // rotate  bits by 5
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 19:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 20:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 21:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 22:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 23:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);                           // rotate  bits by 1
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 24:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 25:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 26:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                 // *
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 27:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 28:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 29:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 30:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 31:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] *= worker.chunk[i];                          // *
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 32:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 33:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] *= worker.chunk[i];                             // *
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 34:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 35:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 36:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 37:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] *= worker.chunk[i];                             // *
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 38:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 39:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 40:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 41:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 42:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 43:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 44:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 45:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);                       // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 46:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 47:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 48:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        // worker.chunk[i] = ~worker.chunk[i];                    // binary NOT operator
+        // worker.chunk[i] = ~worker.chunk[i];                    // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 49:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 50:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 51:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 52:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 53:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 54:
 
-//       break;
-//     case 55:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 56:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 57:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 8);                // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
-//                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 58:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 59:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 60:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 61:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 8);             // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);// rotate  bits by 5
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 62:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 63:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 64:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 65:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 66:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 67:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 68:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 69:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 70:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 71:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 72:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 73:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 74:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 75:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 76:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 77:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 78:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 79:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] += worker.chunk[i];               // +
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 80:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 81:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 82:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//         // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
-//         // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 83:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 84:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 85:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 86:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 87:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];               // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] += worker.chunk[i];               // +
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 88:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 89:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];               // +
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 90:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 91:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 92:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 93:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 94:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 95:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 96:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 97:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 98:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 99:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 100:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 101:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 102:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 103:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 104:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 105:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 106:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 107:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 6);             // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 108:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 109:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 110:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 111:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 112:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 113:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);                           // rotate  bits by 1
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 114:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 115:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 116:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 117:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 118:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 119:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 120:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 121:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 122:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 123:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 6);                // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 124:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 125:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 126:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 9); // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//         worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
-//                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 127:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 128:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 129:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 130:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 131:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] *= worker.chunk[i];                 // *
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 132:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 133:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 134:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 135:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 136:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 137:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 138:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//         worker.chunk[i] += worker.chunk[i];           // +
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
-//                                                         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 139:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 140:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 141:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 142:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 143:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 144:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 145:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 146:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 147:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 148:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 149:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//         worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
-//         worker.chunk[i] += worker.chunk[i];           // +
-//                                                         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 150:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 151:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 152:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 153:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         // worker.chunk[i] = ~worker.chunk[i];     // binary NOT operator
-//         // worker.chunk[i] = ~worker.chunk[i];     // binary NOT operator
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 154:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 155:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 156:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], 4);             // rotate  bits by 3
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 157:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 158:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 159:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 160:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 4);             // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
-//         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 161:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 162:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 163:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 164:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                 // *
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 165:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 166:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] += worker.chunk[i];               // +
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 167:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
-//         // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 168:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 169:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 170:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
-//         worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
-//         worker.chunk[i] *= worker.chunk[i];          // *
-//                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 171:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 172:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 173:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 174:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 175:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 176:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] *= worker.chunk[i];              // *
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 177:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 178:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 179:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 180:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 181:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 182:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 5);         // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 183:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];        // +
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97); // XOR and -
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97); // XOR and -
-//         worker.chunk[i] *= worker.chunk[i];        // *
-//                                                      // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 184:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 185:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 186:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 187:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 188:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 189:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 190:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 191:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 192:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 193:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 194:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 195:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 196:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 197:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 198:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 199:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];           // binary NOT operator
-//         worker.chunk[i] += worker.chunk[i];           // +
-//         worker.chunk[i] *= worker.chunk[i];           // *
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//                                                         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 200:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 201:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 202:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 203:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 204:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 205:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 206:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 207:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);                           // rotate  bits by 3
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 208:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 209:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 210:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 211:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 212:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 213:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 214:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 215:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 216:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 217:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//         worker.chunk[i] += worker.chunk[i];               // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 218:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
-//         worker.chunk[i] = ~worker.chunk[i];          // binary NOT operator
-//         worker.chunk[i] *= worker.chunk[i];          // *
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
-//                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 219:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 220:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 221:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
-//         worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
-//         worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 222:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] *= worker.chunk[i];                          // *
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 223:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 224:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 4);  // rotate  bits by 1
-//         // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        //
-//       }
-//       break;
-//     case 225:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 226:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
-//         worker.chunk[i] *= worker.chunk[i];           // *
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//                                                         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 227:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 228:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 229:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 230:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 231:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 232:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 233:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 234:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 235:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] *= worker.chunk[i];               // *
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 236:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 237:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 238:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] += worker.chunk[i];              // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
-//                                                            // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 239:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
-//         // worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
-//         worker.chunk[i] *= worker.chunk[i];                             // *
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 240:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
-//         worker.chunk[i] += worker.chunk[i];                             // +
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 241:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 242:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];           // +
-//         worker.chunk[i] += worker.chunk[i];           // +
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
-//         worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
-//                                                         // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 243:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 244:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 245:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 246:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//         worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
-//         worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
-//         worker.chunk[i] += worker.chunk[i];                          // +
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 247:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
-//         worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
-//                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 248:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
-//         worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 249:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 250:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
-//         worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
-//                                                                           // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 251:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] += worker.chunk[i];                 // +
-//         worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
-//         worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
-//                                                               // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 252:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
-//         worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
-//                                                                        // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     case 253:
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
-//         worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
-//         // INSERT_RANDOM_CODE_END
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+        // worker.chunk[i] = ~worker.chunk[i];    // binary NOT operator
+        // worker.chunk[i] = ~worker.chunk[i];    // binary NOT operator
+        // INSERT_RANDOM_CODE_END
+      }
 
-//         worker.prev_lhash = worker.lhash + worker.prev_lhash;
-//         worker.lhash = XXHash64::hash(worker.chunk, worker.pos2,0);
-//       }
-//       break;
-//     case 254:
-//     case 255:
-//       RC4_set_key(&worker.key[wIndex], 256,  worker.chunk);
-// // worker.chunk = highwayhash.Sum(worker.chunk[:], worker.chunk[:])
-// #pragma GCC unroll 32
-//       for (int i = worker.pos1; i < worker.pos2; i++)
-//       {
-//         // INSERT_RANDOM_CODE_START
-//         worker.chunk[i] ^= static_cast<uint8_t>(std::bitset<8>(worker.chunk[i]).count()); // ones count bits
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                                  // rotate  bits by 3
-//         worker.chunk[i] ^= rl8(worker.chunk[i], 2);                                 // rotate  bits by 2
-//         worker.chunk[i] = rl8(worker.chunk[i], 3);                                  // rotate  bits by 3
-//                                                                                             // INSERT_RANDOM_CODE_END
-//       }
-//       break;
-//     default:
-//       break;
-//     }
+      break;
+    case 55:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 56:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 57:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 8);                // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
+                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 58:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] += worker.chunk[i];                             // +
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 59:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 60:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] *= worker.chunk[i];              // *
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 61:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 8);             // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);// rotate  bits by 5
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 62:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] += worker.chunk[i];                             // +
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 63:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] += worker.chunk[i];                 // +
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 64:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] *= worker.chunk[i];               // *
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 65:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];               // *
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 66:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 67:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 68:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 69:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 70:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 71:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 72:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 73:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 74:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 75:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 76:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 77:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 78:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 79:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] += worker.chunk[i];               // +
+        worker.chunk[i] *= worker.chunk[i];               // *
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 80:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 81:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 82:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+        // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
+        // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 83:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 84:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 85:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 86:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 87:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];               // +
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] += worker.chunk[i];               // +
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 88:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 89:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];               // +
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 90:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 91:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 92:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 93:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] += worker.chunk[i];                             // +
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 94:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 95:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 10); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 96:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 97:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 98:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 99:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 100:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 101:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 102:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 103:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 104:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] += worker.chunk[i];                 // +
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 105:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 106:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] *= worker.chunk[i];               // *
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 107:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 6);             // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 108:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 109:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 110:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 111:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 112:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 113:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);                           // rotate  bits by 1
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 114:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 115:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 116:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 117:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 118:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 119:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 120:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 121:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] *= worker.chunk[i];                          // *
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 122:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 123:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 6);                // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 124:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 125:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 126:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 9); // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+        worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
+                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 127:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 128:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 129:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 130:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 131:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] *= worker.chunk[i];                 // *
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 132:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 133:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 134:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 135:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 136:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 137:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 138:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+        worker.chunk[i] += worker.chunk[i];           // +
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
+                                                        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 139:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 140:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 141:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] += worker.chunk[i];                 // +
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 142:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 143:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 144:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 145:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 146:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 147:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] *= worker.chunk[i];                          // *
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 148:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 149:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+        worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
+        worker.chunk[i] += worker.chunk[i];           // +
+                                                        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 150:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 151:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 152:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 153:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 4); // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        // worker.chunk[i] = ~worker.chunk[i];     // binary NOT operator
+        // worker.chunk[i] = ~worker.chunk[i];     // binary NOT operator
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 154:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
+        worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 155:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 156:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], 4);             // rotate  bits by 3
+        // worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 157:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 158:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 159:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 160:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 4);             // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
+        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 161:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 162:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 163:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 164:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                 // *
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 165:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 166:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] += worker.chunk[i];               // +
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 167:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
+        // worker.chunk[i] = ~worker.chunk[i];        // binary NOT operator
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 168:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 169:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 170:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
+        worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
+        worker.chunk[i] *= worker.chunk[i];          // *
+                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 171:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 172:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 173:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 174:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 175:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
+        worker.chunk[i] *= worker.chunk[i];              // *
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 176:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] *= worker.chunk[i];              // *
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 177:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 178:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 179:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 180:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 181:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 182:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 5);         // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 183:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];        // +
+        worker.chunk[i] -= (worker.chunk[i] ^ 97); // XOR and -
+        worker.chunk[i] -= (worker.chunk[i] ^ 97); // XOR and -
+        worker.chunk[i] *= worker.chunk[i];        // *
+                                                     // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 184:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] *= worker.chunk[i];                          // *
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 185:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 186:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 187:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 188:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 189:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);        // XOR and -
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 190:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 191:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 192:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] *= worker.chunk[i];                          // *
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 193:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 194:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 195:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 196:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 197:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] *= worker.chunk[i];                             // *
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 198:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 199:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];           // binary NOT operator
+        worker.chunk[i] += worker.chunk[i];           // +
+        worker.chunk[i] *= worker.chunk[i];           // *
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+                                                        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 200:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 201:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 202:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 203:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], 1);                // rotate  bits by 1
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 204:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 205:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 206:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 207:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 8); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);                           // rotate  bits by 3
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 208:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 209:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 210:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], 5);                // rotate  bits by 5
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 211:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 212:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 213:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 214:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 215:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] *= worker.chunk[i];                             // *
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 216:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 217:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+        worker.chunk[i] += worker.chunk[i];               // +
+        worker.chunk[i] = rl8(worker.chunk[i], 1);  // rotate  bits by 1
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 218:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]); // reverse bits
+        worker.chunk[i] = ~worker.chunk[i];          // binary NOT operator
+        worker.chunk[i] *= worker.chunk[i];          // *
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);   // XOR and -
+                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 219:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 220:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 221:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5); // rotate  bits by 5
+        worker.chunk[i] ^= worker.chunk[worker.pos2];    // XOR
+        worker.chunk[i] = ~worker.chunk[i];              // binary NOT operator
+        worker.chunk[i] = reverse8(worker.chunk[i]);     // reverse bits
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 222:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] *= worker.chunk[i];                          // *
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 223:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 224:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 4);  // rotate  bits by 1
+        // worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       //
+      }
+      break;
+    case 225:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                          // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 226:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);  // reverse bits
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
+        worker.chunk[i] *= worker.chunk[i];           // *
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+                                                        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 227:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 228:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];          // ones count bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 229:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                // rotate  bits by 3
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);               // rotate  bits by 2
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 230:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 231:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                // XOR
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 232:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4); // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 233:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);    // rotate  bits by 3
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 234:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3);    // shift right
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 235:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] *= worker.chunk[i];               // *
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 236:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= worker.chunk[worker.pos2];                   // XOR
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                      // XOR and -
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 237:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 3);             // rotate  bits by 3
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 238:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] += worker.chunk[i];              // +
+        worker.chunk[i] = rl8(worker.chunk[i], 3); // rotate  bits by 3
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);       // XOR and -
+                                                           // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 239:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 6); // rotate  bits by 5
+        // worker.chunk[i] = rl8(worker.chunk[i], 1); // rotate  bits by 1
+        worker.chunk[i] *= worker.chunk[i];                             // *
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 240:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                             // binary NOT operator
+        worker.chunk[i] += worker.chunk[i];                             // +
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3);    // shift left
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 241:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);   // rotate  bits by 4
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] ^= worker.chunk[worker.pos2];       // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 242:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];           // +
+        worker.chunk[i] += worker.chunk[i];           // +
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);    // XOR and -
+        worker.chunk[i] ^= worker.chunk[worker.pos2]; // XOR
+                                                        // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 243:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 1);    // rotate  bits by 1
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 244:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = reverse8(worker.chunk[i]);      // reverse bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 245:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);                   // XOR and -
+        worker.chunk[i] = rl8(worker.chunk[i], 5);             // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 246:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                          // +
+        worker.chunk[i] = rl8(worker.chunk[i], 1);             // rotate  bits by 1
+        worker.chunk[i] = worker.chunk[i] >> (worker.chunk[i] & 3); // shift right
+        worker.chunk[i] += worker.chunk[i];                          // +
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 247:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 5);  // rotate  bits by 5
+        worker.chunk[i] = ~worker.chunk[i];               // binary NOT operator
+                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 248:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = ~worker.chunk[i];                 // binary NOT operator
+        worker.chunk[i] -= (worker.chunk[i] ^ 97);          // XOR and -
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 5);    // rotate  bits by 5
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 249:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);                    // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 250:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = worker.chunk[i] & worker.chunk[worker.pos2]; // AND
+        worker.chunk[i] = rl8(worker.chunk[i], worker.chunk[i]); // rotate  bits by random
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]];             // ones count bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);               // rotate  bits by 4
+                                                                          // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 251:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] += worker.chunk[i];                 // +
+        worker.chunk[i] ^= (byte)bitTable[worker.chunk[i]]; // ones count bits
+        worker.chunk[i] = reverse8(worker.chunk[i]);        // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);   // rotate  bits by 2
+                                                              // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 252:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = reverse8(worker.chunk[i]);                 // reverse bits
+        worker.chunk[i] ^= rl8(worker.chunk[i], 4);            // rotate  bits by 4
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);            // rotate  bits by 2
+        worker.chunk[i] = worker.chunk[i] << (worker.chunk[i] & 3); // shift left
+                                                                       // INSERT_RANDOM_CODE_END
+      }
+      break;
+    case 253:
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2); // rotate  bits by 2
+        worker.chunk[i] ^= worker.chunk[worker.pos2];     // XOR
+        worker.chunk[i] = rl8(worker.chunk[i], 3);  // rotate  bits by 3
+        // INSERT_RANDOM_CODE_END
 
-//     if(isTest) {
-//       break;
-//     }
+        worker.prev_lhash = worker.lhash + worker.prev_lhash;
+        worker.lhash = XXHash64::hash(worker.chunk, worker.pos2,0);
+      }
+      break;
+    case 254:
+    case 255:
+      RC4_set_key(&worker.key[wIndex], 256,  worker.chunk);
+// worker.chunk = highwayhash.Sum(worker.chunk[:], worker.chunk[:])
+#pragma GCC unroll 32
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        // INSERT_RANDOM_CODE_START
+        worker.chunk[i] ^= static_cast<uint8_t>(std::bitset<8>(worker.chunk[i]).count()); // ones count bits
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                                  // rotate  bits by 3
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);                                 // rotate  bits by 2
+        worker.chunk[i] = rl8(worker.chunk[i], 3);                                  // rotate  bits by 3
+                                                                                            // INSERT_RANDOM_CODE_END
+      }
+      break;
+    default:
+      break;
+    }
 
-//     // if (op == 53) {
-//     //   std::cout << hexStr(worker.chunk, 256) << std::endl << std::endl;
-//     //   std::cout << hexStr(&worker.chunk[worker.pos1], 1) << std::endl;
-//     //   std::cout << hexStr(&worker.chunk[worker.pos2], 1) << std::endl;
-//     // }
+    if(isTest) {
+      break;
+    }
 
-//     uint8_t pushPos1 = lp1;
-//     uint8_t pushPos2 = lp2;
+    // if (op == 53) {
+    //   std::cout << hexStr(worker.chunk, 256) << std::endl << std::endl;
+    //   std::cout << hexStr(&worker.chunk[worker.pos1], 1) << std::endl;
+    //   std::cout << hexStr(&worker.chunk[worker.pos2], 1) << std::endl;
+    // }
 
-//     if (worker.pos1 == worker.pos2) {
-//       pushPos1 = -1;
-//       pushPos2 = -1;
-//     }
+    uint8_t pushPos1 = lp1;
+    uint8_t pushPos2 = lp2;
 
-//     worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
-//     worker.A = (256 + (worker.A % 256)) % 256;
+    if (worker.pos1 == worker.pos2) {
+      pushPos1 = -1;
+      pushPos2 = -1;
+    }
 
-//     #ifdef DEBUG_OP_ORDER
-//     if (debugOpOrder){printf("worker.A: %02X\n", worker.A);}
-//     #endif
+    worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
+    worker.A = (256 + (worker.A % 256)) % 256;
 
-//     if (worker.A < 0x10)
-//     { // 6.25 % probability
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder){printf("A\n");}
-//       #endif
-//       __builtin_prefetch(worker.chunk, 0, 0);
-//       worker.prev_lhash = worker.lhash + worker.prev_lhash;
-//       worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
-//       // if (debugOpOrder) printf("A: new worker.lhash: %08jx\n", worker.lhash);
-//     }
+    #ifdef DEBUG_OP_ORDER
+    if (debugOpOrder){printf("worker.A: %02X\n", worker.A);}
+    #endif
 
-//     if (worker.A < 0x20)
-//     { // 12.5 % probability
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder){printf("B\n");}
-//       #endif
-//       __builtin_prefetch(worker.chunk, 0, 0);
-//       worker.prev_lhash = worker.lhash + worker.prev_lhash;
-//       worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
-//       // if (debugOpOrder) printf("B: new worker.lhash: %08jx\n", worker.lhash);
-//     }
+    if (worker.A < 0x10)
+    { // 6.25 % probability
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder){printf("A\n");}
+      #endif
+      __builtin_prefetch(worker.chunk, 0, 0);
+      worker.prev_lhash = worker.lhash + worker.prev_lhash;
+      worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
+      // if (debugOpOrder) printf("A: new worker.lhash: %08jx\n", worker.lhash);
+    }
 
-//     if (worker.A < 0x30)
-//     { // 18.75 % probability
-//       // std::copy(worker.chunk, worker.chunk + worker.pos2, s3);
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder){printf("C\n");}
-//       #endif
-//       __builtin_prefetch(worker.chunk, 0, 0);
-//       worker.prev_lhash = worker.lhash + worker.prev_lhash;
-//       HH_ALIGNAS(16)
-//       const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
-//       worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2); // more deviations
-//       // if (debugOpOrder) printf("C: new worker.lhash: %08jx\n", worker.lhash);
-//     }
+    if (worker.A < 0x20)
+    { // 12.5 % probability
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder){printf("B\n");}
+      #endif
+      __builtin_prefetch(worker.chunk, 0, 0);
+      worker.prev_lhash = worker.lhash + worker.prev_lhash;
+      worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
+      // if (debugOpOrder) printf("B: new worker.lhash: %08jx\n", worker.lhash);
+    }
 
-//     if (worker.A <= 0x40)
-//     { // 25% probablility
-//       // if (debugOpOrder) {
-//       //   printf("D: RC4 key:\n");
-//       //   for (int i = 0; i < 256; i++) {
-//       //     printf("%d, ", worker.key.data[i]);
-//       //   }
-//       // }
-//       #ifdef DEBUG_OP_ORDER
-//       if (debugOpOrder){printf("D\n");}
-//       #endif
-//       __builtin_prefetch(&worker.key[wIndex], 0, 0);
-//       RC4(&worker.key[wIndex], 256, worker.chunk,  worker.chunk);
-//       if (255 - pushPos2 < MINPREFLEN)
-//         pushPos2 = 255;
-//       if (pushPos1 < MINPREFLEN)
-//         pushPos1 = 0;
+    if (worker.A < 0x30)
+    { // 18.75 % probability
+      // std::copy(worker.chunk, worker.chunk + worker.pos2, s3);
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder){printf("C\n");}
+      #endif
+      __builtin_prefetch(worker.chunk, 0, 0);
+      worker.prev_lhash = worker.lhash + worker.prev_lhash;
+      HH_ALIGNAS(16)
+      const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
+      worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2); // more deviations
+      // if (debugOpOrder) printf("C: new worker.lhash: %08jx\n", worker.lhash);
+    }
+
+    if (worker.A <= 0x40)
+    { // 25% probablility
+      // if (debugOpOrder) {
+      //   printf("D: RC4 key:\n");
+      //   for (int i = 0; i < 256; i++) {
+      //     printf("%d, ", worker.key.data[i]);
+      //   }
+      // }
+      #ifdef DEBUG_OP_ORDER
+      if (debugOpOrder){printf("D\n");}
+      #endif
+      __builtin_prefetch(&worker.key[wIndex], 0, 0);
+      RC4(&worker.key[wIndex], 256, worker.chunk,  worker.chunk);
+      if (255 - pushPos2 < MINPREFLEN)
+        pushPos2 = 255;
+      if (pushPos1 < MINPREFLEN)
+        pushPos1 = 0;
 
 
-//       if (pushPos1 == 255) pushPos1 = 0;
+      if (pushPos1 == 255) pushPos1 = 0;
       
-//       worker.astroTemplate[worker.templateIdx] = templateMarker{
-//         (uint8_t)(chunkCount > 1 ? pushPos1 : 0),
-//         (uint8_t)(chunkCount > 1 ? pushPos2 : 255),
-//         (uint16_t)0,
-//         (uint16_t)0,
-//         (uint16_t)((firstChunk << 7) | chunkCount)
-//       };
+      worker.astroTemplate[worker.templateIdx] = templateMarker{
+        (uint8_t)(chunkCount > 1 ? pushPos1 : 0),
+        (uint8_t)(chunkCount > 1 ? pushPos2 : 255),
+        (uint16_t)0,
+        (uint16_t)0,
+        (uint16_t)((firstChunk << 7) | chunkCount)
+      };
 
-//       pushPos1 = 0;
-//       pushPos2 = 255;
-//       worker.templateIdx += (worker.tries[wIndex] > 1);
-//       firstChunk = worker.tries[wIndex]-1;
-//       lp1 = 255;
-//       lp2 = 0;
-//       chunkCount = 1;
-//     } else {
-//       chunkCount++;
-//     }
+      pushPos1 = 0;
+      pushPos2 = 255;
+      worker.templateIdx += (worker.tries[wIndex] > 1);
+      firstChunk = worker.tries[wIndex]-1;
+      lp1 = 255;
+      lp2 = 0;
+      chunkCount = 1;
+    } else {
+      chunkCount++;
+    }
 
-//     if (255 - pushPos2 < MINPREFLEN)
-//       pushPos2 = 255;
-//     if (pushPos1 < MINPREFLEN)
-//       pushPos1 = 0;
+    if (255 - pushPos2 < MINPREFLEN)
+      pushPos2 = 255;
+    if (pushPos1 < MINPREFLEN)
+      pushPos1 = 0;
 
-//     worker.chunk[255] = worker.chunk[255] ^ worker.chunk[worker.pos1] ^ worker.chunk[worker.pos2];
+    worker.chunk[255] = worker.chunk[255] ^ worker.chunk[worker.pos1] ^ worker.chunk[worker.pos2];
 
-//     prefetch(worker.chunk, 256, 1);
-//     memcpy(&worker.sData[(worker.tries[wIndex] - 1) * 256], worker.chunk, 256);
+    prefetch(worker.chunk, 256, 1);
+    memcpy(&worker.sData[(worker.tries[wIndex] - 1) * 256], worker.chunk, 256);
 
-//     #ifdef DEBUG_OP_ORDER
-//     if (debugOpOrder && worker.op == sus_op) {
-//       printf("op %d result:\n", worker.op);
-//       for (int i = 0; i < 256; i++) {
-//           printf("%02X ", worker.chunk[i]);
-//       } 
-//       printf("\n");
-//     }
-//     #endif
-//     // std::copy(worker.chunk, worker.chunk + 256, &worker.sData[(worker.tries[wIndex] - 1) * 256]);
+    #ifdef DEBUG_OP_ORDER
+    if (debugOpOrder && worker.op == sus_op) {
+      printf("op %d result:\n", worker.op);
+      for (int i = 0; i < 256; i++) {
+          printf("%02X ", worker.chunk[i]);
+      } 
+      printf("\n");
+    }
+    #endif
+    // std::copy(worker.chunk, worker.chunk + 256, &worker.sData[(worker.tries[wIndex] - 1) * 256]);
 
-//     // memcpy(&worker->data.data()[(worker.tries[wIndex] - 1) * 256], worker.chunk, 256);
+    // memcpy(&worker->data.data()[(worker.tries[wIndex] - 1) * 256], worker.chunk, 256);
 
-//     // std::cout << hexStr(worker.chunk, 256) << std::endl;
+    // std::cout << hexStr(worker.chunk, 256) << std::endl;
 
-//     if (worker.tries[wIndex] > 260 + 16 || (worker.chunk[255] >= 0xf0 && worker.tries[wIndex] > 260))
-//     {
-//       break;
-//     }
-//   }
+    if (worker.tries[wIndex] > 260 + 16 || (worker.chunk[255] >= 0xf0 && worker.tries[wIndex] > 260))
+    {
+      break;
+    }
+  }
 
-//   if (chunkCount > 0) {
-//     if (255 - lp2 < MINPREFLEN)
-//       lp2 = 255;
-//     if (lp1 < MINPREFLEN)
-//       lp1 = 0;
-//     worker.astroTemplate[worker.templateIdx] = templateMarker{
-//       (uint8_t)(chunkCount > 1 ? lp1 : 0),
-//       (uint8_t)(chunkCount > 1 ? lp2 : 255),
-//       (uint16_t)0,
-//       (uint16_t)0,
-//       (uint16_t)((firstChunk << 7) | chunkCount)
-//     };
-//     worker.templateIdx++;
-//   }
+  if (chunkCount > 0) {
+    if (255 - lp2 < MINPREFLEN)
+      lp2 = 255;
+    if (lp1 < MINPREFLEN)
+      lp1 = 0;
+    worker.astroTemplate[worker.templateIdx] = templateMarker{
+      (uint8_t)(chunkCount > 1 ? lp1 : 0),
+      (uint8_t)(chunkCount > 1 ? lp2 : 255),
+      (uint16_t)0,
+      (uint16_t)0,
+      (uint16_t)((firstChunk << 7) | chunkCount)
+    };
+    worker.templateIdx++;
+  }
 
-//   worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
-// }
+  worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
+}
 
 // #if defined(__AVX2__)
 
@@ -8772,6 +9270,9 @@ void wolfCompute(workerData &worker, bool isTest, int wIndex)
 
   uint8_t lp1 = 0;
   uint8_t lp2 = 255;
+  const bool phaseTelemetry = isPhaseTelemetryEnabled();
+  std::array<uint64_t, kSpsaOpFamilyCount> phase_spsa_op_family_calls{0, 0, 0, 0};
+  std::array<uint64_t, kSpsaOpFamilyCount> phase_spsa_op_family_bytes{0, 0, 0, 0};
 
   worker.tries[wIndex] = 0;
   for (int it = 0; it < 278; ++it)
@@ -8805,6 +9306,14 @@ void wolfCompute(workerData &worker, bool isTest, int wIndex)
 
       worker.pos1 = p1;
       worker.pos2 = p2;
+      const uint8_t span = (worker.pos2 > worker.pos1)
+          ? static_cast<uint8_t>(worker.pos2 - worker.pos1)
+          : 0;
+      if (phaseTelemetry) {
+        const size_t family = classifySpsaOpFamily(worker.op);
+        phase_spsa_op_family_calls[family] += 1;
+        phase_spsa_op_family_bytes[family] += span;
+      }
 
       worker.chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 1) * 256];
 
@@ -8813,21 +9322,9 @@ void wolfCompute(workerData &worker, bool isTest, int wIndex)
       } else {
         worker.prev_chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 2) * 256];
 
-        // Phase 2 optimization: Selective copy based on modified region size
-        // Saves ~50KB per hash by only copying unchanged regions
-#if defined(__AVX2__) && USE_SELECTIVE_MEMCPY
-        if (should_use_incremental_copy(p1, p2)) {
-          // Copy only unchanged regions: [0, p1) and [p2+1, 256)
-          // Modified region [p1, p2] will be overwritten by wolfPermute
-          memcpy_range_avx2(worker.chunk, worker.prev_chunk, p1, p2 + 1);
-        } else {
-          // Full copy with cache retention for larger modified regions
-          memcpy256_cached(worker.chunk, worker.prev_chunk);
-        }
-#else
-        // Fallback: Let compiler optimize the 256-byte copy (matches TNN approach)
+        // Full 256-byte copy required: wolfPermute reads from chunk[p1:p2)
+        // See USE_SELECTIVE_MEMCPY comment in astroworker.h for details
         memcpy(worker.chunk, worker.prev_chunk, 256);
-#endif
       }
     // }
 
@@ -8896,36 +9393,40 @@ after:
     worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
     worker.A = (256 + (worker.A % 256)) % 256;
 
-    if (worker.A < 0x10)
-    { // 6.25 % probability
-      worker.prev_lhash = worker.lhash + worker.prev_lhash;
-      worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
-
-      #ifdef DEBUG_OP_ORDER
-      if (worker.op == sus_op && debugOpOrder)  printf("Wolf: A: new worker.lhash: %08jx\n", worker.lhash);
-      #endif
-    }
-
-    if (worker.A < 0x20)
-    { // 12.5 % probability
-      worker.prev_lhash = worker.lhash + worker.prev_lhash;
-      worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
-
-      #ifdef DEBUG_OP_ORDER
-      if (worker.op == sus_op && debugOpOrder)  printf("Wolf: B: new worker.lhash: %08jx\n", worker.lhash);
-      #endif
-    }
-
-    if (worker.A < 0x30)
-    { // 18.75 % probability
-      worker.prev_lhash = worker.lhash + worker.prev_lhash;
-      HH_ALIGNAS(16)
-      const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
-      worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2); // more deviations
-
-      #ifdef DEBUG_OP_ORDER
-      if (worker.op == sus_op && debugOpOrder)  printf("Wolf: C: new worker.lhash: %08jx\n", worker.lhash);
-      #endif
+    // Branchless hash dispatch: replace 3 unpredictable cascading if/else with
+    // a single computed selector + switch/fallthrough. ~81% of the time sel==0
+    // (no hash needed), so the fast path is a single comparison.
+    {
+      const int hash_sel = (worker.A < 0x30) + (worker.A < 0x20) + (worker.A < 0x10);
+      switch (hash_sel) {
+        case 3:  // A < 0x10: XXHash + FNV + SipHash
+          worker.prev_lhash = worker.lhash + worker.prev_lhash;
+          worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
+          #ifdef DEBUG_OP_ORDER
+          if (worker.op == sus_op && debugOpOrder)  printf("Wolf: A: new worker.lhash: %08jx\n", worker.lhash);
+          #endif
+          [[fallthrough]];
+        case 2:  // A < 0x20: FNV + SipHash
+          worker.prev_lhash = worker.lhash + worker.prev_lhash;
+          worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
+          #ifdef DEBUG_OP_ORDER
+          if (worker.op == sus_op && debugOpOrder)  printf("Wolf: B: new worker.lhash: %08jx\n", worker.lhash);
+          #endif
+          [[fallthrough]];
+        case 1:  // A < 0x30: SipHash only
+          {
+            worker.prev_lhash = worker.lhash + worker.prev_lhash;
+            HH_ALIGNAS(16)
+            const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
+            worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+            #ifdef DEBUG_OP_ORDER
+            if (worker.op == sus_op && debugOpOrder)  printf("Wolf: C: new worker.lhash: %08jx\n", worker.lhash);
+            #endif
+          }
+          break;
+        default:  // hash_sel == 0, A >= 0x30: no hash (~81%)
+          break;
+      }
     }
 
     if (worker.A <= 0x40)
@@ -9009,13 +9510,326 @@ after:
 
   // printf("%dc\n", changeCount);
   worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
+  if (phaseTelemetry) {
+    addSpsaOpFamilyTelemetryBatch(phase_spsa_op_family_calls, phase_spsa_op_family_bytes);
+  }
 }
 
 
 // Compute the new values for worker.chunk using layered lookup tables instead of
-// branched computational operations
+// branched computational operations (memory-bound, reduces thermal throttling)
 void lookupCompute(workerData &worker, bool isTest, int wIndex)
-{}
+{
+#if USE_LOOKUP_TABLES
+  byte prevOp;
+  int changeCount = 0;
+
+  worker.templateIdx = 0;
+  uint8_t chunkCount = 1;
+  int firstChunk = 0;
+
+  uint8_t lp1 = 0;
+  uint8_t lp2 = 255;
+  const bool phaseTelemetry = isPhaseTelemetryEnabled();
+  std::array<uint64_t, kSpsaOpFamilyCount> phase_spsa_op_family_calls{0, 0, 0, 0};
+  std::array<uint64_t, kSpsaOpFamilyCount> phase_spsa_op_family_bytes{0, 0, 0, 0};
+
+  worker.tries[wIndex] = 0;
+  for (int it = 0; it < 278; ++it)
+  {
+      worker.tries[wIndex]++;
+      worker.random_switcher = worker.prev_lhash ^ worker.lhash ^ worker.tries[wIndex];
+
+      prevOp = worker.op;
+      worker.op = static_cast<byte>(worker.random_switcher);
+
+      byte p1 = static_cast<byte>(worker.random_switcher >> 8);
+      byte p2 = static_cast<byte>(worker.random_switcher >> 16);
+
+      if (p1 > p2)
+      {
+        std::swap(p1, p2);
+      }
+
+      if (p2 - p1 > 32)
+      {
+        p2 = p1 + ((p2 - p1) & 0x1f);
+      }
+
+      if (worker.tries[wIndex] > 0) {
+        lp1 = std::min(lp1, p1);
+        lp2 = std::max(lp2, p2);
+      }
+
+      if (p1 < worker.pos1 || p2 > worker.pos2) {worker.isSame = false; changeCount++;}
+
+      worker.pos1 = p1;
+      worker.pos2 = p2;
+      const uint8_t span = (worker.pos2 > worker.pos1)
+          ? static_cast<uint8_t>(worker.pos2 - worker.pos1)
+          : 0;
+      if (phaseTelemetry) {
+        const size_t family = classifySpsaOpFamily(worker.op);
+        phase_spsa_op_family_calls[family] += 1;
+        phase_spsa_op_family_bytes[family] += span;
+      }
+
+      worker.chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 1) * 256];
+
+      if (worker.tries[wIndex] == 1) {
+        worker.prev_chunk = worker.chunk;
+      } else {
+        worker.prev_chunk = &worker.sData[wIndex * ASTRO_SCRATCH_SIZE + (worker.tries[wIndex] - 2) * 256];
+        memcpy(worker.chunk, worker.prev_chunk, 256);
+      }
+
+    if (worker.op == 253)
+    {
+      copyChunkData(worker, worker.pos1, worker.pos2);
+      for (int i = worker.pos1; i < worker.pos2; i++)
+      {
+        worker.chunk[i] = rl8(worker.chunk[i], 3);
+        worker.chunk[i] ^= rl8(worker.chunk[i], 2);
+        worker.chunk[i] ^= worker.prev_chunk[worker.pos2];
+        worker.chunk[i] = rl8(worker.chunk[i], 3);
+
+        worker.prev_lhash = worker.lhash + worker.prev_lhash;
+        worker.lhash = XXHash64::hash(worker.chunk, worker.pos2,0);
+      }
+
+      goto after_lookup;
+    }
+    if (worker.op >= 254) {
+#if USE_FAST_RC4
+      rc4_avx512::fast_rc4_set_key_dual(worker.fast_rc4_key[wIndex], &worker.key[wIndex], 256, worker.prev_chunk);
+#elif USE_CRYPTOGAMS_RC4_DUAL
+      worker.cryptogams_rc4[wIndex].set_key(worker.prev_chunk, 256);
+      RC4_set_key(&worker.key[wIndex], 256, worker.prev_chunk);
+#else
+      RC4_set_key(&worker.key[wIndex], 256,  worker.prev_chunk);
+#endif
+    }
+
+    // === LOOKUP TABLE BRANCH (replaces wolfPermute) ===
+    {
+      const bool isBranched = g_is_branched[worker.op];
+      const bool smart_mode = (g_lookup_mode == LOOKUP_MODE_SMART);
+      const bool branched_hybrid = isBranched && (g_lookup_mode == LOOKUP_MODE_HYBRID);
+      const uint8_t span = (worker.pos2 > worker.pos1)
+          ? static_cast<uint8_t>(worker.pos2 - worker.pos1)
+          : 0;
+      const bool smart_can_use_avx2 = smart_mode && isBranched && lookupSmartAvx2Available();
+      const bool branched_smart_avx2 =
+          smart_can_use_avx2 && (span > static_cast<uint8_t>(g_lookup_smart_threshold));
+      const uint8_t* lut = nullptr;
+      bool use_lut = !(branched_hybrid || branched_smart_avx2);
+      alignas(64) uint8_t branch_row[256];
+
+      if (smart_mode && isBranched && g_lookup_smart_telemetry) {
+        const size_t hist_index = static_cast<size_t>(std::min<int>(span, 32));
+        g_lookup_smart_branched_total.fetch_add(1, std::memory_order_relaxed);
+        g_lookup_smart_span_hist[hist_index].fetch_add(1, std::memory_order_relaxed);
+        if (branched_smart_avx2) {
+          g_lookup_smart_path_avx2.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          g_lookup_smart_path_lut.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+
+      if (branched_hybrid || branched_smart_avx2) {
+        // Hybrid/smart AVX2 path: regular ops still use 1D LUT, branched ops run wolfPermute.
+        wolfPermute(worker.prev_chunk, worker.chunk, worker.op, worker.pos1, worker.pos2, worker);
+      } else if (g_lookup_mode == LOOKUP_MODE_FULL && lookup_full::g_lookup3D != nullptr) {
+        const size_t full_base = (static_cast<size_t>(worker.op) << 16) +
+                                 (static_cast<size_t>(worker.prev_chunk[worker.pos2]) << 8);
+        lut = &lookup_full::g_lookup3D[full_base];
+      } else if (!isBranched) {
+        // 1D lookup: regular ops (no pos2val dependency)
+        // Table: 152 x 256 = 38 KB (fits in L1 cache!)
+        lut = &lookup1D_global[static_cast<size_t>(g_reg_idx[worker.op]) * 256];
+      } else if (g_lookup_mode == LOOKUP_MODE_3D && lookup3D_global != nullptr) {
+        const size_t firstIndex =
+            static_cast<size_t>(g_branched_idx[worker.op]) * 256 * 256 +
+            static_cast<size_t>(worker.prev_chunk[worker.pos2]) * 256;
+        lut = &lookup3D_global[firstIndex];
+      } else {
+        // 1D mode for branched ops: build a 256-byte row per iteration.
+        const uint8_t pos2val = worker.prev_chunk[worker.pos2];
+        const uint32_t opcode = CodeLUT[worker.op];
+        for (int v = 0; v < 256; v++) {
+          branch_row[v] = lookup_tables::computeBranchCorrect(
+              static_cast<uint8_t>(v), pos2val, opcode);
+        }
+        lut = branch_row;
+      }
+
+      if (use_lut) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_prefetch(reinterpret_cast<const char*>(lut), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(lut + 64), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(lut + 128), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(lut + 192), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(&worker.prev_chunk[worker.pos1]), _MM_HINT_T0);
+#endif
+
+        // Process individual bytes with unrolled loops
+        int i = worker.pos1;
+        for (; i + 15 < worker.pos2; i += 16) {
+          worker.chunk[i]    = lut[worker.prev_chunk[i]];
+          worker.chunk[i+1]  = lut[worker.prev_chunk[i+1]];
+          worker.chunk[i+2]  = lut[worker.prev_chunk[i+2]];
+          worker.chunk[i+3]  = lut[worker.prev_chunk[i+3]];
+          worker.chunk[i+4]  = lut[worker.prev_chunk[i+4]];
+          worker.chunk[i+5]  = lut[worker.prev_chunk[i+5]];
+          worker.chunk[i+6]  = lut[worker.prev_chunk[i+6]];
+          worker.chunk[i+7]  = lut[worker.prev_chunk[i+7]];
+          worker.chunk[i+8]  = lut[worker.prev_chunk[i+8]];
+          worker.chunk[i+9]  = lut[worker.prev_chunk[i+9]];
+          worker.chunk[i+10] = lut[worker.prev_chunk[i+10]];
+          worker.chunk[i+11] = lut[worker.prev_chunk[i+11]];
+          worker.chunk[i+12] = lut[worker.prev_chunk[i+12]];
+          worker.chunk[i+13] = lut[worker.prev_chunk[i+13]];
+          worker.chunk[i+14] = lut[worker.prev_chunk[i+14]];
+          worker.chunk[i+15] = lut[worker.prev_chunk[i+15]];
+        }
+        for (; i + 7 < worker.pos2; i += 8) {
+          worker.chunk[i]   = lut[worker.prev_chunk[i]];
+          worker.chunk[i+1] = lut[worker.prev_chunk[i+1]];
+          worker.chunk[i+2] = lut[worker.prev_chunk[i+2]];
+          worker.chunk[i+3] = lut[worker.prev_chunk[i+3]];
+          worker.chunk[i+4] = lut[worker.prev_chunk[i+4]];
+          worker.chunk[i+5] = lut[worker.prev_chunk[i+5]];
+          worker.chunk[i+6] = lut[worker.prev_chunk[i+6]];
+          worker.chunk[i+7] = lut[worker.prev_chunk[i+7]];
+        }
+        for (; i < worker.pos2; i++) {
+          worker.chunk[i] = lut[worker.prev_chunk[i]];
+        }
+      }
+    }
+
+    if (!worker.op) {
+      if ((worker.pos2-worker.pos1)%2 == 1) {
+        worker.t1 = worker.chunk[worker.pos1];
+        worker.t2 = worker.chunk[worker.pos2];
+        worker.chunk[worker.pos1] = reverse8(worker.t2);
+        worker.chunk[worker.pos2] = reverse8(worker.t1);
+        worker.isSame = false;
+      }
+    }
+
+after_lookup:
+    uint8_t pushPos1 = lp1;
+    uint8_t pushPos2 = lp2;
+
+    if (worker.pos1 == worker.pos2) {
+      pushPos1 = -1;
+      pushPos2 = -1;
+    }
+
+    worker.A = (worker.chunk[worker.pos1] - worker.chunk[worker.pos2]);
+    worker.A = (256 + (worker.A % 256)) % 256;
+
+    // Branchless hash dispatch: single selector + switch/fallthrough
+    // replaces 3 unpredictable cascading if/else branches
+    {
+      const int hash_sel = (worker.A < 0x30) + (worker.A < 0x20) + (worker.A < 0x10);
+      switch (hash_sel) {
+        case 3:  // A < 0x10: XXHash + FNV + SipHash
+          worker.prev_lhash = worker.lhash + worker.prev_lhash;
+          worker.lhash = XXHash64::hash(worker.chunk, worker.pos2, 0);
+          [[fallthrough]];
+        case 2:  // A < 0x20: FNV + SipHash
+          worker.prev_lhash = worker.lhash + worker.prev_lhash;
+          worker.lhash = hash_64_fnv1a(worker.chunk, worker.pos2);
+          [[fallthrough]];
+        case 1:  // A < 0x30: SipHash only
+          {
+            worker.prev_lhash = worker.lhash + worker.prev_lhash;
+            HH_ALIGNAS(16)
+            const highwayhash::HH_U64 key2[2] = {worker.tries[wIndex], worker.prev_lhash};
+            worker.lhash = highwayhash::SipHash(key2, (char*)worker.chunk, worker.pos2);
+          }
+          break;
+        default:  // hash_sel == 0, A >= 0x30: no hash (~81%)
+          break;
+      }
+    }
+
+    if (worker.A <= 0x40)
+    {
+#if USE_FAST_RC4
+      rc4_avx512::fast_rc4_dual(worker.fast_rc4_key[wIndex], &worker.key[wIndex], 256, worker.chunk, worker.chunk);
+#elif USE_CRYPTOGAMS_RC4_DUAL
+      worker.cryptogams_rc4[wIndex].apply_keystream_256(worker.chunk);
+#else
+      RC4(&worker.key[wIndex], 256, worker.chunk,  worker.chunk);
+#endif
+      worker.isSame = false;
+      if (255 - pushPos2 < MINPREFLEN)
+        pushPos2 = 255;
+      if (pushPos1 < MINPREFLEN)
+        pushPos1 = 0;
+
+      if (pushPos1 == 255) pushPos1 = 0;
+
+      worker.astroTemplate[worker.templateIdx] = templateMarker{
+        (uint8_t)(chunkCount > 1 ? pushPos1 : 0),
+        (uint8_t)(chunkCount > 1 ? pushPos2 : 255),
+        (uint16_t)0,
+        (uint16_t)0,
+        (uint16_t)((firstChunk << 7) | chunkCount)
+      };
+
+      pushPos1 = 0;
+      pushPos2 = 255;
+      worker.templateIdx += (worker.tries[wIndex] > 1);
+      firstChunk = worker.tries[wIndex]-1;
+      lp1 = 255;
+      lp2 = 0;
+      chunkCount = 1;
+    } else {
+      chunkCount++;
+    }
+
+    worker.chunk[255] = worker.chunk[255] ^ worker.chunk[worker.pos1] ^ worker.chunk[worker.pos2];
+
+    if (255 - pushPos2 < MINPREFLEN)
+      pushPos2 = 255;
+    if (pushPos1 < MINPREFLEN)
+      pushPos1 = 0;
+
+    if (worker.tries[wIndex] > 260 + 16 || (worker.sData[(worker.tries[wIndex]-1)*256+255] >= 0xf0 && worker.tries[wIndex] > 260))
+    {
+      break;
+    }
+  }
+
+  if (chunkCount > 0) {
+    if (255 - lp2 < MINPREFLEN)
+      lp2 = 255;
+    if (lp1 < MINPREFLEN)
+      lp1 = 0;
+    worker.astroTemplate[worker.templateIdx] = templateMarker{
+      (uint8_t)(chunkCount > 1 ? lp1 : 0),
+      (uint8_t)(chunkCount > 1 ? lp2 : 255),
+      (uint16_t)0,
+      (uint16_t)0,
+      (uint16_t)((firstChunk << 7) | chunkCount)
+    };
+
+    worker.templateIdx++;
+  }
+
+  worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
+  if (phaseTelemetry) {
+    addSpsaOpFamilyTelemetryBatch(phase_spsa_op_family_calls, phase_spsa_op_family_bytes);
+  }
+#else
+  // Fallback to wolfCompute when lookup tables are disabled
+  wolfCompute(worker, isTest, wIndex);
+#endif
+}
 // {
 //   worker.templateIdx = 0;
 //   uint8_t chunkCount = 1;
@@ -9411,5 +10225,3 @@ void lookupCompute(workerData &worker, bool isTest, int wIndex)
 
 //   worker.data_len = static_cast<uint32_t>((worker.tries[wIndex] - 4) * 256 + (((static_cast<uint64_t>(worker.chunk[253]) << 8) | static_cast<uint64_t>(worker.chunk[254])) & 0x3ff));
 // }
-
-

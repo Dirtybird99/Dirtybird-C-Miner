@@ -14,6 +14,10 @@
 #include <cstring>
 #include <algorithm>
 
+// Runtime flag from miner.cpp (CLI: --spsa-stamp-fast on|off)
+extern bool g_spsa_stamp_fast;
+extern bool g_spsa_decode_bases;
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 
@@ -111,6 +115,7 @@ bool sha_ni_available() {
 
 // Entries per SHA-256 block (16 x 4-byte entries = 64 bytes)
 static constexpr size_t ENTRIES_PER_BLOCK = 16;
+static constexpr size_t SPSA_DECODE_STAMP_TABLE_SIZE = 512;
 
 // Prefetch distance: how many blocks ahead to prefetch
 // 2 blocks ahead gives prefetch time to complete during current processing
@@ -220,23 +225,143 @@ static ALWAYS_INLINE void fill_block_from_reduced_sa(
     size_t start_entry,
     size_t num_entries
 ) {
-    for (size_t i = 0; i < num_entries; i++) {
-        const size_t entry_idx = start_entry + i;
-        const size_t offset = i * 4;
-        const uint32_t entry = sa_data[entry_idx];
-
-        // Inline merge_entry_to_global_pos logic to avoid function call overhead
-        int32_t value;
-        if (spsa::is_merge_stamp_ref(entry)) {
-            uint16_t stamp_id = spsa::decode_merge_stamp_id(entry);
-            uint16_t relative_pos = spsa::decode_merge_relative_pos(entry);
-            ASSUME(stamp_id < stamp_count);
-            const spsa::Stamp& stamp = stamp_data[stamp_id];
-            value = static_cast<int32_t>(stamp.start_chunk * 256 + relative_pos);
-        } else {
-            value = static_cast<int32_t>(entry);
+    (void)stamp_count;
+    // Hot path: full SHA block (16 x 32-bit entries). Decode 4 entries at once.
+    if (LIKELY(num_entries == ENTRIES_PER_BLOCK)) {
+        int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+        for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+            spsa::merge_entries_to_global_pos_batch4(
+                sa_data + start_entry + i,
+                stamp_data,
+                out32 + i
+            );
         }
-        memcpy(block + offset, &value, sizeof(int32_t));
+        return;
+    }
+
+    // Tail path for final partial block used by SHA padding.
+    int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+    for (size_t i = 0; i < num_entries; i++) {
+        const uint32_t entry = sa_data[start_entry + i];
+        out32[i] = spsa::merge_entry_to_global_pos_fast(entry, stamp_data);
+    }
+}
+
+// Compact starts-cache decode path used by SHA-NI hot loop.
+static ALWAYS_INLINE void fill_block_from_reduced_sa_starts(
+    uint8_t* __restrict block,
+    const uint32_t* __restrict sa_data,
+    const uint16_t* __restrict stamp_start_chunks,
+    size_t start_entry,
+    size_t num_entries
+) {
+    if (LIKELY(num_entries == ENTRIES_PER_BLOCK)) {
+        int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+        if (LIKELY(g_spsa_stamp_fast)) {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                const uint32_t all_stamp_mask = entries[0] & entries[1] & entries[2] & entries[3] & 0x80000000u;
+                if (LIKELY(all_stamp_mask == 0x80000000u)) {
+                    spsa::merge_entries_to_global_pos_batch4_stamp_only_starts(
+                        entries,
+                        stamp_start_chunks,
+                        out32 + i
+                    );
+                } else {
+                    spsa::merge_entries_to_global_pos_batch4_starts(
+                        entries,
+                        stamp_start_chunks,
+                        out32 + i
+                    );
+                }
+            }
+        } else {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                spsa::merge_entries_to_global_pos_batch4_starts(
+                    entries,
+                    stamp_start_chunks,
+                    out32 + i
+                );
+            }
+        }
+        return;
+    }
+
+    int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+    for (size_t i = 0; i < num_entries; i++) {
+        const uint32_t entry = sa_data[start_entry + i];
+        out32[i] = spsa::merge_entry_to_global_pos_fast_starts(entry, stamp_start_chunks);
+    }
+}
+
+// Compact base-offset decode path used by SHA-NI hot loop.
+static ALWAYS_INLINE void fill_block_from_reduced_sa_bases(
+    uint8_t* __restrict block,
+    const uint32_t* __restrict sa_data,
+    const int32_t* __restrict stamp_base_offsets,
+    size_t start_entry,
+    size_t num_entries
+) {
+    if (LIKELY(num_entries == ENTRIES_PER_BLOCK)) {
+        int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+        if (LIKELY(g_spsa_stamp_fast)) {
+#if defined(__AVX2__)
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 8) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(entries));
+                // High bit (bit 31) of each 32-bit entry indicates stamp ref
+                int mask = _mm256_movemask_ps(_mm256_castsi256_ps(e));
+                if (LIKELY(mask == 0xFF)) { // All 8 are stamps
+                    spsa::merge_entries_to_global_pos_avx2_stamp_only_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                } else {
+                    spsa::merge_entries_to_global_pos_avx2_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                }
+            }
+#else
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                const uint32_t all_stamp_mask = entries[0] & entries[1] & entries[2] & entries[3] & 0x80000000u;
+                if (LIKELY(all_stamp_mask == 0x80000000u)) {
+                    spsa::merge_entries_to_global_pos_batch4_stamp_only_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                } else {
+                    spsa::merge_entries_to_global_pos_batch4_bases(
+                        entries,
+                        stamp_base_offsets,
+                        out32 + i
+                    );
+                }
+            }
+#endif
+        } else {
+            for (size_t i = 0; i < ENTRIES_PER_BLOCK; i += 4) {
+                const uint32_t* __restrict entries = sa_data + start_entry + i;
+                spsa::merge_entries_to_global_pos_batch4_bases(
+                    entries,
+                    stamp_base_offsets,
+                    out32 + i
+                );
+            }
+        }
+        return;
+    }
+
+    int32_t* __restrict out32 = reinterpret_cast<int32_t*>(block);
+    for (size_t i = 0; i < num_entries; i++) {
+        const uint32_t entry = sa_data[start_entry + i];
+        out32[i] = spsa::merge_entry_to_global_pos_fast_bases(entry, stamp_base_offsets);
     }
 }
 
@@ -783,8 +908,22 @@ void sha256_reduced_sa_ni(
     const size_t sa_len = reduced_sa.size();
     const size_t full_blocks = total_bytes / 64;
     const uint32_t* sa_data = reduced_sa.data();
-    const spsa::Stamp* stamp_data = stamps.data();
     const size_t stamp_count = stamps.size();
+    const spsa::Stamp* stamp_data = stamps.data();
+    const bool use_base_offsets = g_spsa_decode_bases;
+    // Hot-path scratch: only the copied prefix is read, so avoid per-call zeroing.
+    alignas(64) static thread_local uint16_t stamp_start_chunks[SPSA_DECODE_STAMP_TABLE_SIZE];
+    alignas(64) static thread_local int32_t stamp_base_offsets[SPSA_DECODE_STAMP_TABLE_SIZE];
+    const size_t copied_stamp_count = std::min(stamp_count, static_cast<size_t>(spsa::MAX_STAMPS));
+    if (use_base_offsets) {
+        for (size_t i = 0; i < copied_stamp_count; i++) {
+            stamp_base_offsets[i] = static_cast<int32_t>(stamp_data[i].start_chunk) << 8;
+        }
+    } else {
+        for (size_t i = 0; i < copied_stamp_count; i++) {
+            stamp_start_chunks[i] = stamp_data[i].start_chunk;
+        }
+    }
 
     // Double-buffered block storage (cache-line aligned)
     alignas(64) uint8_t block_a[64];
@@ -795,16 +934,18 @@ void sha256_reduced_sa_ni(
     // Prefetch first 2 blocks' SA entries and stamps before entering loop
     if (full_blocks > 0) {
         prefetch_reduced_sa_entries(sa_data, 0, sa_len);
-        prefetch_stamps_for_block(sa_data, stamp_data, 0, ENTRIES_PER_BLOCK, sa_len, stamp_count);
     }
     if (full_blocks > 1) {
         prefetch_reduced_sa_entries(sa_data, ENTRIES_PER_BLOCK, sa_len);
-        prefetch_stamps_for_block(sa_data, stamp_data, ENTRIES_PER_BLOCK, ENTRIES_PER_BLOCK, sa_len, stamp_count);
     }
 
     // Fill first block if we have any
     if (full_blocks > 0) {
-        fill_block_from_reduced_sa(current_block, sa_data, stamp_data, stamp_count, 0, ENTRIES_PER_BLOCK);
+        if (use_base_offsets) {
+            fill_block_from_reduced_sa_bases(current_block, sa_data, stamp_base_offsets, 0, ENTRIES_PER_BLOCK);
+        } else {
+            fill_block_from_reduced_sa_starts(current_block, sa_data, stamp_start_chunks, 0, ENTRIES_PER_BLOCK);
+        }
     }
 
     // Process full blocks with prefetch-ahead and double-buffering
@@ -814,14 +955,17 @@ void sha256_reduced_sa_ni(
         if (prefetch_block < full_blocks) {
             size_t prefetch_entry = prefetch_block * ENTRIES_PER_BLOCK;
             prefetch_reduced_sa_entries(sa_data, prefetch_entry, sa_len);
-            prefetch_stamps_for_block(sa_data, stamp_data, prefetch_entry, ENTRIES_PER_BLOCK, sa_len, stamp_count);
         }
 
         // Fill next block while we process current
         // (next iteration will use this as current_block)
         if (block_idx + 1 < full_blocks) {
             size_t next_start = (block_idx + 1) * ENTRIES_PER_BLOCK;
-            fill_block_from_reduced_sa(next_block, sa_data, stamp_data, stamp_count, next_start, ENTRIES_PER_BLOCK);
+            if (use_base_offsets) {
+                fill_block_from_reduced_sa_bases(next_block, sa_data, stamp_base_offsets, next_start, ENTRIES_PER_BLOCK);
+            } else {
+                fill_block_from_reduced_sa_starts(next_block, sa_data, stamp_start_chunks, next_start, ENTRIES_PER_BLOCK);
+            }
         }
 
         // Process current block (SHA-256 ~200 cycles)
@@ -843,7 +987,11 @@ void sha256_reduced_sa_ni(
     if (remaining_bytes > 0) {
         size_t start_entry = full_blocks * ENTRIES_PER_BLOCK;
         size_t remaining_entries = (remaining_bytes + 3) / 4;
-        fill_block_from_reduced_sa(final_blocks, sa_data, stamp_data, stamp_count, start_entry, remaining_entries);
+        if (use_base_offsets) {
+            fill_block_from_reduced_sa_bases(final_blocks, sa_data, stamp_base_offsets, start_entry, remaining_entries);
+        } else {
+            fill_block_from_reduced_sa_starts(final_blocks, sa_data, stamp_start_chunks, start_entry, remaining_entries);
+        }
     }
 
     final_blocks[remaining_bytes] = 0x80;
