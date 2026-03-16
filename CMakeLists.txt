@@ -1597,6 +1597,7 @@ if (BUILD_SALSA20_BENCH AND NOT WITH_HIP)
     list(APPEND REPLAY_ASTRO_SOURCES
         src/crypto/sha256_override.cpp
         src/crypto/salsa20_simd.c
+        src/core/build_info.cpp
         src/util/numa_optimizer.cpp
     )
     if (USE_LIBSAIS)

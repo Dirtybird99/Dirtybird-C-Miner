@@ -99,8 +99,6 @@ int reportInterval = 1;
 int threads = 0;
 
 bool ABORT_MINER = false;
-const char *dirtybirdTargetArch = XSTR(CPU_ARCHTARGET);
-const char *tnnTargetArch = XSTR(CPU_ARCHTARGET);
 double latest_hashrate = 0.0;
 
 bool gpuMine = false;
