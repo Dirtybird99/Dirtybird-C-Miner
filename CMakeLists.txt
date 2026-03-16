@@ -931,8 +931,8 @@ elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
   endif()
 elseif (CMAKE_HOST_SYSTEM_NAME MATCHES "Windows")
   if (NOT WITH_HIP)
-    # CPU builds: use MinGW's linker
-    set(CMAKE_LINKER "C:/mingw64/bin/ld.lld.exe")
+    # CPU builds: let clang select lld from PATH/MSYS2 instead of relying on
+    # a host-specific absolute linker path.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
   endif()
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -v")
