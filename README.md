@@ -2,6 +2,8 @@
 
 DIRTYBIRD Miner is a high-performance DERO CPU miner focused on AstroBWTv3 throughput, practical solo and pool usability, and straightforward release packaging.
 
+The repository includes the required `libsais` source under `extern/libsais`, so standalone source builds do not depend on a sibling checkout.
+
 ## Prebuilt Releases
 
 GitHub Releases publish ready-to-run CPU builds with TNN-style asset names:
