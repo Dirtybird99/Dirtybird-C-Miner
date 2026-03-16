@@ -1,9 +1,12 @@
 #include "astrobwtv3.h"
 #include "compile.h"
-#include "simd_util_avx512.hpp"
 #include "branch_tables.hpp"
 #include <inttypes.h>
 #include <stdio.h>
+
+#if defined(__AVX512F__) || defined(DIRTYBIRD_FEATURE_AVX512)
+#include "simd_util_avx512.hpp"
+#endif
 
 // Cached AVX2 availability flag (set once at init)
 static bool g_has_avx2 = false;
@@ -111,7 +114,9 @@ static __m256i vec_3 = _mm256_set1_epi8(3);
     }                                                                           \
   }
 
-// AVX512 Branch Macro - processes 64 bytes at a time with native 512-bit operations
+// Keep the dormant AVX512 helper definitions behind an AVX512-capable target so
+// generic x86-64 Linux release builds can compile this TU without ABI errors.
+#if defined(__AVX512F__) || defined(DIRTYBIRD_FEATURE_AVX512)
 static __m512i vec_3_512 = _mm512_set1_epi8(3);
 
 #define WOLF_BRANCH_AVX512(IN, POS2VAL, OPCODE)                                 \
@@ -137,6 +142,7 @@ static __m512i vec_3_512 = _mm512_set1_epi8(3);
       case 15: (IN) = _mm512_rol_epi8((IN), 5); break;                          \
     }                                                                           \
   }
+#endif
 #endif
 #endif
 

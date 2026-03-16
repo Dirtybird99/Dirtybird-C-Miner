@@ -38,6 +38,7 @@
 #define STR(x) #x
 
 extern const char *dirtybirdTargetArch;
+extern const char *tnnTargetArch;
 
 #define CMP_LT_U256(X, Y) (X[3] != Y[3] ? X[3] < Y[3] : X[2] != Y[2] ? X[2] < Y[2] \
                                                                             : X[1] != Y[1]   ? X[1] < Y[1] \
