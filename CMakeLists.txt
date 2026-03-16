@@ -375,16 +375,18 @@ if (NOT WITH_HIP)
 
   # Clang-specific: aggressive inline threshold (must be after project() for compiler ID)
   if (AGGRESSIVE_INLINE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(STATUS "Clang detected: applying -mllvm -inline-threshold=250 (compile + LTO linker)")
+    message(STATUS "Clang detected: applying -mllvm -inline-threshold=250")
     set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   -mllvm -inline-threshold=250")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mllvm -inline-threshold=250")
-    set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS}  -Wl,-mllvm,-inline-threshold=250")
+    if (NOT DISABLE_LTO)
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-mllvm,-inline-threshold=250")
+    endif()
   endif()
 
   # Keep the LTO backend aligned with the compile-time tuning target.
   # Without this, the final whole-program codegen can fall back to the generic
   # -march CPU and discard the local scheduling model from -mtune.
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang") 
+  if (NOT DISABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "Clang") 
     if (TUNE_NATIVE)
       set(DIRTYBIRD_LTO_MCPU "native")
     elseif (WIN32 AND TARGET_ARCH MATCHES "amd64" AND CPU_ARCHTARGET STREQUAL "x86-64-v3")
