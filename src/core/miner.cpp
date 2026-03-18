@@ -374,10 +374,11 @@ bool useLookupMine = false;
 std::string devWallet = "";
 double devFee = 0.0;
 
-// SPSA control - default OFF until replay/test parity is restored.
-// Use --spsa on to opt back into the library fast path for live tuning.
+// Keep the safer library path as the global startup default. Live lookup/3D
+// defaults are resolved later so explicit flags and self-tests remain
+// unaffected.
 bool g_use_spsa = false;
-bool g_use_local_spsa = true; // Default to the integrated C++ SPSA path; current live tests show it is both correct and faster
+bool g_use_local_spsa = false;
 bool g_spsa_stamp_fast = true;
 bool g_spsa_decode_bases = true;
 int g_spsa_bucket_prefetch = 0;
@@ -608,10 +609,48 @@ void applyCpuRuntimeProfile(const po::variables_map& vm, const CpuRuntimeProfile
   if (!optionExplicit(vm, "spsa") && !optionExplicit(vm, "no-spsa")) {
     g_use_spsa = true;
   }
+}
+
+void applyLiveLookup3dSpsaDefaults(const po::variables_map& vm,
+                                   const MiningProfile& profile,
+                                   bool quiet) {
+#if defined(USE_ASTRO_SPSA)
+  if (!g_use_spsa ||
+      profile.coin.miningAlgo != ALGO_ASTROBWTV3 ||
+      !useLookupMine ||
+      g_lookup_mode != LOOKUP_MODE_3D) {
+    return;
+  }
+
+  bool changed_impl = false;
+  bool changed_decode_bases = false;
 
   if (!optionExplicit(vm, "local-spsa") && !optionExplicit(vm, "library-spsa")) {
-    g_use_local_spsa = true;
+    if (g_use_local_spsa) {
+      g_use_local_spsa = false;
+      changed_impl = true;
+    }
   }
+  if (!optionExplicit(vm, "spsa-decode-bases") && g_spsa_decode_bases) {
+    g_spsa_decode_bases = false;
+    changed_decode_bases = true;
+  }
+
+  if ((changed_impl || changed_decode_bases) && !quiet) {
+    setcolor(CYAN);
+    std::cout << "Live lookup/3D SPSA defaults: "
+              << (g_use_local_spsa ? "local" : "library")
+              << " path, decode_bases="
+              << (g_spsa_decode_bases ? "on" : "off")
+              << std::endl;
+    fflush(stdout);
+    setcolor(BRIGHT_WHITE);
+  }
+#else
+  (void)vm;
+  (void)profile;
+  (void)quiet;
+#endif
 }
 
 std::string buildCpuSummaryLine(const CpuRuntimeProfileSummary& cpu) {
@@ -2256,6 +2295,8 @@ int dirtybird_main(int argc, char** argv)
     }
   }
   #endif
+
+  applyLiveLookup3dSpsaDefaults(vm, miningProfile, beQuiet);
 
   // DERO Miner: DIRTYBIRD_SHAIHIVE block removed
 
