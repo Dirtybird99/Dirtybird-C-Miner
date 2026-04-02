@@ -1,5 +1,0 @@
-{
-  "daemon-address": "pool.example.com:10100",
-  "wallet": "YOUR_DERO_WALLET_ADDRESS",
-  "threads": 20
-}

@@ -1,4 +1,0 @@
-timestamp,implementation,test_pattern,data_size,time_mean_ns,time_stddev_ns,time_p50_ns,time_p99_ns,cycles_mean,cycles_stddev,cache_misses,branch_misses,instructions,ops_per_sec,bytes_per_sec
-1768939400,divsufsort,random,256,79689.90,716390.29,0.00,902747.00,188540,37028,0,0,0,12549,3212452
-1768939400,insertion_sort,random,256,22856.90,378352.56,0.00,0.00,44250,8448,0,0,0,43750,11200119
-1768939400,radix_sort,random,256,667.30,21091.33,0.00,0.00,1805,432,0,0,0,1498576,383635546
