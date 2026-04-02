@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build and Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            artifact_name: dirtybird-miner-windows-bin
+            artifact_path: build/bin/*
+          - name: Linux
+            os: ubuntu-latest
+            artifact_name: dirtybird-miner-linux-bin
+            artifact_path: build/bin/*
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-lld
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-openmp
+            mingw-w64-x86_64-mimalloc
+            make
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build lld patchelf \
+            libboost-all-dev libssl-dev libomp-dev \
+            libnuma-dev libudns-dev libmimalloc-dev
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_LTO=ON \
+            -DBUILD_STATIC=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_LTO=ON \
+            -DBUILD_STATIC=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cmake --build build --target dirtybird-miner-cpu --parallel
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --build build --target dirtybird-miner-cpu --parallel
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: ./build/bin/dirtybird-miner-cpu.exe --help > /dev/null
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: ./build/bin/dirtybird-miner-cpu --help > /dev/null
+
+      - name: Package verification (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash ./scripts/release.sh v0.0.0-ci build dist
+          tar -tzf dist/dirtybird-miner-amd64-v0.0.0-ci.tar.gz | grep -q 'dirtybird-miner-amd64-v0.0.0-ci/lib/libboost_context.so'
+
+      - name: Diagnostic self-test (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: msys2 {0}
+        run: ./build/bin/dirtybird-miner-cpu.exe --test-dero
+
+      - name: Diagnostic self-test (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: ./build/bin/dirtybird-miner-cpu --test-dero
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          retention-days: 7
+
+  lint:
+    name: Repo Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Check for large tracked files
+        run: |
+          git ls-files | while read -r path; do
+            if [ -f "$path" ] && [ "$(wc -c < "$path")" -gt 5242880 ]; then
+              echo "$path"
+            fi
+          done > large_files.txt
+          if [ -s large_files.txt ]; then
+            echo "::warning::Tracked files over 5 MB:"
+            cat large_files.txt
+          fi
+
+      - name: Check for CRLF in source files
+        run: |
+          if git ls-files '*.cpp' '*.hpp' '*.h' '*.c' | xargs grep -l $'\r' 2>/dev/null; then
+            echo "::warning::CRLF line endings detected in source files"
+          fi
