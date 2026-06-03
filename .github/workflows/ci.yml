@@ -125,6 +125,40 @@ jobs:
           path: ${{ matrix.artifact_path }}
           retention-days: 7
 
+  build-test-arm64:
+    name: Build and KAT (linux-aarch64, emulated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up QEMU (arm64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Build + run the pow("a") KAT inside a native arm64 userland (emulated).
+      # Native arm64 apt provides arm64 OpenSSL, so no cross-compile/cross-apt
+      # gymnastics; --selftest exits 0 only if the ARM hashes match the KAT.
+      - name: Build + pow(a) KAT in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src arm64v8/ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends clang lld cmake ninja-build libssl-dev ca-certificates
+            cmake -S . -B build-arm64 -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DDISABLE_LTO=ON \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            cmake --build build-arm64 --target dirtybird-miner-cpu --parallel
+            echo "=== uname / file ==="; uname -m; file build-arm64/bin/dirtybird-miner-cpu
+            echo "=== pow(a) KAT (native arm64) ==="
+            ./build-arm64/bin/dirtybird-miner-cpu --selftest
+          '
+
   lint:
     name: Repo Hygiene
     runs-on: ubuntu-latest
