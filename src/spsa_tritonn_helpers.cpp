@@ -17,6 +17,10 @@
 #include "spsa_tritonn_dump.h"
 #include <cstdint>
 #include <cstring>
+/* The Tritonn verification path (DLUNA_VERIFY_TRITONN, x86 dev-only) uses AVX2
+ * helpers. Guard the whole body so non-x86 (aarch64) builds don't pull
+ * <immintrin.h>; nothing references these symbols on non-x86 (see astrobwt.cpp). */
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <vector>
 #include <openssl/sha.h>
@@ -658,3 +662,5 @@ uint64_t decompress(::workerData& w, int data_size) {
 }
 
 }  // namespace deroluna_tritonn
+
+#endif  /* x86-only Tritonn verify path */

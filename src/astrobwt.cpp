@@ -599,8 +599,8 @@ namespace {
 
 extern "C" void sa_construct_2byte(const uint8_t*, int32_t*, int32_t);
 
-#if defined(USE_ASTRO_SPSA)
-/* Forward decl for Tritonn entry point */
+#if defined(USE_ASTRO_SPSA) && (defined(__x86_64__) || defined(_M_X64))
+/* Forward decl for Tritonn entry point (x86-only verify path) */
 extern "C" uint64_t SPSA_tritonn_entry(const uint8_t* in, int len, ::workerData& w);
 extern "C" void dbg_sha_capture_set(int on);
 extern "C" const uint8_t* dbg_sha_capture_data(size_t* len_out);
@@ -791,7 +791,7 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
             run_default_sa();
         }
         uint64_t t5 = prof_enabled ? prof_rdtsc() : 0;
-#if defined(USE_ASTRO_SPSA)
+#if defined(USE_ASTRO_SPSA) && (defined(__x86_64__) || defined(_M_X64))
 	/* ---- VALIDATION HARNESS: libsais vs Tritonn-port byte-for-byte ---- */
 	static const bool sa_verify_tritonn = []{ const char* e = std::getenv("DLUNA_VERIFY_TRITONN"); return e && e[0] == '1'; }();
 	static const bool sa_verify_stats   = []{ const char* e = std::getenv("DLUNA_VERIFY_TRITONN_STATS"); return e && e[0] == '1'; }();
