@@ -204,6 +204,9 @@ add_library(dluna_runtime STATIC
     src/console.cpp
 )
 target_include_directories(dluna_runtime PUBLIC ${CMAKE_SOURCE_DIR}/include)
+# console.cpp -> astroworker.h -> <openssl/sha.h>: needs the OpenSSL include path
+# (matters when OpenSSL is in a custom prefix, e.g. the Android NDK cross-build).
+target_link_libraries(dluna_runtime PUBLIC OpenSSL::Crypto)
 
 # ---- Mining executable: thin wrapper around the lib ----
 add_executable(dirtybird-miner-cpu

@@ -227,11 +227,10 @@ static void parse_args(int argc, char **argv)
 
 static void set_affinity(std::thread &t, int core)
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 	// MinGW/winpthreads: std::thread::native_handle() returns pthread_t, not HANDLE.
-	// Cross-toolchain-safe approach: set affinity inside the thread function via
-	// SetThreadAffinityMask(GetCurrentThread(), mask). For now, no-op; OS scheduler
-	// handles P/E-core placement. TODO: pass core into mine_thread and pin inside.
+	// Android/Bionic has no pthread_setaffinity_np. In both cases, no-op and let
+	// the OS scheduler place threads. TODO: pin inside mine_thread if needed.
 	(void)t; (void)core;
 #else
 	cpu_set_t cpuset;
