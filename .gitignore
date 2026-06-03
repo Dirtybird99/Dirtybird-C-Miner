@@ -1,0 +1,47 @@
+# Build products
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Testing/
+*.o
+*.obj
+*.a
+*.dll
+*.exe
+*.d
+*.rsp
+*.profdata
+*.profraw
+
+# Runtime captures and generated reports
+/captures/
+/reports/
+
+# Logs and command output
+*.log
+*.out
+*.err
+*.jsonl
+
+# Python/test caches
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Local backups and temporary files
+*.bak
+/out.txt
+tmp/
+tmp-*/
+temp*
+
+# Binary dumps and process dumps stay local unless explicitly force-added.
+*.bin
+*.dmp
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
