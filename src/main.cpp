@@ -156,6 +156,7 @@ static void print_usage(FILE *out, const char *argv0)
 		"        aggressive behavior.\n"
 		"  -V, --verbose  show per-job / per-share event logging (default: off)\n"
 		"        (env equivalent: DLUNA_VERBOSE=1)\n"
+		"  --selftest     compute the pow(\"a\") KAT and exit (0=PASS, 1=FAIL)\n"
 		"  -h, --help     show this help and exit\n"
 		"  -v, --version  print version and exit\n", argv0);
 }
@@ -165,6 +166,8 @@ static void usage(const char *argv0)
 	print_usage(stderr, argv0);
 	exit(1);
 }
+
+static bool g_selftest = false;
 
 static void parse_args(int argc, char **argv)
 {
@@ -195,6 +198,8 @@ static void parse_args(int argc, char **argv)
 #endif
 		} else if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--verbose")) {
 			g_verbose = true;
+		} else if (!strcmp(argv[i], "--selftest")) {
+			g_selftest = true;
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			print_usage(stdout, argv[0]);
 			exit(0);
@@ -210,7 +215,7 @@ static void parse_args(int argc, char **argv)
 		if (e[0] && strcmp(e, "0"))
 			g_verbose = true;
 
-	if (G.host.empty() || G.wallet.empty())
+	if (!g_selftest && (G.host.empty() || G.wallet.empty()))
 		usage(argv[0]);
 	if (G.nthreads <= 0)
 		G.nthreads = (int)std::thread::hardware_concurrency();
@@ -285,8 +290,13 @@ int main(int argc, char **argv)
 	        char in_a[] = "a";
 	        dluna_hash((uint8_t*)in_a, 1, out, *w);
 	        std::string h = hexStr(out, 32);
+	        bool pass = (h == "54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea");
+	        if (g_selftest) {
+	                printf("selftest pow(a): %s %s\n", h.c_str(), pass ? "PASS" : "FAIL");
+	                delete w; exit(pass ? 0 : 1);
+	        }
 	        if (g_verbose) printf("Test pow(a): %s\n", h.c_str());
-	        if (h == "54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea") {
+	        if (pass) {
 	                if (g_verbose) printf("Test pow(a): PASS\n");
 	        } else {
 	                printf("Test pow(a): FAIL! (expected 54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea)\n"); exit(1);

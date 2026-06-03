@@ -48,14 +48,21 @@ else()
     set(IS_CLANG FALSE)
 endif()
 
-# ---- Base optimization flags ----
-# -O2: proven winner over -O3 (code bloat hurts icache, confirmed dead end)
-# -march=x86-64-v3: AVX2 baseline (Haswell+)
-# -mtune=raptorlake: schedule for Raptor Lake (13th gen Intel)
-# -flto: link-time optimization (+7.4% sustained hashrate, verified)
-# -fno-vectorize -fno-slp-vectorize: auto-vectorization hurts thermal (dead end)
-set(BASE_CXX_FLAGS "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2 -fno-vectorize -fno-slp-vectorize -finline-functions")
-set(BASE_C_FLAGS   "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2")
+# ---- Base optimization flags (arch-aware) ----
+# x86-64: AVX2 baseline tuned for Raptor Lake; auto-vec off (icache/thermal, verified).
+# aarch64: ARMv8-A + crypto extensions (SHA/AES); the hot path uses the portable
+#          scalar/soft fallbacks (wolfBranch + sha256_block_soft), no x86 intrinsics.
+# -flto: +7.4% sustained on x86 (added below unless DISABLE_LTO).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2 -fno-vectorize -fno-slp-vectorize -finline-functions")
+    set(BASE_C_FLAGS   "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer -finline-functions")
+    set(BASE_C_FLAGS   "-O2 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer")
+else()
+    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -fomit-frame-pointer")
+    set(BASE_C_FLAGS   "-O2 -DNDEBUG -fomit-frame-pointer")
+endif()
 
 # ---- LTO ----
 option(DISABLE_LTO "Disable link-time optimization" OFF)
