@@ -159,6 +159,52 @@ jobs:
             ./build-arm64/bin/dirtybird-miner-cpu --selftest
           '
 
+  build-android:
+    name: Build Android (aarch64 NDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Cross-build OpenSSL for android-arm64 (static)
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "Using NDK: $NDK"
+          export ANDROID_NDK_ROOT="$NDK"
+          export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          git clone --depth 1 https://github.com/openssl/openssl ossl-src
+          cd ossl-src
+          ./Configure android-arm64 -D__ANDROID_API__=24 no-shared no-tests no-docs \
+            --prefix="$GITHUB_WORKSPACE/ossl-android"
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+      - name: Configure (Android NDK)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_LTO=ON \
+            -DOPENSSL_ROOT_DIR="$GITHUB_WORKSPACE/ossl-android" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DDIRTYBIRD_VERSION=0.0.0-ci
+
+      - name: Build
+        run: cmake --build build-android --target dirtybird-miner-cpu --parallel
+
+      - name: Verify ELF (aarch64)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h build-android/bin/dirtybird-miner-cpu | grep -iE 'Machine|Class'
+
   lint:
     name: Repo Hygiene
     runs-on: ubuntu-latest
