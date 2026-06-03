@@ -132,7 +132,13 @@ set(CMAKE_C_FLAGS_RELEASE   "${BASE_C_FLAGS}")
 # Sleep()/dluna_sleep_ms (see include/dluna.h) for all timing.
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--wrap=SHA256_Init -Wl,--wrap=SHA256_Update -Wl,--wrap=SHA256_Final -Wl,--wrap=nanosleep")
 
-add_definitions(-DUSE_ASTRO_SPSA=1)
+# USE_ASTRO_SPSA gates the x86-only, AVX2 Tritonn verification path (and its
+# extra workerData fields). The live hash path (descriptor-SA / libsais /
+# wolfBranch) does not need it; gating it off is a tested config (Δ-0.31 KH/s).
+# Off on non-x86 so the tree cross-compiles for aarch64.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    add_definitions(-DUSE_ASTRO_SPSA=1)
+endif()
 
 # ---- OpenSSL ----
 find_package(OpenSSL REQUIRED)
@@ -176,11 +182,19 @@ add_library(dluna_stages STATIC
     src/spsa.cpp
     src/spsa_local.cpp
     src/sa_2byte_radix.cpp
-    src/spsa_tritonn.cpp
-    src/spsa_tritonn_helpers.cpp
     src/dluna_stages.cpp
     src/v114_stubs.cpp
 )
+
+# Tritonn verification path uses AVX2 helpers and is referenced only under
+# USE_ASTRO_SPSA (x86-only, above). Compile it on x86 only so non-x86 builds
+# (aarch64) don't pull in <immintrin.h>.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    target_sources(dluna_stages PRIVATE
+        src/spsa_tritonn.cpp
+        src/spsa_tritonn_helpers.cpp
+    )
+endif()
 
 target_include_directories(dluna_stages PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dluna_stages PUBLIC OpenSSL::Crypto OpenSSL::SSL)

@@ -150,11 +150,52 @@ jobs:
           name: release-linux
           path: dist/*.tar.gz
 
+  build-hiveos:
+    name: Build HiveOS/MMPOS Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build lld patchelf libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISABLE_LTO=ON \
+            -DBUILD_STATIC=ON \
+            -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }} \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build --target dirtybird-miner-cpu --parallel
+
+      - name: Smoke test
+        run: ./build/bin/dirtybird-miner-cpu --help > /dev/null
+
+      - name: Package (HiveOS/MMPOS)
+        run: bash ./scripts/release-hiveos.sh "${{ needs.verify.outputs.tag }}" build dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-hiveos
+          path: dist/*.tar.gz
+
   release:
     name: Publish Release
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [verify, build-windows, build-linux]
+    needs: [verify, build-windows, build-linux, build-hiveos]
     # Publish as long as the (locally-verified) Windows build succeeded; a Linux
     # build failure attaches Windows-only rather than blocking the whole release.
     if: ${{ !cancelled() && needs.verify.result == 'success' && needs.build-windows.result == 'success' }}
@@ -178,6 +219,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-linux
+          path: artifacts
+
+      - name: Download HiveOS artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: release-hiveos
           path: artifacts
 
       - name: Build release notes
