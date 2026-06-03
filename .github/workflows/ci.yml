@@ -194,6 +194,10 @@ jobs:
             -DDISABLE_LTO=ON \
             -DOPENSSL_ROOT_DIR="$GITHUB_WORKSPACE/ossl-android" \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DCMAKE_FIND_ROOT_PATH="$GITHUB_WORKSPACE/ossl-android" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DDIRTYBIRD_VERSION=0.0.0-ci
 
       - name: Build
