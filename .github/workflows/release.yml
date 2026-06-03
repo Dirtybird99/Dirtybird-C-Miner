@@ -155,6 +155,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [verify, build-windows, build-linux]
+    # Publish as long as the (locally-verified) Windows build succeeded; a Linux
+    # build failure attaches Windows-only rather than blocking the whole release.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.build-windows.result == 'success' }}
     permissions:
       contents: write
     steps:
@@ -171,6 +174,7 @@ jobs:
           path: artifacts
 
       - name: Download Linux artifact
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: release-linux
@@ -200,6 +204,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
+          shopt -s nullglob
           sha256sum *.zip *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 

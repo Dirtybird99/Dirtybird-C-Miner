@@ -105,7 +105,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           bash ./scripts/release.sh v0.0.0-ci build dist
-          tar -tzf dist/dirtybird-miner-amd64-v0.0.0-ci.tar.gz | grep -q 'dirtybird-miner-amd64-v0.0.0-ci/lib/libboost_context.so'
+          tar -tzf dist/dirtybird-miner-amd64-v0.0.0-ci.tar.gz | grep -q 'dirtybird-miner-amd64-v0.0.0-ci/dirtybird-miner-cpu'
 
       - name: Diagnostic self-test (Windows)
         if: runner.os == 'Windows'
