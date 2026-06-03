@@ -137,7 +137,7 @@ static void reporter_thread()
 /* --- CLI --- */
 
 #ifndef DIRTYBIRD_VERSION_STR
-#define DIRTYBIRD_VERSION_STR "1.0.17"
+#define DIRTYBIRD_VERSION_STR "1.0.18"
 #endif
 
 static void print_usage(FILE *out, const char *argv0)

@@ -3,7 +3,7 @@
 High-performance AstroBWTv3 CPU miner for DERO. Clean-room C++ (no Boost; pthreads + sockets),
 descriptor-SA pipeline with optional profile-guided optimization (PGO).
 
-**Status:** v1.0.17 · x86-64 with AVX2.
+**Status:** v1.0.18 · x86-64 (AVX2) and aarch64 (ARMv8).
 
 ## Build
 
