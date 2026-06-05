@@ -14,6 +14,9 @@
 #include <cstdint>
 #include <cstring>
 
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
 /* Platform sleep -- no nanosleep64 link errors on TDM-GCC. */
 #ifdef _WIN32
 #include <windows.h>
