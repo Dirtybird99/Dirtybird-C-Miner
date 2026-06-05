@@ -52,19 +52,19 @@ endif()
 # x86-64: AVX2 baseline tuned for Raptor Lake; auto-vec off (icache/thermal, verified).
 # aarch64: ARMv8-A + crypto extensions (SHA/AES); the hot path uses the portable
 #          scalar/soft fallbacks (wolfBranch + sha256_block_soft), no x86 intrinsics.
-# -flto: +7.4% sustained on x86 (added below unless DISABLE_LTO).
+# -flto: +7.4% sustained on x86 (enabled by default for Release).
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
-    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2 -fno-vectorize -fno-slp-vectorize -finline-functions")
-    set(BASE_C_FLAGS   "-O2 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2")
+    set(BASE_CXX_FLAGS "-O3 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2 -fno-vectorize -fno-slp-vectorize -finline-functions")
+    set(BASE_C_FLAGS   "-O3 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer -finline-functions")
-    set(BASE_C_FLAGS   "-O2 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer")
+    set(BASE_CXX_FLAGS "-O3 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer -finline-functions")
+    set(BASE_C_FLAGS   "-O3 -DNDEBUG -march=armv8-a+crypto -fomit-frame-pointer")
 else()
-    set(BASE_CXX_FLAGS "-O2 -DNDEBUG -fomit-frame-pointer")
-    set(BASE_C_FLAGS   "-O2 -DNDEBUG -fomit-frame-pointer")
+    set(BASE_CXX_FLAGS "-O3 -DNDEBUG -fomit-frame-pointer")
+    set(BASE_C_FLAGS   "-O3 -DNDEBUG -fomit-frame-pointer")
 endif()
 
-# ---- LTO ----
+# ---- LTO (Enabled by default for best performance) ----
 option(DISABLE_LTO "Disable link-time optimization" OFF)
 if(NOT DISABLE_LTO)
     set(BASE_CXX_FLAGS "${BASE_CXX_FLAGS} -flto")

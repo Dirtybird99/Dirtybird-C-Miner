@@ -616,7 +616,7 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 	uint64_t t0 = prof_enabled ? prof_rdtsc() : 0;
 
 	/* SHA256(input) -> scratch[320..352] */
-	hashSHA256(w.sha256, input, &scratch[320], inputLen);
+	hashSHA256(input, &scratch[320], inputLen);
 	uint64_t t1 = prof_enabled ? prof_rdtsc() : 0;
 
 	/* Salsa20(key=scratch[320], iv=scratch[256]) -> scratch[0..256] */
@@ -806,7 +806,7 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 		memcpy(libsais_sa, w.sa, w.data_len * sizeof(int32_t));
 		/* Compute the libsais-side digest for hash-level comparison. */
 		uint8_t libsais_digest[32];
-		hashSHA256(w.sha256, (byte*)w.sa, libsais_digest, w.data_len * 4);
+		hashSHA256((byte*)w.sa, libsais_digest, w.data_len * 4);
 		/* Clear w.padding so we can detect whether Tritonn writes a digest. */
 		memset(w.padding, 0, 32);
 		/* Capture decompress's SHA256 input byte stream for byte-level diff. */
@@ -946,7 +946,7 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 #endif // USE_ASTRO_SPSA
 
         if (!descriptor_hash_ready) {
-            hashSHA256(w.sha256, (byte*)w.sa, output, w.data_len * 4);
+            hashSHA256((byte*)w.sa, output, w.data_len * 4);
         }
         if (prof_enabled) {
             prof_init();

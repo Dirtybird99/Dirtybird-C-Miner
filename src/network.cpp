@@ -5,6 +5,17 @@
  * Protocol: WSS to /ws/{wallet}, receive jobs as JSON, submit shares as JSON.
  */
 
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <mstcpip.h>   /* struct tcp_keepalive, SIO_KEEPALIVE_VALS */
+  #pragma comment(lib, "ws2_32.lib")
+  typedef SOCKET sock_t;
+  #define SOCK_INVALID INVALID_SOCKET
+  #define sock_close closesocket
+  #define sock_errno WSAGetLastError()
+#endif
+
 #include "dluna.h"
 #include "hex.h"
 
@@ -21,16 +32,7 @@
 #include <chrono>
 #include <string>
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <mstcpip.h>   /* struct tcp_keepalive, SIO_KEEPALIVE_VALS */
-  #pragma comment(lib, "ws2_32.lib")
-  typedef SOCKET sock_t;
-  #define SOCK_INVALID INVALID_SOCKET
-  #define sock_close closesocket
-  #define sock_errno WSAGetLastError()
-#else
+#ifndef _WIN32
   #include <unistd.h>
   #include <sys/socket.h>
   #include <sys/types.h>

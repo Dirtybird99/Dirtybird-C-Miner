@@ -60,8 +60,12 @@ public:
 
   int lucky = 0;
 
+#if defined(__x86_64__) || defined(_M_X64)
+  /* Keep a dummy SHA256_CTX on x86 to maintain binary layout compatibility
+   * with the proprietary libastroSPSA (which may access fields by offset). */
   SHA256_CTX sha256;
   uint8_t sha_padding[64];
+#endif
   ucstk::Salsa20 salsa20;
   RC4_KEY key[DERO_BATCH];
 

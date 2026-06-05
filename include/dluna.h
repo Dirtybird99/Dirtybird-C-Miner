@@ -118,11 +118,19 @@ bool check_hash(const uint8_t hash[32], const uint8_t target[32]);
 void dluna_hash(uint8_t *input, int len, uint8_t *output, workerData &w);
 void init_lut(void);
 
-/* SHA-256 via SHA-NI (linked with --wrap) */
-inline void hashSHA256(SHA256_CTX &ctx, const uint8_t *in, uint8_t *out, int len) {
+/* SHA-256 via SHA-NI (linked with --wrap) or EVP (OpenSSL 3.0) */
+inline void hashSHA256(const uint8_t *in, uint8_t *out, int len) {
+#if defined(__x86_64__) || defined(_M_X64)
+    /* On x86, we use our hardware-accelerated SHA-NI implementation via linker wraps. */
+    SHA256_CTX ctx;
     SHA256_Init(&ctx);
     SHA256_Update(&ctx, in, len);
     SHA256_Final(out, &ctx);
+#else
+    /* On other platforms (e.g. ARM), use the modern OpenSSL 3.0 EVP API. */
+    unsigned int md_len;
+    EVP_Digest(in, len, out, &md_len, EVP_sha256(), NULL);
+#endif
 }
 
 /* Hex helpers */
