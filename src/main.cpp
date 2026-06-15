@@ -204,7 +204,7 @@ static void parse_args(int argc, char **argv)
 			print_usage(stdout, argv[0]);
 			exit(0);
 		} else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
-			printf("DIRTYBIRD Miner v%s\n", DIRTYBIRD_VERSION_STR);
+			printf("Dirtybird Miner v%s\n", DIRTYBIRD_VERSION_STR);
 			exit(0);
 		} else {
 			usage(argv[0]);
@@ -248,7 +248,7 @@ int main(int argc, char **argv)
 
 	parse_args(argc, argv);
 
-	log_line("INFO", "Version: DIRTYBIRD Miner %s", DIRTYBIRD_VERSION_STR);
+	log_line("INFO", "Dirtybird Miner");
 	log_line("INFO", "Server:  %s:%d", G.host.c_str(), G.port);
 	log_line("INFO", "Wallet:  %s", G.wallet.c_str());
 	log_line("INFO", "Threads: %d", G.nthreads);
