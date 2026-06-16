@@ -72,25 +72,6 @@ if(NOT DISABLE_LTO)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
     if(IS_CLANG)
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
-        # Under -flto the static-library members are LLVM bitcode. GNU ar/ranlib
-        # write an archive symbol index that ignores bitcode symbols, so lld
-        # cannot pull the needed members and the link dies with "undefined
-        # symbol" (seen on the MinGW/Windows CI: dluna_hash, init_lut,
-        # g_console_mtx, ...). llvm-ar/llvm-ranlib understand bitcode and index
-        # it correctly. Resolve them next to the active clang compiler.
-        get_filename_component(_DLUNA_CLANG_BINDIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        find_program(DLUNA_LLVM_AR NAMES llvm-ar HINTS "${_DLUNA_CLANG_BINDIR}")
-        find_program(DLUNA_LLVM_RANLIB NAMES llvm-ranlib HINTS "${_DLUNA_CLANG_BINDIR}")
-        if(DLUNA_LLVM_AR)
-            set(CMAKE_AR "${DLUNA_LLVM_AR}")
-            set(CMAKE_C_COMPILER_AR "${DLUNA_LLVM_AR}")
-            set(CMAKE_CXX_COMPILER_AR "${DLUNA_LLVM_AR}")
-        endif()
-        if(DLUNA_LLVM_RANLIB)
-            set(CMAKE_RANLIB "${DLUNA_LLVM_RANLIB}")
-            set(CMAKE_C_COMPILER_RANLIB "${DLUNA_LLVM_RANLIB}")
-            set(CMAKE_CXX_COMPILER_RANLIB "${DLUNA_LLVM_RANLIB}")
-        endif()
     endif()
 endif()
 
@@ -192,7 +173,12 @@ endfunction()
 # The #if gates added to astroworker.h / astrobwt.cpp / main.cpp / miner.cpp
 # are kept (harmless when USE_ASTRO_SPSA defined; useful for future ports).
 # ---- libdluna_stages: stage code shared between mining exe and replay harness ----
-add_library(dluna_stages STATIC
+# OBJECT (not STATIC): under -flto the members are LLVM bitcode, and a GNU-ar
+# archive's symbol index omits bitcode symbols, so lld can't pull members and the
+# link fails with "undefined symbol" on toolchains without llvm-ar (MinGW/Windows
+# CI). OBJECT libraries feed the object files straight into each consumer's link,
+# so there is no archive and no bitcode-index dependency on any platform.
+add_library(dluna_stages OBJECT
     src/astrobwt.cpp
     src/branch.cpp
     src/sha256_ni.cpp
@@ -218,7 +204,7 @@ endif()
 target_include_directories(dluna_stages PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dluna_stages PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
-add_library(dluna_runtime STATIC
+add_library(dluna_runtime OBJECT
     src/runtime_tune.cpp
     src/console.cpp
 )
