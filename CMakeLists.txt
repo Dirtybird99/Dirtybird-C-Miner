@@ -173,7 +173,12 @@ endfunction()
 # The #if gates added to astroworker.h / astrobwt.cpp / main.cpp / miner.cpp
 # are kept (harmless when USE_ASTRO_SPSA defined; useful for future ports).
 # ---- libdluna_stages: stage code shared between mining exe and replay harness ----
-add_library(dluna_stages STATIC
+# OBJECT (not STATIC): under -flto the members are LLVM bitcode, and a GNU-ar
+# archive's symbol index omits bitcode symbols, so lld can't pull members and the
+# link fails with "undefined symbol" on toolchains without llvm-ar (MinGW/Windows
+# CI). OBJECT libraries feed the object files straight into each consumer's link,
+# so there is no archive and no bitcode-index dependency on any platform.
+add_library(dluna_stages OBJECT
     src/astrobwt.cpp
     src/branch.cpp
     src/sha256_ni.cpp
@@ -199,7 +204,7 @@ endif()
 target_include_directories(dluna_stages PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dluna_stages PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
-add_library(dluna_runtime STATIC
+add_library(dluna_runtime OBJECT
     src/runtime_tune.cpp
     src/console.cpp
 )
