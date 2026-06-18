@@ -115,6 +115,13 @@ static void reporter_thread()
 		else if (dval >= 1000ULL)       snprintf(diffbuf, sizeof diffbuf, "%lluK", dval / 1000ULL);
 		else                            snprintf(diffbuf, sizeof diffbuf, "%llu",  dval);
 		const char *rejcol = (G.rejected.load() > 0) ? "\033[91m" : "\033[37m";
+		char netbuf[16];
+		{
+			int64_t us = G.netRttUs.load(std::memory_order_relaxed);
+			if      (us < 0)    snprintf(netbuf, sizeof netbuf, "--");
+			else if (us < 1000) snprintf(netbuf, sizeof netbuf, "<1ms"); /* LAN node */
+			else                snprintf(netbuf, sizeof netbuf, "%lldms", (long long)(us / 1000));
+		}
 
 		std::lock_guard<std::mutex> lk(g_console_mtx);
 		if (dluna_is_tty()) {
@@ -123,20 +130,20 @@ static void reporter_thread()
 			printf("\r\033[93m[DIRTYBIRD] \033[92m%.2f KH/s\033[97m "
 			       "(\033[32m%.2f KH/s avg\033[97m) | \033[34mHeight:%lld\033[97m | "
 			       "\033[36mMiniblocks:%lld\033[97m | \033[32mBlocks:%lld\033[97m | "
-			       "%sREJ:%lld\033[97m | \033[35mDiff:%s\033[97m | "
+			       "%sREJ:%lld\033[97m | \033[35mDiff:%s\033[97m | \033[36mnet:%s\033[97m | "
 			       "\033[37m%02d:%02d:%02d\033[0m%s      ",
 			       rate, avg, (long long)G.height,
 			       (long long)G.accepted.load(), (long long)G.blocks.load(),
 			       rejcol, (long long)G.rejected.load(),
-			       diffbuf, hh, mm, ss, dluna_clr_eol());
+			       diffbuf, netbuf, hh, mm, ss, dluna_clr_eol());
 		} else {
 			/* Redirected to a file/pipe: same fields, no ANSI, newline-terminated. */
 			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "
-			       "Miniblocks:%lld | Blocks:%lld | REJ:%lld | Diff:%s | "
+			       "Miniblocks:%lld | Blocks:%lld | REJ:%lld | Diff:%s | net:%s | "
 			       "%02d:%02d:%02d\n",
 			       rate, avg, (long long)G.height,
 			       (long long)G.accepted.load(), (long long)G.blocks.load(),
-			       (long long)G.rejected.load(), diffbuf, hh, mm, ss);
+			       (long long)G.rejected.load(), diffbuf, netbuf, hh, mm, ss);
 		}
 
 		/* -V submit-funnel diagnostic: read-only atomics, no hot-loop impact.

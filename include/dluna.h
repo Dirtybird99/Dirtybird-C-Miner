@@ -80,6 +80,7 @@ struct MinerState {
     std::atomic<int64_t> submitted{0};
     std::atomic<int64_t> sendFails{0};
     std::atomic<int64_t> staleDrops{0};
+    std::atomic<int64_t> netRttUs{-1};  /* live kernel TCP RTT (microseconds); -1 = unknown */
 
     /* Config -- set once at startup, read-only after.
      * Defaults let the binary run with no args; override via -d/-w. */
