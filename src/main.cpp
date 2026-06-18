@@ -174,7 +174,9 @@ static void print_usage(FILE *out, const char *argv0)
 {
 	fprintf(out,
 		"Usage: %s [-d host:port] [-w wallet] [-t threads] [-p priority]\n"
-		"  -d  daemon address (host:port)  (default: dero.rabidmining.com:10300)\n"
+		"  Config: reads config.json (next to the exe) for daemon-address/wallet/threads/\n"
+		"          priority; CLI flags below override it. Edit config.json OR pass flags.\n"
+		"  -d  daemon address (host:port)  (default: community-pools.mysrv.cloud:10300)\n"
 		"  -w  wallet address              (default: built-in)\n"
 		"  -t  number of mining threads (default: hardware threads)\n"
 		"  -p  priority profile: normal | max  (default: normal)\n"
@@ -270,11 +272,93 @@ static void set_affinity(std::thread &t, int core)
 #endif
 }
 
+/* --- config.json loader (minimal; no JSON lib — same flat-key approach as network.cpp) --- */
+
+static bool read_file_to_string(const char *path, std::string &out)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) return false;
+	fseek(f, 0, SEEK_END);
+	long n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (n > 0) { out.resize((size_t)n); out.resize(fread(&out[0], 1, (size_t)n, f)); }
+	fclose(f);
+	return true;
+}
+
+/* "key":"value" -> value ("" on miss). Flat config, no escapes/nesting. */
+static std::string cfg_str(const std::string &j, const char *key)
+{
+	std::string pat = std::string("\"") + key + "\":";
+	size_t p = j.find(pat);
+	if (p == std::string::npos) return {};
+	p += pat.size();
+	while (p < j.size() && (j[p] == ' ' || j[p] == '\t' || j[p] == '\n' || j[p] == '\r')) p++;
+	if (p >= j.size() || j[p] != '"') return {};
+	p++;
+	size_t q = j.find('"', p);
+	if (q == std::string::npos) return {};
+	return j.substr(p, q - p);
+}
+
+/* "key": <int> -> value (def on miss / if it's a string). Handles negative. */
+static long long cfg_int(const std::string &j, const char *key, long long def)
+{
+	std::string pat = std::string("\"") + key + "\":";
+	size_t p = j.find(pat);
+	if (p == std::string::npos) return def;
+	p += pat.size();
+	while (p < j.size() && (j[p] == ' ' || j[p] == '\t' || j[p] == '\n' || j[p] == '\r')) p++;
+	if (p >= j.size() || j[p] == '"') return def;
+	return strtoll(j.c_str() + p, nullptr, 10);
+}
+
+/* Apply config.json (if present) into G as defaults. CLI args (parse_args) override.
+ * Absent file = no-op (built-in defaults stand) -> fully backward compatible. */
+static void load_config(const char *path)
+{
+	std::string j;
+	if (!read_file_to_string(path, j) || j.empty()) return;
+
+	std::string daddr = cfg_str(j, "daemon-address");
+	if (daddr.empty()) daddr = cfg_str(j, "pool");
+	if (daddr.empty()) daddr = cfg_str(j, "daemon");
+	if (!daddr.empty()) {
+		size_t colon = daddr.rfind(':');
+		if (colon == std::string::npos) {
+			G.host = daddr;
+		} else {
+			G.host = daddr.substr(0, colon);
+			G.port = (uint16_t)atoi(daddr.c_str() + colon + 1);
+		}
+	}
+	long long pj = cfg_int(j, "port", -1);
+	if (pj > 0) G.port = (uint16_t)pj;
+
+	std::string w = cfg_str(j, "wallet");
+	if (!w.empty()) G.wallet = w;
+
+	long long t = cfg_int(j, "threads", 0);
+	if (t > 0) G.nthreads = (int)t;   /* <=0 (e.g. -1) keeps auto-detect */
+
+	std::string prio = cfg_str(j, "priority");
+	if (prio == "normal" || prio == "max") {
+#ifdef _WIN32
+		_putenv_s("DLUNA_PRIORITY", prio.c_str());
+#else
+		setenv("DLUNA_PRIORITY", prio.c_str(), 1);
+#endif
+	}
+}
+
 /* --- main --- */
 
 int main(int argc, char **argv)
 {
 	dluna_console_init();
+
+	/* config.json (next to the exe) provides defaults; CLI flags below override it. */
+	load_config("config.json");
 
 	parse_args(argc, argv);
 

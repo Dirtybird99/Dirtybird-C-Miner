@@ -84,10 +84,10 @@ struct MinerState {
 
     /* Config -- set once at startup, read-only after.
      * Defaults let the binary run with no args; override via -d/-w. */
-    std::string host{"dero.rabidmining.com"};
+    std::string host{"community-pools.mysrv.cloud"};
     uint16_t    port{10300};
-    std::string wallet{""};
-    int         nthreads{0};
+    std::string wallet{"dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y"};
+    int         nthreads{0};   /* 0 / -1 in config = auto (all hardware threads) */
 };
 
 extern MinerState G;

@@ -38,6 +38,8 @@ New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
 Copy-Item $BinaryPath -Destination $PackageDir -Force
 Copy-Item (Join-Path $RepoRoot "README.md") -Destination $PackageDir -Force
 Copy-Item (Join-Path $RepoRoot "LICENSE") -Destination $PackageDir -Force
+Copy-Item (Join-Path $RepoRoot "config.json") -Destination $PackageDir -Force
+Copy-Item (Join-Path $RepoRoot "config.json.example") -Destination $PackageDir -Force
 
 # Bundle the MinGW/OpenSSL runtime DLLs the dynamic build needs (skip any not present).
 $RuntimeFiles = @(
@@ -52,13 +54,15 @@ foreach ($runtimeFile in $RuntimeFiles) {
     if (Test-Path $runtimePath) { Copy-Item $runtimePath -Destination $PackageDir -Force }
 }
 
-# Auto-restart launcher (edit the daemon/wallet, then double-click).
+# Auto-restart launcher. Settings come from config.json; add flags below to override (CLI wins).
 $StartScript = @"
 @echo off
 cd /d "%~dp0"
 title DIRTYBIRD Miner $AssetVersion
+REM Edit config.json for daemon-address / wallet / threads / priority.
+REM To override per-run, append flags to the line below, e.g.:  -t 20 -p max
 :loop
-.\dirtybird-miner-cpu.exe -d YOUR_NODE_IP:10100 -w YOUR_DERO_WALLET -t 20
+.\dirtybird-miner-cpu.exe
 timeout 3
 goto loop
 "@
@@ -71,14 +75,16 @@ DIRTYBIRD Miner $AssetVersion
 Contents:
 - dirtybird-miner-cpu.exe
 - *.dll  (runtime; keep them next to the exe)
+- config.json   (edit this: daemon-address / wallet / threads / priority)
+- config.json.example
 - start.bat
 - README.md
 - LICENSE
 
 Quick start:
-1. Edit start.bat: set -d <daemon host:port>, -w <your DERO wallet>, -t <threads>.
-2. Double-click start.bat (it auto-restarts the miner), or run directly:
-   dirtybird-miner-cpu.exe -d host:port -w YOUR_DERO_WALLET -t 20
+1. Edit config.json: "daemon-address" (host:port), "wallet", "threads" (-1 = auto), "priority".
+2. Double-click start.bat (auto-restarts the miner). It reads config.json.
+   Power users: append flags to start.bat to override, e.g. -t 20 -p max (CLI wins over config.json).
 3. -p max for headless/AFK (more hashrate, may stutter the desktop); -p normal (default) is desktop-safe.
 
 Notes:

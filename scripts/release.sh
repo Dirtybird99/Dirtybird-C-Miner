@@ -101,6 +101,8 @@ validate_runtime_bundle "$PACKAGE_DIR/$BINARY_NAME" "$LIB_DIR"
 
 cp "$REPO_ROOT/README.md" "$PACKAGE_DIR/"
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_DIR/"
+cp "$REPO_ROOT/config.json" "$PACKAGE_DIR/"
+cp "$REPO_ROOT/config.json.example" "$PACKAGE_DIR/"
 
 cat > "$PACKAGE_DIR/start.sh" <<'EOF'
 #!/bin/bash
@@ -119,14 +121,17 @@ DIRTYBIRD Miner $ASSET_VERSION
 Contents:
 - dirtybird-miner-cpu
 - lib/          (bundled runtime libraries)
+- config.json   (edit this: daemon-address / wallet / threads / priority)
+- config.json.example
 - start.sh
 - README.md
 - LICENSE
 
 Quick start:
-  ./start.sh -d <daemon host:port> -w <your DERO wallet> -t <threads>
-or directly:
-  LD_LIBRARY_PATH=./lib ./dirtybird-miner-cpu -d host:port -w YOUR_DERO_WALLET -t 20
+1. Edit config.json: "daemon-address" (host:port), "wallet", "threads" (-1 = auto), "priority".
+2. ./start.sh        (reads config.json)
+   Override per-run by appending flags (CLI wins over config.json):
+   ./start.sh -t 20 -p max
 
 Use -p max for headless/AFK (more hashrate); -p normal (default) is desktop-safe.
 

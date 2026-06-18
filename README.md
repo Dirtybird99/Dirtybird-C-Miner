@@ -3,7 +3,7 @@
 High-performance AstroBWTv3 CPU miner for DERO. Clean-room C++ (no Boost; pthreads + sockets),
 descriptor-SA pipeline with optional profile-guided optimization (PGO).
 
-**Status:** v1.0.22 · x86-64 (AVX2) and aarch64 (ARMv8).
+**Status:** v1.0.23 · x86-64 (AVX2) and aarch64 (ARMv8).
 
 ## Build
 
@@ -19,15 +19,29 @@ For the fastest binary, use the two-pass PGO flow documented in `build.sh` / `CM
 
 ## Usage
 
+Configure via **`config.json`** (next to the exe) **or** CLI flags — your choice. Precedence is
+**built-in defaults → `config.json` → CLI flags** (CLI wins). Editing `config.json` is enough; the
+bundled `start.bat`/`start.sh` runs the miner with no flags so it picks up `config.json`.
+
+```jsonc
+// config.json
+{
+  "daemon-address": "host:port",
+  "wallet": "dero1...",
+  "threads": -1,          // -1 = auto (all hardware threads)
+  "priority": "normal"    // normal (desktop-safe) | max (headless)
+}
 ```
-dirtybird-miner-cpu -d <host:port> -w <wallet> -t <threads> [-p normal|max]
+
+```
+dirtybird-miner-cpu [-d <host:port>] [-w <wallet>] [-t <threads>] [-p normal|max]
 ```
 
 | flag | meaning |
 |------|---------|
-| `-d` | daemon address `host:port` |
-| `-w` | DERO wallet address |
-| `-t` | mining threads |
+| `-d` | daemon address `host:port` (overrides `daemon-address`) |
+| `-w` | DERO wallet address (overrides `wallet`) |
+| `-t` | mining threads (overrides `threads`) |
 | `-p` | priority profile: `normal` (default, desktop-safe) or `max` (headless) |
 | `-h`, `--help` / `-v`, `--version` | help / version |
 

@@ -41,6 +41,10 @@ temp*
 *.bin
 *.dmp
 
+# Wallet / database files — NEVER commit (the miner does not create these; this is a guard).
+*.db
+wallet.db
+
 # Editor/OS noise
 .DS_Store
 Thumbs.db
