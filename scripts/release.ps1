@@ -54,19 +54,20 @@ foreach ($runtimeFile in $RuntimeFiles) {
     if (Test-Path $runtimePath) { Copy-Item $runtimePath -Destination $PackageDir -Force }
 }
 
-# Auto-restart launcher. Settings come from config.json; add flags below to override (CLI wins).
-$StartScript = @"
-@echo off
-cd /d "%~dp0"
-title DIRTYBIRD Miner $AssetVersion
-REM Edit config.json for daemon-address / wallet / threads / priority.
-REM To override per-run, append flags to the line below, e.g.:  -t 20 -p max
-:loop
-.\dirtybird-miner-cpu.exe
-timeout 3
-goto loop
-"@
-$StartScript | Out-File -FilePath (Join-Path $PackageDir "start.bat") -Encoding ascii
+# Auto-restart launcher. Settings come from config.json; add flags to override (CLI wins).
+# Write with explicit CRLF -- Windows cmd.exe mishandles LF-only .bat (esp. :loop/goto).
+$startLines = @(
+    '@echo off',
+    'cd /d "%~dp0"',
+    "title DIRTYBIRD Miner $AssetVersion",
+    'REM Edit config.json for daemon-address / wallet / threads / priority.',
+    'REM To override per-run, append flags below, e.g.:  .\dirtybird-miner-cpu.exe -t 20 -p max',
+    ':loop',
+    '.\dirtybird-miner-cpu.exe',
+    'timeout 3',
+    'goto loop'
+)
+[System.IO.File]::WriteAllText((Join-Path $PackageDir "start.bat"), ($startLines -join "`r`n") + "`r`n", [System.Text.Encoding]::ASCII)
 
 $QuickStart = @"
 DIRTYBIRD Miner $AssetVersion

@@ -193,58 +193,6 @@ static void set_snd_timeout_ms(sock_t s, int ms)
 #endif
 }
 
-#ifdef _WIN32
-#ifndef SIO_TCP_INFO
-/* mingw-w64 headers predate SIO_TCP_INFO; define the v0 query + struct
- * (Windows 10 1703+ ABI, natural alignment) so the kernel-RTT path builds. */
-#define SIO_TCP_INFO _WSAIORW(IOC_VENDOR, 39)
-typedef struct _TCP_INFO_v0 {
-	unsigned int       State;
-	unsigned int       Mss;
-	unsigned long long ConnectionTimeMs;
-	unsigned char      TimestampsEnabled;
-	unsigned int       RttUs;
-	unsigned int       MinRttUs;
-	unsigned int       BytesInFlight;
-	unsigned int       Cwnd;
-	unsigned int       SndWnd;
-	unsigned int       RcvWnd;
-	unsigned int       RcvBuf;
-	unsigned long long BytesOut;
-	unsigned long long BytesIn;
-	unsigned int       BytesReordered;
-	unsigned int       BytesRetrans;
-	unsigned int       FastRetrans;
-	unsigned int       DupAcksIn;
-	unsigned int       TimeoutEpisodes;
-	unsigned char      SynRetrans;
-} TCP_INFO_v0;
-#endif
-#endif
-
-/* Sample the kernel's smoothed RTT for the live connection -- no extra traffic;
- * getwork's steady job stream keeps it fresh. Returns microseconds, or -1 if
- * unavailable. g_sock is the raw TCP socket (SSL is layered on top), so this
- * reads the real connection regardless of whether the daemon answers WS pings. */
-static long long sample_net_rtt_us(void)
-{
-	if (g_sock == SOCK_INVALID) return -1;
-#ifdef _WIN32
-	TCP_INFO_v0 info;
-	DWORD ver = 0, bytes = 0;
-	if (WSAIoctl(g_sock, SIO_TCP_INFO, &ver, sizeof ver, &info, sizeof info,
-	             &bytes, nullptr, nullptr) == 0 && bytes >= sizeof info)
-		return (long long)info.RttUs;
-	return -1;
-#else
-	struct tcp_info ti;
-	socklen_t len = sizeof ti;
-	if (getsockopt(g_sock, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0)
-		return (long long)ti.tcpi_rtt; /* microseconds */
-	return -1;
-#endif
-}
-
 static int send_all(const void *buf, int len)
 {
 	const char *p = (const char *)buf;
@@ -361,7 +309,6 @@ static void cleanup(void)
 	if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = nullptr; }
 	if (g_sock != SOCK_INVALID) { sock_close(g_sock); g_sock = SOCK_INVALID; }
 	G.connected.store(false);
-	G.netRttUs.store(-1, std::memory_order_relaxed);
 }
 
 static bool ws_connect(void)
@@ -746,10 +693,6 @@ void network_thread(void)
 		bool got_job = false;
 		auto session_start = std::chrono::steady_clock::now();
 
-		/* Live net latency: sample the kernel TCP RTT every NET_SAMPLE_MS. */
-		const int NET_SAMPLE_MS = 1000;
-		auto last_sample = session_start - std::chrono::milliseconds(NET_SAMPLE_MS);
-
 		/* Main loop: interleave recv and submit.
 		 * SO_RCVTIMEO is 50ms so we don't block long. */
 		while (!G.quit.load()) {
@@ -771,15 +714,6 @@ void network_thread(void)
 			 * the drop first, but this is the belt-and-braces path). */
 			if (G.submitReady.load() && !submit_share())
 				break;
-
-			/* Refresh the live net: RTT (read-only getsockopt; no traffic). */
-			auto now_s = std::chrono::steady_clock::now();
-			if (std::chrono::duration_cast<std::chrono::milliseconds>(
-				    now_s - last_sample).count() >= NET_SAMPLE_MS) {
-				long long us = sample_net_rtt_us();
-				if (us >= 0) G.netRttUs.store(us, std::memory_order_relaxed);
-				last_sample = now_s;
-			}
 		}
 
 		cleanup();
