@@ -119,12 +119,13 @@ static void reporter_thread()
 		std::lock_guard<std::mutex> lk(g_console_mtx);
 		if (dluna_is_tty()) {
 			/* Colored line rewritten in place; \033[0m resets color, dluna_clr_eol()
-			 * + trailing spaces clear any remnants from a longer previous line. */
+			 * (\033[K) erases any remnant of a longer previous line. NO trailing pad:
+			 * padding past the last column makes the console auto-wrap -> the line stacks. */
 			printf("\r\033[93m[DIRTYBIRD] \033[92m%.2f KH/s\033[97m "
 			       "(\033[32m%.2f KH/s avg\033[97m) | \033[34mHeight:%lld\033[97m | "
 			       "\033[36mMiniblocks:%lld\033[97m | \033[32mBlocks:%lld\033[97m | "
 			       "%sREJ:%lld\033[97m | \033[35mDiff:%s\033[97m | "
-			       "\033[37m%02d:%02d:%02d\033[0m%s      ",
+			       "\033[37m%02d:%02d:%02d\033[0m%s",
 			       rate, avg, (long long)G.height,
 			       (long long)G.accepted.load(), (long long)G.blocks.load(),
 			       rejcol, (long long)G.rejected.load(),
