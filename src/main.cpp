@@ -95,36 +95,59 @@ static void reporter_thread()
 		double rate = (dt > 0) ? delta / (dt * 1000.0) : 0;
 		double avg = (elapsed > 0) ? total / (elapsed * 1000.0) : 0;
 
-		/* DeroLuna-style steady status line. Counters from the daemon getwork:
-		 *   IB  = integrator/full blocks (daemon "blocks")
-		 *   MB  = miniblocks accepted    (daemon "miniblocks")
-		 *   MBR = miniblocks rejected    (daemon "rejected")
-		 * G.height is written under jobMutex; an aligned 64-bit read for display
-		 * is benign on x64, so no lock is taken here. */
+		/* Colored [DIRTYBIRD] status line (the format users liked). Fields:
+		 *   Height     = G.height   (written under jobMutex; an aligned 64-bit
+		 *                            read for display is benign on x64)
+		 *   Miniblocks = G.accepted (daemon "miniblocks" accepted)
+		 *   Blocks     = G.blocks   (daemon integrator/full "blocks")
+		 *   REJ        = G.rejected (daemon "rejected")
+		 * No banner, no shares field. ANSI colors only on a TTY (console.cpp enables
+		 * VT processing); the file/pipe branch stays plain so miner_live.log is clean. */
 		long sec = (long)elapsed;
 		int hh = (int)(sec / 3600), mm = (int)((sec % 3600) / 60),
 		    ss = (int)(sec % 60);
 
+		/* Humanize difficulty to K/M/G (port of the 1.0.12 reporter). */
+		char diffbuf[24];
+		unsigned long long dval = (unsigned long long)G.difficulty.load();
+		if      (dval >= 1000000000ULL) snprintf(diffbuf, sizeof diffbuf, "%lluG", dval / 1000000000ULL);
+		else if (dval >= 1000000ULL)    snprintf(diffbuf, sizeof diffbuf, "%lluM", dval / 1000000ULL);
+		else if (dval >= 1000ULL)       snprintf(diffbuf, sizeof diffbuf, "%lluK", dval / 1000ULL);
+		else                            snprintf(diffbuf, sizeof diffbuf, "%llu",  dval);
+		const char *rejcol = (G.rejected.load() > 0) ? "\033[91m" : "\033[37m";
+
 		std::lock_guard<std::mutex> lk(g_console_mtx);
 		if (dluna_is_tty()) {
-			/* Rewrite one line in place; clear trailing remnants. The 6 trailing
-			 * spaces are the fallback clear when VT erase-to-EOL is unavailable. */
-			printf("\r%03d:%02d:%02d Height:%lld IB:%lld MB:%lld MBR:%lld "
-			       "Diff:%llu @ %.2f KH/s (%.2f KH/s) >>%s      ",
-			       hh, mm, ss, (long long)G.height,
-			       (long long)G.blocks.load(), (long long)G.accepted.load(),
-			       (long long)G.rejected.load(),
-			       (unsigned long long)G.difficulty.load(),
-			       rate, avg, dluna_clr_eol());
+			/* Colored line rewritten in place; \033[0m resets color, dluna_clr_eol()
+			 * + trailing spaces clear any remnants from a longer previous line. */
+			printf("\r\033[93m[DIRTYBIRD] \033[92m%.2f KH/s\033[97m "
+			       "(\033[32m%.2f KH/s avg\033[97m) | \033[34mHeight:%lld\033[97m | "
+			       "\033[36mMiniblocks:%lld\033[97m | \033[32mBlocks:%lld\033[97m | "
+			       "%sREJ:%lld\033[97m | \033[35mDiff:%s\033[97m | "
+			       "\033[37m%02d:%02d:%02d\033[0m%s      ",
+			       rate, avg, (long long)G.height,
+			       (long long)G.accepted.load(), (long long)G.blocks.load(),
+			       rejcol, (long long)G.rejected.load(),
+			       diffbuf, hh, mm, ss, dluna_clr_eol());
 		} else {
-			/* Redirected to a file/pipe: emit a plain newline-terminated line. */
-			printf("%03d:%02d:%02d Height:%lld IB:%lld MB:%lld MBR:%lld "
-			       "Diff:%llu @ %.2f KH/s (%.2f KH/s) >>\n",
-			       hh, mm, ss, (long long)G.height,
-			       (long long)G.blocks.load(), (long long)G.accepted.load(),
-			       (long long)G.rejected.load(),
-			       (unsigned long long)G.difficulty.load(),
-			       rate, avg);
+			/* Redirected to a file/pipe: same fields, no ANSI, newline-terminated. */
+			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "
+			       "Miniblocks:%lld | Blocks:%lld | REJ:%lld | Diff:%s | "
+			       "%02d:%02d:%02d\n",
+			       rate, avg, (long long)G.height,
+			       (long long)G.accepted.load(), (long long)G.blocks.load(),
+			       (long long)G.rejected.load(), diffbuf, hh, mm, ss);
+		}
+
+		/* -V submit-funnel diagnostic: read-only atomics, no hot-loop impact.
+		 * submitted ~ acc with ~0 stale/sendfail => healthy; high stale or
+		 * sendfail, or submitted >> acc, points at a real submit/accept problem. */
+		if (g_verbose) {
+			printf("\n[funnel] submitted:%lld acc:%lld rej:%lld "
+			       "stale:%lld sendfail:%lld\n",
+			       (long long)G.submitted.load(), (long long)G.accepted.load(),
+			       (long long)G.rejected.load(), (long long)G.staleDrops.load(),
+			       (long long)G.sendFails.load());
 		}
 		fflush(stdout);
 
