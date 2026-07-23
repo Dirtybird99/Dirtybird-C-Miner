@@ -64,6 +64,14 @@ target_include_directories(test_runtime_tune PRIVATE
 target_link_libraries(test_runtime_tune PRIVATE dluna_runtime)
 dluna_copy_runtime_dlls(test_runtime_tune)
 
+add_executable(test_statusline test_statusline.cpp)
+target_include_directories(test_statusline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(test_statusline PRIVATE dluna_runtime)
+dluna_copy_runtime_dlls(test_statusline)
+
 add_test(NAME cap_format COMMAND test_cap_format)
 add_test(NAME self_diff
     COMMAND test_self_diff
@@ -81,6 +89,11 @@ set_tests_properties(v114_encode_count1_false_is_off PROPERTIES
 add_test(NAME stage3_tail COMMAND test_stage3_tail)
 add_test(NAME stage5_descriptor COMMAND test_stage5_descriptor)
 add_test(NAME runtime_tune_policy COMMAND test_runtime_tune)
+add_test(NAME statusline COMMAND test_statusline)
+add_test(NAME statusline_env_cols COMMAND test_statusline)
+set_tests_properties(statusline_env_cols PROPERTIES
+    ENVIRONMENT "DIRTYBIRD_COLS=56"
+)
 add_test(NAME stage5_fused_profile_contract
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass
         -File ${CMAKE_SOURCE_DIR}/tools/test_stage5_fused_profile_contract.ps1

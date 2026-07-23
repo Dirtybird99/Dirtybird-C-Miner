@@ -109,6 +109,33 @@ void dluna_console_init(void);
 bool dluna_is_tty(void);       /* stdout is an interactive console */
 const char *dluna_clr_eol(void); /* ANSI erase-to-EOL, or "" when unavailable */
 
+/* Visible width of the console in columns, or 0 when it cannot be determined
+ * (not a TTY, query failed). Cheap enough to call once per reporter tick, which
+ * is how a terminal resize is picked up without a SIGWINCH handler. */
+int dluna_term_cols(void);
+
+/* One reporter tick's worth of numbers, ready to render. */
+struct DlunaStatus {
+	double      rate;      /* instantaneous KH/s */
+	double      avg;       /* cumulative KH/s */
+	long long   height;
+	long long   accepted;  /* daemon "miniblocks" */
+	long long   blocks;    /* daemon "blocks" */
+	long long   rejected;
+	const char *diff;      /* already humanized, e.g. "795K" */
+	int         hh, mm, ss;
+};
+
+/* Renders the in-place status line into `out` (leading \r, no trailing newline,
+ * always closed with reset + erase-to-EOL). `cols` is the terminal width from
+ * dluna_term_cols(); the widest layout whose VISIBLE width fits `cols - 1` wins,
+ * so the line never wraps and \r always rewinds to its own first column. Pass
+ * cols <= 0 for "unknown" -- that renders the full layout unconditionally.
+ * Does no I/O and reads no miner state (only dluna_clr_eol() for the trailing
+ * erase), so it is directly unit-testable. Returns the number of bytes written
+ * (excluding the NUL). */
+size_t dluna_format_status(char *out, size_t cap, const DlunaStatus &s, int cols);
+
 /* Thread entry points */
 void mine_thread(int tid);
 void network_thread(void);
