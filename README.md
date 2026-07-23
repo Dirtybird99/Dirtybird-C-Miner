@@ -55,6 +55,29 @@ At startup the miner computes `pow("a")` and verifies it equals
 ~20 KH/s sustained at 20 threads on an i7-13700HX. Measure over >=10 minutes for a
 representative sustained figure.
 
+## Android / Termux (mobile)
+
+A download-only setup script handles everything: it fetches the pre-built aarch64
+Android release, writes `config.json`, acquires a wake-lock (so Android Doze doesn't
+pause the miner), and runs with auto-restart.
+
+```bash
+curl -sL https://raw.githubusercontent.com/Dirtybird99/dirtybird-miner/master/scripts/termux-setup.sh | bash
+```
+
+Or run it directly from a checkout:
+
+```bash
+bash scripts/termux-setup.sh              # install + run
+bash scripts/termux-setup.sh --update     # upgrade to latest release
+bash scripts/termux-setup.sh --reconfigure  # re-prompt for pool/wallet/threads
+bash scripts/termux-setup.sh --uninstall  # remove installed files
+```
+
+Requirements: Termux (aarch64 / 64-bit ARM only). Install `termux-api` in Termux for
+wake-lock support. Use `-p max` only when charging (headless) — `-p normal` is
+thermal-safe for mobile.
+
 ## License
 
 MIT - see [LICENSE](LICENSE).
