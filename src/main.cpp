@@ -114,22 +114,27 @@ static void reporter_thread()
 		else if (dval >= 1000000ULL)    snprintf(diffbuf, sizeof diffbuf, "%lluM", dval / 1000000ULL);
 		else if (dval >= 1000ULL)       snprintf(diffbuf, sizeof diffbuf, "%lluK", dval / 1000ULL);
 		else                            snprintf(diffbuf, sizeof diffbuf, "%llu",  dval);
-		const char *rejcol = (G.rejected.load() > 0) ? "\033[91m" : "\033[37m";
 
 		std::lock_guard<std::mutex> lk(g_console_mtx);
 		if (dluna_is_tty()) {
-			/* Colored line rewritten in place; \033[0m resets color, dluna_clr_eol()
-			 * (\033[K) erases any remnant of a longer previous line. NO trailing pad:
-			 * padding past the last column makes the console auto-wrap -> the line stacks. */
-			printf("\r\033[93m[DIRTYBIRD] \033[92m%.2f KH/s\033[97m "
-			       "(\033[32m%.2f KH/s avg\033[97m) | \033[34mHeight:%lld\033[97m | "
-			       "\033[36mMiniblocks:%lld\033[97m | \033[32mBlocks:%lld\033[97m | "
-			       "%sREJ:%lld\033[97m | \033[35mDiff:%s\033[97m | "
-			       "\033[37m%02d:%02d:%02d\033[0m%s",
-			       rate, avg, (long long)G.height,
-			       (long long)G.accepted.load(), (long long)G.blocks.load(),
-			       rejcol, (long long)G.rejected.load(),
-			       diffbuf, hh, mm, ss, dluna_clr_eol());
+			/* Colored line rewritten in place with \r, so it has to fit on ONE
+			 * row -- a wrapped line leaves the cursor on its last row and every
+			 * repaint then stacks a row lower (Termux: 115 columns on a 56-column
+			 * phone terminal). dluna_format_status() picks the widest layout that
+			 * fits, re-querying the width each tick so a resize re-fits within a
+			 * second. Ends with \033[0m + \033[K and NO trailing pad. */
+			char line[512];
+			DlunaStatus st{};
+			st.rate     = rate;
+			st.avg      = avg;
+			st.height   = (long long)G.height;
+			st.accepted = (long long)G.accepted.load();
+			st.blocks   = (long long)G.blocks.load();
+			st.rejected = (long long)G.rejected.load();
+			st.diff     = diffbuf;
+			st.hh = hh; st.mm = mm; st.ss = ss;
+			dluna_format_status(line, sizeof line, st, dluna_term_cols());
+			fputs(line, stdout);
 		} else {
 			/* Redirected to a file/pipe: same fields, no ANSI, newline-terminated. */
 			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "
