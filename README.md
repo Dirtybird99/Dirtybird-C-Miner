@@ -62,7 +62,7 @@ Android release, writes `config.json`, acquires a wake-lock (so Android Doze doe
 pause the miner), and runs with auto-restart.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/Dirtybird99/dirtybird-miner/master/scripts/termux-setup.sh | bash
+curl -sL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-C-Miner/master/scripts/termux-setup.sh | bash
 ```
 
 Or run it directly from a checkout:

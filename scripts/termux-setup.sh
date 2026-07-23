@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-REPO="Dirtybird99/dirtybird-miner"
+REPO="Dirtybird99/Dirtybird-C-Miner"
 DEFAULT_POOL="community-pools.mysrv.cloud:10300"
 DEFAULT_WALLET="dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y"
 INSTALL_DIR="$HOME/dirtybird-miner"
@@ -36,12 +36,33 @@ note()  { printf "${CYAN}[i]${NC} %s\n" "$*"; }
 FORCE_UPDATE=false
 RECONFIGURE=false
 UNINSTALL=false
+
+usage() {
+    cat <<'USAGE'
+DIRTYBIRD Miner -- Termux (Android) setup & launcher.
+
+Downloads the pre-built aarch64 Android release, writes config.json, acquires a
+wake-lock so Android Doze doesn't pause mining, and runs with auto-restart.
+
+Usage:
+  bash scripts/termux-setup.sh                # install (if needed) + run
+  bash scripts/termux-setup.sh --update       # re-download the latest release
+  bash scripts/termux-setup.sh --reconfigure  # re-prompt for pool/wallet/threads
+  bash scripts/termux-setup.sh --uninstall    # remove installed files
+  bash scripts/termux-setup.sh --help         # this message
+
+Requires aarch64 (64-bit ARM) Android. Install termux-api ("pkg install
+termux-api") for wake-lock and battery-status support.
+USAGE
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --update)        FORCE_UPDATE=true; shift ;;
         --reconfigure)   RECONFIGURE=true; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
         -h|--help)
+            usage
             exit 0
             ;;
         *) err "Unknown option: $1"; exit 2 ;;
@@ -130,7 +151,7 @@ else
     fi
     info "Latest release: $LATEST_TAG"
 
-    ARCHIVE="${ARCHIVE_PREFIX}${LATEST_TAG#v}_aarch64_android.tar.gz"
+    ARCHIVE="${ARCHIVE_PREFIX}${LATEST_TAG#v}${ARCHIVE_SUFFIX}"
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/${LATEST_TAG}/${ARCHIVE}"
 
     info "Downloading $ARCHIVE ..."
@@ -150,14 +171,26 @@ else
     fi
 
     info "Extracting..."
+    # Clear the previous install FIRST. Without this an --update kept the old
+    # binary: the "is it nested?" test below saw the existing ./$BINARY_NAME,
+    # skipped the move, and left the freshly extracted one stranded in its
+    # package directory -- while $VERSION_FILE still advanced to the new tag,
+    # so the update looked like it worked and never did. Also sweep away any
+    # package directory a run of that older script orphaned here.
+    rm -f "./$BINARY_NAME"
+    find . -maxdepth 1 -type d -name "${ARCHIVE_PREFIX}*" -exec rm -rf {} + 2>/dev/null || true
+
     tar xzf "$ARCHIVE"
     rm -f "$ARCHIVE"
 
-    # move binary to install dir if it's nested in a subdirectory
+    # The release tarball nests everything under <package>/ (see
+    # scripts/release-android.sh); lift the binary out to $INSTALL_DIR.
     if [ ! -f "./$BINARY_NAME" ]; then
         NESTED="$(find . -maxdepth 2 -name "$BINARY_NAME" -type f | head -1)"
         if [ -n "$NESTED" ]; then
             mv "$NESTED" "./$BINARY_NAME"
+            # dirname is never "." here: this branch only runs when
+            # ./$BINARY_NAME is absent, so find cannot have matched at depth 1.
             rm -rf "$(dirname "$NESTED")" 2>/dev/null || true
         else
             err "Extraction succeeded but $BINARY_NAME binary not found."
