@@ -61,6 +61,11 @@ A download-only setup script handles everything: it fetches the pre-built aarch6
 Android release, writes `config.json`, acquires a wake-lock (so Android Doze doesn't
 pause the miner), and runs with auto-restart.
 
+It offers a menu of daemons and pools, or a custom `host:port`. Take the pool
+(option 1, the default) on a phone. The solo nodes pay out at network difficulty,
+which at phone hashrates means hours between rewards — the counters sit at zero long
+enough to look broken, even though nothing is wrong.
+
 ```bash
 curl -sL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-C-Miner/master/scripts/termux-setup.sh | bash
 ```
