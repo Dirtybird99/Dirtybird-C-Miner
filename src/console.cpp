@@ -64,9 +64,12 @@ void dluna_console_init(void)
 
 /* --- terminal width --- */
 
-/* Visible console width in columns, or 0 when unknown. Queried fresh on every
- * reporter tick (one cheap syscall per second on a cold path), which is how a
- * font-size change or a window resize is picked up without a SIGWINCH handler. */
+/* Visible console width in columns. Falls back to 80 when TIOCGWINSZ is
+ * unavailable so the status line doesn't wrap on TTYs that don't report their
+ * width (some Termux/HiveOS/detached-screen setups). Returns 0 only for non-TTY
+ * (file/pipe) output. Queried fresh on every reporter tick (one cheap syscall per
+ * second on a cold path), which is how a font-size change or a window resize is
+ * picked up without a SIGWINCH handler. */
 int dluna_term_cols(void)
 {
 	/* Explicit override wins: TIOCGWINSZ reports 0 under some HiveOS/MMPOS
@@ -82,19 +85,19 @@ int dluna_term_cols(void)
 	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
 	if (h == INVALID_HANDLE_VALUE || !GetConsoleScreenBufferInfo(h, &csbi))
-		return 0;
+		return 80;
 	/* conhost wraps at the screen BUFFER width but only the window is on
 	 * screen; the smaller of the two keeps the line both unwrapped and
 	 * fully visible. On Windows Terminal the two are equal anyway. */
 	int buf = (int)csbi.dwSize.X;
 	int win = (int)(csbi.srWindow.Right - csbi.srWindow.Left) + 1;
 	int cols = (buf > 0 && buf < win) ? buf : win;
-	return cols > 0 ? cols : 0;
+	return cols > 0 ? cols : 80;
 #else
 	struct winsize ws;
 	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
 		return (int)ws.ws_col;
-	return 0;
+	return 80;
 #endif
 }
 
