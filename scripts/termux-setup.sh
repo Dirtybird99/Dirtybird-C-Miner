@@ -267,7 +267,16 @@ else
     note "Without it, Android Doze may pause the miner in background."
 fi
 
-# ── step 10: run with auto-restart ────────────────────────────────────────────
+# ── step 10: set terminal width for status line ────────────────────────────────
+# TIOCGWINSZ can fail on some Termux setups; DIRTYBIRD_COLS forces the miner
+# to pick a status-line layout that fits the actual screen instead of wrapping.
+TERM_COLS="$(tput cols 2>/dev/null || true)"
+if [ -z "$TERM_COLS" ] || [ "$TERM_COLS" -lt 20 ] 2>/dev/null; then
+    TERM_COLS=50
+fi
+export DIRTYBIRD_COLS="$TERM_COLS"
+
+# ── step 11: run with auto-restart ────────────────────────────────────────────
 printf "\n"
 printf "  Pool:     ${GREEN}%s${NC}\n" "$(jq -r '.["daemon-address"]' config.json)"
 printf "  Wallet:   ${GREEN}%s${NC}\n" "$(jq -r '.wallet' config.json)"
