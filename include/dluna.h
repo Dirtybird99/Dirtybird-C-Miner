@@ -109,9 +109,11 @@ void dluna_console_init(void);
 bool dluna_is_tty(void);       /* stdout is an interactive console */
 const char *dluna_clr_eol(void); /* ANSI erase-to-EOL, or "" when unavailable */
 
-/* Visible width of the console in columns, or 0 when it cannot be determined
- * (not a TTY, query failed). Cheap enough to call once per reporter tick, which
- * is how a terminal resize is picked up without a SIGWINCH handler. */
+/* Visible width of the console in columns. 0 means stdout is NOT a console (a
+ * file or pipe); a console whose size cannot be queried reports an assumed 80
+ * rather than 0, because dluna_format_status() reads 0 as an unbounded width
+ * budget and would let the line wrap. Cheap enough to call once per reporter
+ * tick, which is how a terminal resize is picked up without a SIGWINCH handler. */
 int dluna_term_cols(void);
 
 /* One reporter tick's worth of numbers, ready to render. */

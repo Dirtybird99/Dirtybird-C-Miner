@@ -73,9 +73,12 @@ target_link_libraries(test_statusline PRIVATE dluna_runtime)
 dluna_copy_runtime_dlls(test_statusline)
 
 add_test(NAME cap_format COMMAND test_cap_format)
+# Runs from the binary output dir, not this target's build dir: the test shells
+# out to "./dirtybird-miner-cpu-replay" by relative path, and every executable
+# lands in ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}.
 add_test(NAME self_diff
     COMMAND test_self_diff
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
 )
 add_test(NAME v114_encode COMMAND test_v114_encode)
 add_test(NAME v114_encode_count1_singletons COMMAND test_v114_encode)
@@ -94,13 +97,33 @@ add_test(NAME statusline_env_cols COMMAND test_statusline)
 set_tests_properties(statusline_env_cols PROPERTIES
     ENVIRONMENT "DIRTYBIRD_COLS=56"
 )
-add_test(NAME stage5_fused_profile_contract
-    COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-        -File ${CMAKE_SOURCE_DIR}/tools/test_stage5_fused_profile_contract.ps1
-        -BenchExe $<TARGET_FILE:bench_stage5>
-        -Captures ${CMAKE_SOURCE_DIR}/captures/v1.14/869d2bd2_20260501_1810_1000
-)
-add_test(NAME stage5_candidate_gate_contract
-    COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-        -File ${CMAKE_SOURCE_DIR}/tools/test_stage5_candidate_gate_contract.ps1
-)
+# Stage5 contract tests need a PowerShell driver plus a capture corpus, neither
+# of which ships in this repo. Registering them unconditionally made `ctest` fail
+# out of the box on a fresh clone with an error about a missing -File argument,
+# which is indistinguishable from a real regression. Register only when the
+# fixtures are actually present.
+set(STAGE5_FUSED_DRIVER
+    ${CMAKE_SOURCE_DIR}/tools/test_stage5_fused_profile_contract.ps1)
+set(STAGE5_FUSED_CAPTURES
+    ${CMAKE_SOURCE_DIR}/captures/v1.14/869d2bd2_20260501_1810_1000)
+if(EXISTS ${STAGE5_FUSED_DRIVER} AND EXISTS ${STAGE5_FUSED_CAPTURES})
+    add_test(NAME stage5_fused_profile_contract
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File ${STAGE5_FUSED_DRIVER}
+            -BenchExe $<TARGET_FILE:bench_stage5>
+            -Captures ${STAGE5_FUSED_CAPTURES}
+    )
+else()
+    message(STATUS "stage5_fused_profile_contract: fixtures absent, test skipped")
+endif()
+
+set(STAGE5_GATE_DRIVER
+    ${CMAKE_SOURCE_DIR}/tools/test_stage5_candidate_gate_contract.ps1)
+if(EXISTS ${STAGE5_GATE_DRIVER})
+    add_test(NAME stage5_candidate_gate_contract
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File ${STAGE5_GATE_DRIVER}
+    )
+else()
+    message(STATUS "stage5_candidate_gate_contract: driver absent, test skipped")
+endif()

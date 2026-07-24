@@ -64,9 +64,19 @@ void dluna_console_init(void)
 
 /* --- terminal width --- */
 
-/* Visible console width in columns, or 0 when unknown. Queried fresh on every
- * reporter tick (one cheap syscall per second on a cold path), which is how a
- * font-size change or a window resize is picked up without a SIGWINCH handler. */
+/* Assumed width when stdout IS a console but its size cannot be read (some
+ * Termux/HiveOS/detached-screen setups). Guessing the classic 80 is what keeps
+ * the status line on one row: the old "unknown" answer of 0 meant an unbounded
+ * budget, so the 115-column full layout went out to a terminal of any size and
+ * wrapped. 80 is never worse -- a wider console just gets a narrower layout,
+ * while a narrower one is the case that actually breaks. */
+static const int DEFAULT_COLS = 80;
+
+/* Visible console width in columns. 0 means "not a console" (redirected to a
+ * file or pipe) -- never "console of unknown size", which reports DEFAULT_COLS
+ * instead. Queried fresh on every reporter tick (one cheap syscall per second on
+ * a cold path), which is how a font-size change or a window resize is picked up
+ * without a SIGWINCH handler. */
 int dluna_term_cols(void)
 {
 	/* Explicit override wins: TIOCGWINSZ reports 0 under some HiveOS/MMPOS
@@ -82,19 +92,19 @@ int dluna_term_cols(void)
 	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
 	if (h == INVALID_HANDLE_VALUE || !GetConsoleScreenBufferInfo(h, &csbi))
-		return 0;
+		return DEFAULT_COLS;
 	/* conhost wraps at the screen BUFFER width but only the window is on
 	 * screen; the smaller of the two keeps the line both unwrapped and
 	 * fully visible. On Windows Terminal the two are equal anyway. */
 	int buf = (int)csbi.dwSize.X;
 	int win = (int)(csbi.srWindow.Right - csbi.srWindow.Left) + 1;
 	int cols = (buf > 0 && buf < win) ? buf : win;
-	return cols > 0 ? cols : 0;
+	return cols > 0 ? cols : DEFAULT_COLS;
 #else
 	struct winsize ws;
 	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
 		return (int)ws.ws_col;
-	return 0;
+	return DEFAULT_COLS;
 #endif
 }
 

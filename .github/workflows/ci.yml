@@ -81,14 +81,28 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++
 
+      # Builds every target, not just the miner: the unit tests below live in
+      # tools/replay and would not exist otherwise.
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: cmake --build build --target dirtybird-miner-cpu --parallel
+        run: cmake --build build --parallel
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
-        run: cmake --build build --target dirtybird-miner-cpu --parallel
+        run: cmake --build build --parallel
+
+      # The unit suite (statusline layout, stage5 descriptor, v1.14 encode,
+      # self-diff, ...) used to build in CI and never run, so a regression in any
+      # of it reached a release with a green tick.
+      - name: Unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Unit tests (Linux)
+        if: runner.os == 'Linux'
+        run: ctest --test-dir build --output-on-failure
 
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
@@ -234,3 +248,18 @@ jobs:
           if git ls-files '*.cpp' '*.hpp' '*.h' '*.c' | xargs grep -l $'\r' 2>/dev/null; then
             echo "::warning::CRLF line endings detected in source files"
           fi
+
+      # Shell scripts are how users install the miner (termux-setup.sh is piped
+      # straight into bash from the README), so a syntax error ships as a broken
+      # installer. Nothing lint-checked them before.
+      #
+      # Pinned to error severity on purpose: these scripts deliberately build
+      # printf format strings out of the colour variables, which is a firehose of
+      # SC2059 notes. Errors are the ones that mean "this script is broken".
+      - name: Shell script lint
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || exit 1
+          done
+          shellcheck --severity=error $(git ls-files '*.sh')

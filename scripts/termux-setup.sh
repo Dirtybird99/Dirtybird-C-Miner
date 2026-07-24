@@ -16,13 +16,57 @@
 set -euo pipefail
 
 REPO="Dirtybird99/Dirtybird-C-Miner"
-DEFAULT_POOL="community-pools.mysrv.cloud:10300"
 DEFAULT_WALLET="dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y"
 INSTALL_DIR="$HOME/dirtybird-miner"
 BINARY_NAME="dirtybird-miner-cpu"
 VERSION_FILE=".installed_version"
 ARCHIVE_PREFIX="dirtybird-miner-v"
 ARCHIVE_SUFFIX="_aarch64_android.tar.gz"
+
+# ── daemon / pool menu ────────────────────────────────────────────────────────
+# The two pools hand out low-difficulty shares, so a phone sees progress every
+# few seconds; the solo daemons hand out real network work, which is the same
+# expected earnings for a given hashrate but can leave a phone sitting for hours
+# between rewards -- and that reads as a broken miner. Hence the labels.
+#
+# Port matters as much as host: dero.rabidmining.com serves solo daemon work on
+# :10100 and pool shares on :10300 (network difficulty vs 20000 when measured).
+# The pool port is the one worth offering here.
+#
+# No scheme prefix: the miner splits the address at the last ':' (load_config in
+# src/main.cpp), so a "ws://" prefix becomes part of the hostname and the lookup
+# fails.
+#
+# Verified 2026-07-24 -- all four completed a TLS handshake and a
+# 'GET /ws/<wallet>' WebSocket upgrade and served a job. A plain TCP probe is
+# not enough to re-check them: the miner only ever speaks TLS, so a port that
+# accepts a connection can still fail at SSL_connect. To re-check one:
+#   KEY=$(head -c16 /dev/urandom | base64)
+#   printf 'GET /ws/WALLET HTTP/1.1\r\nHost: HOST:PORT\r\nUpgrade: websocket\r\n'\
+#          'Connection: Upgrade\r\nSec-WebSocket-Key: '"$KEY"'\r\n'\
+#          'Sec-WebSocket-Version: 13\r\n\r\n' \
+#     | openssl s_client -connect HOST:PORT -quiet   # expect "101 Switching Protocols"
+declare -a DAEMON_NAMES=(
+    "Community Pools"
+    "Rabid Mining"
+    "dero-node.net"
+    "DERO Foundation"
+    "Custom address"
+)
+declare -a DAEMON_ADDRS=(
+    "community-pools.mysrv.cloud:10300"
+    "dero.rabidmining.com:10300"
+    "dero-node.net:10100"
+    "node.derofoundation.org:10100"
+    ""
+)
+declare -a DAEMON_KINDS=(
+    "pool -- rewards every few seconds, best for phones"
+    "pool -- rewards every few seconds, best for phones"
+    "solo node -- a phone may wait hours between rewards"
+    "solo node -- full blocks only, 9x the work per reward"
+    ""
+)
 
 # ── colours (safe for Termux) ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -202,13 +246,50 @@ else
     info "Installed $LATEST_TAG."
 fi
 
-# ── step 4: prompt for daemon address ────────────────────────────────────────
+# ── step 4: pick a daemon / pool ─────────────────────────────────────────────
+# Rejected input re-prompts instead of exiting: this is the one interactive step
+# a phone user is likely to fat-finger, and the download has already succeeded by
+# now -- throwing the whole install away over a typo is a poor trade.
 if [ "$RECONFIGURE" = true ] || [ ! -f "config.json" ]; then
     printf "\n"
-    printf "${CYAN}Daemon/pool address [scheme://]host:port${NC}\n"
-    printf "  Press Enter to use: ${GREEN}%s${NC}\n" "$DEFAULT_POOL"
-    read -rp "  Address: " INPUT_POOL </dev/tty
-    POOL="${INPUT_POOL:-$DEFAULT_POOL}"
+    printf "${CYAN}Select a daemon/pool:${NC}\n\n"
+    for i in "${!DAEMON_NAMES[@]}"; do
+        if [ -n "${DAEMON_ADDRS[$i]}" ]; then
+            printf "  ${GREEN}[%d]${NC} %-16s %s\n" \
+                "$((i + 1))" "${DAEMON_NAMES[$i]}" "${DAEMON_ADDRS[$i]}"
+            printf "      %-16s ${YELLOW}%s${NC}\n" "" "${DAEMON_KINDS[$i]}"
+        else
+            printf "  ${GREEN}[%d]${NC} %s\n" "$((i + 1))" "${DAEMON_NAMES[$i]}"
+        fi
+    done
+    printf "\n"
+
+    POOL=""
+    while [ -z "$POOL" ]; do
+        read -rp "  Choice [1]: " CHOICE </dev/tty || CHOICE=""
+        CHOICE="${CHOICE:-1}"
+
+        if ! printf '%s' "$CHOICE" | grep -qE '^[0-9]+$' ||
+           [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#DAEMON_NAMES[@]}" ]; then
+            warn "Enter a number from 1 to ${#DAEMON_NAMES[@]}."
+            continue
+        fi
+
+        POOL="${DAEMON_ADDRS[$((CHOICE - 1))]}"
+        if [ -z "$POOL" ]; then
+            printf "\n"
+            printf "${CYAN}Daemon/pool address (host:port, no scheme prefix)${NC}\n"
+            read -rp "  Address: " POOL </dev/tty || POOL=""
+            # Validated, not just non-empty: this string is interpolated straight
+            # into the config.json heredoc below, so a quote or newline would
+            # emit malformed JSON the miner then silently fails to parse.
+            if ! printf '%s' "$POOL" | grep -qE '^[A-Za-z0-9._-]+:[0-9]{1,5}$'; then
+                warn "Expected host:port (e.g. dero-node.net:10100)."
+                POOL=""
+            fi
+        fi
+    done
+    info "Using: $POOL"
 
     # ── step 5: prompt for wallet address ────────────────────────────────────
     printf "\n"

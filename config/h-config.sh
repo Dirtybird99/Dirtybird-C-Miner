@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+# HiveOS sources this to render the miner's config file. The [[ ]] tests below
+# are bash syntax, so declare the shell rather than leaving it to chance.
 if [[ $CUSTOM_URL == wss* ]]; then
     USERNAME=`echo $CUSTOM_TEMPLATE | cut -d . -f 1`
 else
