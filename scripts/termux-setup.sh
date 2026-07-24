@@ -16,13 +16,28 @@
 set -euo pipefail
 
 REPO="Dirtybird99/Dirtybird-C-Miner"
-DEFAULT_POOL="community-pools.mysrv.cloud:10300"
 DEFAULT_WALLET="dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y"
 INSTALL_DIR="$HOME/dirtybird-miner"
 BINARY_NAME="dirtybird-miner-cpu"
 VERSION_FILE=".installed_version"
 ARCHIVE_PREFIX="dirtybird-miner-v"
 ARCHIVE_SUFFIX="_aarch64_android.tar.gz"
+
+# ── remote daemon/pool options ──────────────────────────────────────────────────
+declare -a DAEMON_NAMES=(
+    "Community Pools (mining pool)"
+    "Rabid Mining"
+    "dero-node.net"
+    "DERO Foundation node"
+    "Custom address"
+)
+declare -a DAEMON_ADDRS=(
+    "community-pools.mysrv.cloud:10300"
+    "dero.rabidmining.com:10100"
+    "dero-node.net:10100"
+    "node.derofoundation.org:10100"
+    ""
+)
 
 # ── colours (safe for Termux) ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -202,13 +217,36 @@ else
     info "Installed $LATEST_TAG."
 fi
 
-# ── step 4: prompt for daemon address ────────────────────────────────────────
+# ── step 4: daemon/pool selection menu ───────────────────────────────────────
 if [ "$RECONFIGURE" = true ] || [ ! -f "config.json" ]; then
     printf "\n"
-    printf "${CYAN}Daemon/pool address [scheme://]host:port${NC}\n"
-    printf "  Press Enter to use: ${GREEN}%s${NC}\n" "$DEFAULT_POOL"
-    read -rp "  Address: " INPUT_POOL </dev/tty
-    POOL="${INPUT_POOL:-$DEFAULT_POOL}"
+    printf "${CYAN}Select a daemon/pool:${NC}\n\n"
+    for i in "${!DAEMON_NAMES[@]}"; do
+        n=$((i + 1))
+        printf "  ${GREEN}[%d]${NC} %-35s %s\n" "$n" "${DAEMON_NAMES[$i]}" "${DAEMON_ADDRS[$i]}"
+    done
+    printf "\n"
+    read -rp "  Choice [1]: " CHOICE </dev/tty
+    CHOICE="${CHOICE:-1}"
+
+    if ! printf '%s' "$CHOICE" | grep -qE '^[0-9]+$' || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#DAEMON_NAMES[@]}" ]; then
+        err "Invalid choice: $CHOICE"
+        exit 1
+    fi
+
+    IDX=$((CHOICE - 1))
+    if [ -z "${DAEMON_ADDRS[$IDX]}" ]; then
+        printf "\n"
+        printf "${CYAN}Enter daemon/pool address [scheme://]host:port${NC}\n"
+        read -rp "  Address: " POOL </dev/tty
+        if [ -z "$POOL" ]; then
+            err "Address cannot be empty."
+            exit 1
+        fi
+    else
+        POOL="${DAEMON_ADDRS[$IDX]}"
+    fi
+    info "Using: $POOL"
 
     # ── step 5: prompt for wallet address ────────────────────────────────────
     printf "\n"
