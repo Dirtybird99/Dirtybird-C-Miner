@@ -187,11 +187,11 @@ int main()
 		            vis, out.c_str() + 1);
 	}
 
-	/* dluna_term_cols() is mostly untestable here -- TIOCGWINSZ and
-	 * GetConsoleScreenBufferInfo both need a real terminal, and ctest gives us
-	 * a pipe. The DIRTYBIRD_COLS override is the one branch we can pin, and it
-	 * is also the escape hatch for setups where the ioctl reports 0. Driven by
-	 * the `statusline_env_cols` test registration. */
+	/* Two dluna_term_cols() branches are reachable from ctest, one per test
+	 * registration: `statusline_env_cols` sets DIRTYBIRD_COLS and pins the
+	 * override (the escape hatch for setups where the ioctl reports 0), while
+	 * plain `statusline` leaves it unset and lands on the query-failed
+	 * fallback, because ctest gives us a pipe rather than a real terminal. */
 	if (const char *env = std::getenv("DIRTYBIRD_COLS")) {
 		int want = std::atoi(env);
 		int got  = dluna_term_cols();
@@ -206,6 +206,31 @@ int main()
 		      "override width %d rendered %d columns", got, vis);
 		std::printf("statusline: DIRTYBIRD_COLS=%d honored (%d columns)\n",
 		            got, vis);
+	} else {
+		/* No override: this is the width-query-failed path. g_tty is still its
+		 * default true here (dluna_console_init() is deliberately never called),
+		 * and ctest hands us a pipe, so both TIOCGWINSZ and
+		 * GetConsoleScreenBufferInfo fail -- exactly the case that used to
+		 * answer 0. A 0 here is an INT_MAX width budget in
+		 * dluna_format_status(), i.e. the full 115-column line on a phone
+		 * terminal, which wraps and then stacks one row per repaint.
+		 *
+		 * Asserted as "> 0" rather than "== 80" so this still holds when a
+		 * developer runs the binary straight from a real terminal, where the
+		 * query succeeds and returns that terminal's actual width. */
+		int got = dluna_term_cols();
+		CHECK(got > 0,
+		      "dluna_term_cols() == %d on a console of unknown width -- 0 is an "
+		      "unbounded budget and the status line will wrap and stack", got);
+
+		char buf[512];
+		dluna_format_status(buf, sizeof buf, cases[1].st, got);
+		bool intact = false;
+		int vis = visible_width(std::string(buf), &intact);
+		CHECK(intact && vis <= got - 1,
+		      "fallback width %d rendered %d columns", got, vis);
+		std::printf("statusline: unknown-width fallback = %d columns "
+		            "(%d rendered)\n", got, vis);
 	}
 
 	if (g_failures == 0) {
