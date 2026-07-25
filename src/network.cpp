@@ -573,13 +573,13 @@ static bool handle_job(const std::string &json)
 		workChanged =
 			blob != G.blob ||
 			jid  != G.jobId ||
-			h    != G.height ||
+			h    != G.height.load(std::memory_order_relaxed) ||
 			(uint64_t)diff != G.difficulty.load(std::memory_order_relaxed);
 
 		G.blob = blob;
 		hexstrToBytes(blob, G.blobBin);
 		G.jobId = jid;
-		G.height = h;
+		G.height.store(h, std::memory_order_relaxed);
 		G.difficulty.store((uint64_t)diff);
 		G.accepted.store(miniblks, std::memory_order_relaxed);
 		G.blocks.store(blks, std::memory_order_relaxed);

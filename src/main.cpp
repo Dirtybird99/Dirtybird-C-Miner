@@ -71,11 +71,98 @@ extern "C" int __llvm_profile_write_file(void);
 
 extern "C" uint64_t dluna_get_nanosleep_calls();
 
+namespace {
+
+struct HashrateTracker {
+	using Clock = std::chrono::steady_clock;
+
+	struct Snapshot {
+		Clock::time_point time;
+		int64_t hashes;
+	};
+
+	static constexpr int WINDOW_SAMPLES = 10;
+	Snapshot history[WINDOW_SAMPLES];
+	Snapshot start;
+	int64_t last_hashes;
+	int next = 0;
+
+	HashrateTracker(Clock::time_point now, int64_t total)
+		: start{now, total}, last_hashes(total)
+	{
+		for (auto &snapshot : history)
+			snapshot = start;
+	}
+
+	void sample(Clock::time_point now, int64_t total, double &rate, double &avg)
+	{
+		if (total < last_hashes) {
+			start = {now, total};
+			for (auto &snapshot : history)
+				snapshot = start;
+			last_hashes = total;
+			next = 0;
+			rate = avg = 0;
+			return;
+		}
+
+		const Snapshot oldest = history[next];
+		const double window_seconds =
+			std::chrono::duration<double>(now - oldest.time).count();
+		const double session_seconds =
+			std::chrono::duration<double>(now - start.time).count();
+		rate = (window_seconds > 0)
+			? (total - oldest.hashes) / (window_seconds * 1000.0) : 0;
+		avg = (session_seconds > 0)
+			? (total - start.hashes) / (session_seconds * 1000.0) : 0;
+		history[next] = {now, total};
+		last_hashes = total;
+		next = (next + 1) % WINDOW_SAMPLES;
+	}
+};
+
+static bool hashrate_tracker_selftest()
+{
+	using Clock = HashrateTracker::Clock;
+	const auto start = Clock::time_point{};
+	double rate = 0, avg = 0;
+
+	HashrateTracker irregular(start, 777);
+	irregular.sample(start + std::chrono::seconds(2), 2777, rate, avg);
+	if (rate != 1.0 || avg != 1.0)
+		return false;
+
+	HashrateTracker stalled(start, 777);
+	for (int second = 1; second <= 5; ++second) {
+		stalled.sample(start + std::chrono::seconds(second),
+		              777 + 1000 * second, rate, avg);
+		if (rate != 1.0 || avg != 1.0)
+			return false;
+	}
+	for (int second = 6; second <= 10; ++second)
+		stalled.sample(start + std::chrono::seconds(second), 5777, rate, avg);
+	if (rate != 0.5 || avg != 0.5)
+		return false;
+	for (int second = 11; second <= 15; ++second)
+		stalled.sample(start + std::chrono::seconds(second), 5777, rate, avg);
+	if (rate != 0)
+		return false;
+
+	HashrateTracker reset(start, 777);
+	reset.sample(start + std::chrono::seconds(1), 1777, rate, avg);
+	reset.sample(start + std::chrono::seconds(2), 10, rate, avg);
+	if (rate != 0 || avg != 0)
+		return false;
+	reset.sample(start + std::chrono::seconds(3), 1010, rate, avg);
+	return rate == 1.0 && avg == 1.0;
+}
+
+} // namespace
+
 static void reporter_thread()
 {
-	int64_t prev = 0;
 	auto t0 = std::chrono::steady_clock::now();
-	auto prevT = t0;
+	HashrateTracker hashrate(t0, G.totalHashes.load(std::memory_order_relaxed));
 	int flush_counter = 0;
 
 	while (!G.quit) {
@@ -83,21 +170,12 @@ static void reporter_thread()
 
 		auto now = std::chrono::steady_clock::now();
 		double elapsed = std::chrono::duration<double>(now - t0).count();
-		double dt = std::chrono::duration<double>(now - prevT).count();
-		prevT = now;
 		int64_t total = G.totalHashes.load(std::memory_order_relaxed);
-		int64_t delta = total - prev;
-		prev = total;
-
-		/* Instantaneous KH/s over the ACTUAL inter-tick interval, not a
-		 * hardcoded 1 s -- otherwise a reporter-thread scheduling delay under
-		 * full load divides a multi-second batch by 1 s and spikes the reading. */
-		double rate = (dt > 0) ? delta / (dt * 1000.0) : 0;
-		double avg = (elapsed > 0) ? total / (elapsed * 1000.0) : 0;
+		double rate, avg;
+		hashrate.sample(now, total, rate, avg);
 
 		/* Colored [DIRTYBIRD] status line (the format users liked). Fields:
-		 *   Height     = G.height   (written under jobMutex; an aligned 64-bit
-		 *                            read for display is benign on x64)
+		 *   Height     = G.height   (atomic display snapshot)
 		 *   Miniblocks = G.accepted (daemon "miniblocks" accepted)
 		 *   Blocks     = G.blocks   (daemon integrator/full "blocks")
 		 *   REJ        = G.rejected (daemon "rejected")
@@ -127,7 +205,7 @@ static void reporter_thread()
 			DlunaStatus st{};
 			st.rate     = rate;
 			st.avg      = avg;
-			st.height   = (long long)G.height;
+			st.height   = (long long)G.height.load(std::memory_order_relaxed);
 			st.accepted = (long long)G.accepted.load();
 			st.blocks   = (long long)G.blocks.load();
 			st.rejected = (long long)G.rejected.load();
@@ -140,7 +218,7 @@ static void reporter_thread()
 			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "
 			       "Miniblocks:%lld | Blocks:%lld | REJ:%lld | Diff:%s | "
 			       "%02d:%02d:%02d\n",
-			       rate, avg, (long long)G.height,
+			       rate, avg, (long long)G.height.load(std::memory_order_relaxed),
 			       (long long)G.accepted.load(), (long long)G.blocks.load(),
 			       (long long)G.rejected.load(), diffbuf, hh, mm, ss);
 		}
@@ -166,7 +244,7 @@ static void reporter_thread()
 /* --- CLI --- */
 
 #ifndef DIRTYBIRD_VERSION_STR
-#define DIRTYBIRD_VERSION_STR "1.0.18"
+#define DIRTYBIRD_VERSION_STR "dev"
 #endif
 
 static void print_usage(FILE *out, const char *argv0)
@@ -404,8 +482,10 @@ int main(int argc, char **argv)
 	        std::string h = hexStr(out, 32);
 	        bool pass = (h == "54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea");
 	        if (g_selftest) {
+	                bool tracker_pass = hashrate_tracker_selftest();
+	                printf("selftest hashrate tracker: %s\n", tracker_pass ? "PASS" : "FAIL");
 	                printf("selftest pow(a): %s %s\n", h.c_str(), pass ? "PASS" : "FAIL");
-	                delete w; exit(pass ? 0 : 1);
+	                delete w; exit(pass && tracker_pass ? 0 : 1);
 	        }
 	        if (g_verbose) printf("Test pow(a): %s\n", h.c_str());
 	        if (pass) {
