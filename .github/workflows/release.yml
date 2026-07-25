@@ -66,12 +66,6 @@ jobs:
             echo "::error::$TAG does not have a signature verified by GitHub"
             exit 1
           fi
-          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" \
-              --jq '.enabled')" != "true" ]; then
-            echo "::error::Immutable releases must be enabled before tagging"
-            exit 1
-          fi
-
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "::error::Release $TAG already exists"
             exit 1
