@@ -29,6 +29,7 @@ extern "C" int __llvm_profile_write_file(void);
 struct TrainOptions {
     int threads = static_cast<int>(std::thread::hardware_concurrency());
     int seconds = 60;
+    int warmup_seconds = 0;
     uint64_t hashes = 0;
     int64_t difficulty = 1000000000;
     int rotate_ms = 5000;
@@ -36,7 +37,7 @@ struct TrainOptions {
 
 static void usage(const char* argv0) {
     std::fprintf(stderr,
-        "Usage: %s [-t threads] [--seconds n] [--hashes n] "
+        "Usage: %s [-t threads] [--warmup-seconds n] [--seconds n] [--hashes n] "
         "[--difficulty n] [--rotate-ms n]\n",
         argv0);
     std::exit(2);
@@ -72,6 +73,9 @@ static TrainOptions parse_args(int argc, char** argv) {
         };
         if (!std::strcmp(arg, "-t")) {
             opt.threads = parse_int_arg(need_value("-t"), "-t");
+        } else if (!std::strcmp(arg, "--warmup-seconds")) {
+            opt.warmup_seconds =
+                parse_int_arg(need_value("--warmup-seconds"), "--warmup-seconds");
         } else if (!std::strcmp(arg, "--seconds")) {
             opt.seconds = parse_int_arg(need_value("--seconds"), "--seconds");
         } else if (!std::strcmp(arg, "--hashes")) {
@@ -88,6 +92,10 @@ static TrainOptions parse_args(int argc, char** argv) {
         }
     }
 
+    if (opt.warmup_seconds < 0) {
+        std::fprintf(stderr, "invalid --warmup-seconds: %d\n", opt.warmup_seconds);
+        usage(argv[0]);
+    }
     if (opt.threads <= 0) opt.threads = 1;
     opt.threads = std::min(opt.threads, 255);
     if (opt.seconds <= 0 && opt.hashes == 0) opt.seconds = 60;
@@ -146,8 +154,9 @@ static void init_training_runtime(const TrainOptions& opt) {
 
 int main(int argc, char** argv) {
     TrainOptions opt = parse_args(argc, argv);
-    std::printf("DIRTYBIRD PGO trainer threads=%d seconds=%d hashes=%llu rotate_ms=%d\n",
-                opt.threads, opt.seconds,
+    std::printf("DIRTYBIRD PGO trainer threads=%d warmup_seconds=%d seconds=%d "
+                "hashes=%llu rotate_ms=%d\n",
+                opt.threads, opt.warmup_seconds, opt.seconds,
                 static_cast<unsigned long long>(opt.hashes), opt.rotate_ms);
 
     init_training_runtime(opt);
@@ -158,23 +167,39 @@ int main(int argc, char** argv) {
         threads.emplace_back(mine_thread, i);
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    auto next_rotate = start + std::chrono::milliseconds(opt.rotate_ms);
+    const auto run_start = std::chrono::steady_clock::now();
+    auto measurement_start = run_start;
+    uint64_t measurement_start_hashes =
+        static_cast<uint64_t>(G.totalHashes.load(std::memory_order_relaxed));
+    bool measuring = opt.warmup_seconds == 0;
+    auto next_rotate = run_start + std::chrono::milliseconds(opt.rotate_ms);
     uint64_t epoch = 1;
     while (!G.quit.load(std::memory_order_relaxed)) {
         dluna_sleep_ms(100);
         const auto now = std::chrono::steady_clock::now();
-        if (opt.hashes != 0 &&
-            static_cast<uint64_t>(G.totalHashes.load(std::memory_order_relaxed)) >= opt.hashes) {
-            break;
-        }
-        if (opt.seconds > 0 &&
-            std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= opt.seconds) {
-            break;
-        }
         if (opt.rotate_ms > 0 && now >= next_rotate) {
             seed_training_job(++epoch, opt.difficulty);
             next_rotate = now + std::chrono::milliseconds(opt.rotate_ms);
+        }
+        if (!measuring) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    now - run_start).count() < opt.warmup_seconds) {
+                continue;
+            }
+            measuring = true;
+            measurement_start = now;
+            measurement_start_hashes =
+                static_cast<uint64_t>(G.totalHashes.load(std::memory_order_relaxed));
+        }
+
+        const uint64_t measured_hashes =
+            static_cast<uint64_t>(G.totalHashes.load(std::memory_order_relaxed)) -
+            measurement_start_hashes;
+        if (opt.hashes != 0 && measured_hashes >= opt.hashes) break;
+        if (opt.seconds > 0 &&
+            std::chrono::duration_cast<std::chrono::seconds>(
+                now - measurement_start).count() >= opt.seconds) {
+            break;
         }
     }
 
@@ -183,11 +208,33 @@ int main(int argc, char** argv) {
         if (t.joinable()) t.join();
     }
 
+    const auto measurement_end = std::chrono::steady_clock::now();
+    const uint64_t total_hashes =
+        static_cast<uint64_t>(G.totalHashes.load(std::memory_order_relaxed));
+    const uint64_t measured_hashes =
+        measuring && total_hashes >= measurement_start_hashes
+            ? total_hashes - measurement_start_hashes
+            : 0;
+    const double elapsed_seconds = measuring
+        ? std::chrono::duration<double>(measurement_end - measurement_start).count()
+        : 0.0;
+    const double kh_s = elapsed_seconds > 0.0
+        ? static_cast<double>(measured_hashes) / elapsed_seconds / 1000.0
+        : 0.0;
+
 #ifdef DLUNA_PGO_GENERATE
     __llvm_profile_write_file();
 #endif
 
-    std::printf("pgo_train hashes=%lld\n",
-                static_cast<long long>(G.totalHashes.load(std::memory_order_relaxed)));
+    std::printf("benchmark_result threads=%d warmup_s=%d elapsed_s=%.3f "
+                "hashes=%llu kh_s=%.3f\n",
+                opt.threads, opt.warmup_seconds, elapsed_seconds,
+                static_cast<unsigned long long>(measured_hashes), kh_s);
+    std::printf("pgo_train hashes=%llu\n",
+                static_cast<unsigned long long>(total_hashes));
+    if (opt.seconds > 0 && (elapsed_seconds <= 0.0 || measured_hashes == 0)) {
+        std::fprintf(stderr, "timed measurement produced no hashes\n");
+        return 1;
+    }
     return 0;
 }

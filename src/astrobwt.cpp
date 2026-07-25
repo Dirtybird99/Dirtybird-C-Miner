@@ -17,6 +17,7 @@
 #include "highwayhash/sip_hash.h"
 #include <openssl/sha.h>
 #include <openssl/rc4.h>
+#include <chrono>
 #include <cstring>
 #include <algorithm>
 #include <cstdio>
@@ -409,18 +410,20 @@ uint32_t dluna_internal_branch_dispatch(const uint8_t* in_buf, uint32_t in_buf_l
 	return w->data_len;
 }
 /* Phase-A profiling 2026-04-29 — diagnosed libsais as 90% of hash time.
- * Per-stage rdtsc accumulators. Each thread dumps its own breakdown every
+ * Per-stage clock accumulators. Each thread dumps its own breakdown every
  * PROF_FLUSH_HASHES hashes when DLUNA_PROFILE=1 is set in the env.
  * Off-by-default so production hot path is unaffected. */
 static inline uint64_t prof_rdtsc() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     return __builtin_ia32_rdtsc();
 #else
-    return 0;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 #endif
 }
 namespace {
-    thread_local uint64_t prof_cycles[7] = {0};   /* 0=prelude,1=salsa+rc4+fnv,2=wolfCompute,3=SPSA-call,4=stage5,5=sha-over-sa,6=total */
+    thread_local uint64_t prof_ticks[7] = {0};   /* 0=prelude,1=salsa+rc4+fnv,2=wolfCompute,3=SPSA-call,4=stage5,5=sha-over-sa,6=total */
     thread_local uint64_t prof_hashes = 0;
     thread_local int      prof_tid = -1;
     thread_local bool     prof_inited = false;
@@ -432,13 +435,19 @@ namespace {
     }
     inline void prof_flush() {
         if (!prof_enabled || prof_hashes < PROF_FLUSH_HASHES) return;
-        uint64_t total = prof_cycles[6] ? prof_cycles[6] : 1;
-        printf("[PROF tid=%d hashes=%llu cyc/hash=%llu  prelude=%5.1f%%  salsa+rc4=%5.1f%%  wolfCompute=%5.1f%%  SPSA=%5.1f%%  stage5=%5.1f%%  shaOverSA=%5.1f%%]\n",
-            prof_tid, (unsigned long long)prof_hashes, (unsigned long long)(total / prof_hashes),
-            100.0 * prof_cycles[0] / total, 100.0 * prof_cycles[1] / total,
-            100.0 * prof_cycles[2] / total, 100.0 * prof_cycles[3] / total,
-            100.0 * prof_cycles[4] / total, 100.0 * prof_cycles[5] / total);
-        for (int i = 0; i < 7; i++) prof_cycles[i] = 0;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        static constexpr const char* unit_per_hash = "cyc/hash";
+#else
+        static constexpr const char* unit_per_hash = "ns/hash";
+#endif
+        uint64_t total = prof_ticks[6] ? prof_ticks[6] : 1;
+        printf("[PROF tid=%d hashes=%llu %s=%llu  prelude=%5.1f%%  salsa+rc4=%5.1f%%  wolfCompute=%5.1f%%  SPSA=%5.1f%%  stage5=%5.1f%%  shaOverSA=%5.1f%%]\n",
+            prof_tid, (unsigned long long)prof_hashes, unit_per_hash,
+            (unsigned long long)(total / prof_hashes),
+            100.0 * prof_ticks[0] / total, 100.0 * prof_ticks[1] / total,
+            100.0 * prof_ticks[2] / total, 100.0 * prof_ticks[3] / total,
+            100.0 * prof_ticks[4] / total, 100.0 * prof_ticks[5] / total);
+        for (int i = 0; i < 7; i++) prof_ticks[i] = 0;
         prof_hashes = 0;
     }
 
@@ -636,9 +645,9 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 		if (prof_enabled) {
 			prof_init();
 			uint64_t tend = prof_rdtsc();
-			prof_cycles[0] += (t1 - t0); prof_cycles[1] += (t2 - t1);
-			prof_cycles[2] += (t3 - t2); prof_cycles[3] += (t4 - t3);
-			prof_cycles[6] += (tend - t0);
+			prof_ticks[0] += (t1 - t0); prof_ticks[1] += (t2 - t1);
+			prof_ticks[2] += (t3 - t2); prof_ticks[3] += (t4 - t3);
+			prof_ticks[6] += (tend - t0);
 			prof_hashes++; prof_flush();
 		}
 		return;
@@ -935,13 +944,13 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
         if (prof_enabled) {
             prof_init();
             uint64_t tend = prof_rdtsc();
-            prof_cycles[0] += (t1 - t0);
-            prof_cycles[1] += (t2 - t1);
-            prof_cycles[2] += (t3 - t2);
-            prof_cycles[3] += (t4 - t3);
-            prof_cycles[4] += (t5 - t4);
-            prof_cycles[5] += (tend - t5);
-            prof_cycles[6] += (tend - t0);
+            prof_ticks[0] += (t1 - t0);
+            prof_ticks[1] += (t2 - t1);
+            prof_ticks[2] += (t3 - t2);
+            prof_ticks[3] += (t4 - t3);
+            prof_ticks[4] += (t5 - t4);
+            prof_ticks[5] += (tend - t5);
+            prof_ticks[6] += (tend - t0);
             prof_hashes++;
             prof_flush();
         }
