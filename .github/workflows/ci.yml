@@ -226,6 +226,13 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DDIRTYBIRD_VERSION=0.0.0-ci
 
+      - name: Verify Android excludes x86 SHA shim
+        run: |
+          if grep -E -- '--wrap=SHA256_|sha256_ni\.cpp' build-android/build.ninja; then
+            echo "Android build includes the x86 SHA shim"
+            exit 1
+          fi
+
       - name: Build
         run: |
           cmake --build build-android \
