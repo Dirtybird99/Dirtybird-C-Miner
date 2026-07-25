@@ -53,6 +53,10 @@ endif()
 # aarch64: ARMv8-A + crypto extensions (SHA/AES); the hot path uses the portable
 #          scalar/soft fallbacks (wolfBranch + sha256_block_soft), no x86 intrinsics.
 # -flto: +7.4% sustained on x86 (enabled by default for Release).
+# -O3 base: measured equivalent to -O2 under LTO+2-pass-PGO (2026-07-25,
+# 3x145s interleaved A/B on i7-13700HX @20T: 19.21 vs 19.08 KH/s, orderings
+# disagree = noise). The old "-O2 proven winner (icache)" finding predates
+# PGO; text grew only +5KB at -O3. Flag choice is now evidence-backed.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
     set(BASE_CXX_FLAGS "-O3 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2 -fno-vectorize -fno-slp-vectorize -finline-functions")
     set(BASE_C_FLAGS   "-O3 -DNDEBUG -march=x86-64-v3 -mtune=raptorlake -fomit-frame-pointer -mavx2")
@@ -237,8 +241,9 @@ target_link_libraries(dirtybird-pgo-train PRIVATE dluna_stages dluna_runtime)
 dluna_copy_runtime_dlls(dirtybird-pgo-train)
 
 # 2026-04-29: phase-A profiling showed libsais is 90% of hash time. Bump it
-# to -O3 for aggressive vectorization on its hot inner loops. Clone's general
-# -O2 stays in place (icache-friendly for the rest of the binary).
+# to -O3 for aggressive vectorization on its hot inner loops. (The base level
+# is now also -O3 — see top of file — so this pin is redundant, kept as
+# documentation of the hot spot.)
 set_source_files_properties(src/libsais.c PROPERTIES COMPILE_FLAGS "-O3")
 
 # ---- SPSA: bundled in-tree clean-room implementation ----
