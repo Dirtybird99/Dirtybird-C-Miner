@@ -27,7 +27,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---- Version (drives the --version/banner string; release CI passes -DDIRTYBIRD_VERSION=<tag>) ----
-set(DIRTYBIRD_VERSION_DEFAULT "1.0.27")
+set(DIRTYBIRD_VERSION_DEFAULT "dev")
 if(DEFINED DIRTYBIRD_VERSION)
     set(INTERNAL_DIRTYBIRD_VERSION "${DIRTYBIRD_VERSION}")
 elseif(DEFINED ENV{DIRTYBIRD_VERSION})
@@ -224,6 +224,7 @@ add_executable(dirtybird-miner-cpu
 target_link_libraries(dirtybird-miner-cpu PRIVATE dluna_stages dluna_runtime)
 target_compile_definitions(dirtybird-miner-cpu PRIVATE DIRTYBIRD_VERSION_STR="${INTERNAL_DIRTYBIRD_VERSION}")
 dluna_copy_runtime_dlls(dirtybird-miner-cpu)
+add_test(NAME dirtybird-selftest COMMAND dirtybird-miner-cpu --selftest)
 
 add_executable(dirtybird-pgo-train
     tools/pgo_trainer.cpp

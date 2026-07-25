@@ -33,11 +33,11 @@ bool       g_verbose = false;   /* -V / DLUNA_VERBOSE: restore event spam */
 static bool g_tty   = true;     /* stdout is an interactive console */
 static bool g_vt_ok = true;     /* VT (ANSI \033[K) sequences usable */
 
-bool dluna_is_tty(void) { return g_tty; }
+bool dluna_is_tty(void) { return g_tty && g_vt_ok; }
 
 /* Clears from the cursor to end of line. On a VT-capable console it is the ANSI
  * erase-to-EOL; otherwise empty (the status line space-pads instead). */
-const char *dluna_clr_eol(void) { return (g_tty && g_vt_ok) ? "\033[K" : ""; }
+const char *dluna_clr_eol(void) { return dluna_is_tty() ? "\033[K" : ""; }
 
 void dluna_console_init(void)
 {
@@ -86,7 +86,7 @@ int dluna_term_cols(void)
 		if (v > 0 && v < 10000)
 			return (int)v;
 	}
-	if (!g_tty)
+	if (!dluna_is_tty())
 		return 0;
 #ifdef _WIN32
 	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -359,7 +359,7 @@ void log_line(const char *level, const char *fmt, ...)
 	std::tm tm = *std::localtime(&t);
 	char ts[32];
 	std::strftime(ts, sizeof ts, "%d/%m %H:%M:%S", &tm);
-	if (g_tty)
+	if (dluna_is_tty())
 		printf("\r%s%s.%03d  %-5s %s\n", dluna_clr_eol(), ts, ms, level, msg);
 	else
 		printf("%s.%03d  %-5s %s\n", ts, ms, level, msg);

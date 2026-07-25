@@ -3,7 +3,8 @@
 High-performance AstroBWTv3 CPU miner for DERO. Clean-room C++ (no Boost; pthreads + sockets),
 descriptor-SA pipeline with optional profile-guided optimization (PGO).
 
-**Status:** v1.0.25 · x86-64 (AVX2) and aarch64 (ARMv8).
+**Releases:** [latest release](https://github.com/Dirtybird99/Dirtybird-C-Miner/releases/latest)
+· x86-64 (AVX2) and aarch64 (ARMv8).
 
 ## Build
 

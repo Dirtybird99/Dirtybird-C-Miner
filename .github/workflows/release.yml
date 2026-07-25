@@ -4,7 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,28 +20,63 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           lfs: true
 
       - name: Resolve tag
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          if [ -z "$TAG" ]; then
-            echo "::error::Missing tag name"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::Release workflow must run from a tag"
             exit 1
           fi
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z]+)*$ ]]; then
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Invalid tag format: $TAG"
-            echo "Expected format: v1.0, v1.0.0, or v1.0.0-beta1"
+            echo "Expected format: v1.0.0"
             exit 1
           fi
+
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
+            echo "::error::$TAG must be an annotated tag"
+            exit 1
+          fi
+
+          COMMIT="$(git rev-parse HEAD)"
+          TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
+          if [ "$COMMIT" != "$TAG_COMMIT" ]; then
+            echo "::error::Checkout $COMMIT does not match $TAG ($TAG_COMMIT)"
+            exit 1
+          fi
+
+          TAG_OBJECT="$(git rev-parse "refs/tags/$TAG")"
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
+              --jq '.verification.verified')" != "true" ]; then
+            echo "::error::$TAG does not have a signature verified by GitHub"
+            exit 1
+          fi
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled')" != "true" ]; then
+            echo "::error::Immutable releases must be enabled before tagging"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists"
+            exit 1
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
       - name: Show changelog preview
         run: |
@@ -57,12 +94,13 @@ jobs:
     needs: verify
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify.outputs.commit }}
           lfs: true
 
       - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: MINGW64
           update: true
@@ -93,9 +131,11 @@ jobs:
       # Gate the release on hash correctness: LTO+PGO is aggressive enough to
       # miscompile the hand-written hot path, and a fast WRONG hash is worse than
       # a slow right one. --selftest computes pow("a") and exits 1 on mismatch.
-      - name: Self-test (pow KAT) + smoke
+      - name: Version, self-test, and smoke
         shell: msys2 {0}
         run: |
+          test "$(./build/bin/dirtybird-miner-cpu.exe --version | tr -d '\r')" = \
+            "Dirtybird Miner v${{ needs.verify.outputs.version }}"
           ./build/bin/dirtybird-miner-cpu.exe --selftest
           ./build/bin/dirtybird-miner-cpu.exe --help > /dev/null
 
@@ -104,7 +144,7 @@ jobs:
         run: ./scripts/release.ps1 -Version ${{ needs.verify.outputs.tag }} -BuildDir build -OutputDir dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-windows
           path: dist/*.zip
@@ -116,8 +156,9 @@ jobs:
     needs: verify
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify.outputs.commit }}
           lfs: true
 
       - name: Install dependencies
@@ -139,16 +180,20 @@ jobs:
 
       # Gate on hash correctness (LTO+PGO is new to this path; a fast wrong hash
       # is worse than a slow right one). --selftest exits 1 on pow("a") mismatch.
-      - name: Self-test (pow KAT) + smoke
+      - name: Version, self-test, and smoke
         run: |
+          test "$(./build/bin/dirtybird-miner-cpu --version)" = \
+            "Dirtybird Miner v${{ needs.verify.outputs.version }}"
           ./build/bin/dirtybird-miner-cpu --selftest
           ./build/bin/dirtybird-miner-cpu --help > /dev/null
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
 
       - name: Package
         run: bash ./scripts/release.sh "${{ needs.verify.outputs.tag }}" build dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-linux
           path: dist/*.tar.gz
@@ -160,8 +205,9 @@ jobs:
     needs: verify
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify.outputs.commit }}
           lfs: true
 
       - name: Install dependencies
@@ -179,8 +225,10 @@ jobs:
 
       # Gate on hash correctness (LTO+PGO is new to this path; a fast wrong hash
       # is worse than a slow right one). --selftest exits 1 on pow("a") mismatch.
-      - name: Self-test (pow KAT) + smoke
+      - name: Version, self-test, and smoke
         run: |
+          test "$(./build/bin/dirtybird-miner-cpu --version)" = \
+            "Dirtybird Miner v${{ needs.verify.outputs.version }}"
           ./build/bin/dirtybird-miner-cpu --selftest
           ./build/bin/dirtybird-miner-cpu --help > /dev/null
 
@@ -188,7 +236,7 @@ jobs:
         run: bash ./scripts/release-hiveos.sh "${{ needs.verify.outputs.tag }}" build dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-hiveos
           path: dist/*.tar.gz
@@ -200,13 +248,14 @@ jobs:
     needs: verify
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify.outputs.commit }}
           lfs: true
 
       # binfmt so the static aarch64 PGO trainer runs on the x86 runner.
       - name: Set up QEMU (arm64 binfmt)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
 
@@ -216,7 +265,10 @@ jobs:
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           export ANDROID_NDK_ROOT="$NDK"
           export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          git clone --depth 1 https://github.com/openssl/openssl ossl-src
+          git clone --depth 1 --branch openssl-3.5.7 \
+            https://github.com/openssl/openssl ossl-src
+          test "$(git -C ossl-src rev-parse HEAD)" = \
+            "8cf17aaeb4599f8af87fefd810b5b5fee90fe69e"
           cd ossl-src
           ./Configure android-arm64 -D__ANDROID_API__=24 no-shared no-tests no-docs \
             --prefix="$GITHUB_WORKSPACE/ossl-android"
@@ -240,17 +292,20 @@ jobs:
           export BUILD_DIR=build-android TRAIN_SECS=40 TRAIN_THREADS=4
           bash scripts/build-pgo.sh
 
-      - name: Verify ELF (aarch64)
+      - name: Verify ELF and embedded version (aarch64)
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h \
+          NDKBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$NDKBIN/llvm-readelf" -h \
             build-android/bin/dirtybird-miner-cpu | grep -iE 'Machine|Class'
+          "$NDKBIN/llvm-strings" build-android/bin/dirtybird-miner-cpu \
+            | grep -Fx "${{ needs.verify.outputs.version }}"
 
       - name: Package (Android)
         run: bash ./scripts/release-android.sh "${{ needs.verify.outputs.tag }}" build-android dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-android
           path: dist/*.tar.gz
@@ -260,59 +315,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [verify, build-windows, build-linux, build-hiveos, build-android]
-    # Publish as long as the (locally-verified) Windows build succeeded; a Linux
-    # build failure attaches Windows-only rather than blocking the whole release.
-    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.build-windows.result == 'success' }}
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify.outputs.commit }}
           fetch-depth: 0
           lfs: true
 
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release-windows
           path: artifacts
-
-      - name: Download Linux artifact
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: release-linux
-          path: artifacts
-
-      - name: Download HiveOS artifact
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: release-hiveos
-          path: artifacts
-
-      - name: Download Android artifact
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: release-android
-          path: artifacts
+          merge-multiple: true
 
       - name: Build release notes
         run: |
+          set -euo pipefail
+          TAG="${{ needs.verify.outputs.tag }}"
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
           {
-            echo "## DIRTYBIRD Miner ${{ needs.verify.outputs.tag }}"
+            echo "## DIRTYBIRD Miner $TAG"
             echo
             echo "Assets:"
-            echo "- dirtybird-miner-win64-${{ needs.verify.outputs.tag }}.zip"
-            echo "- dirtybird-miner-amd64-${{ needs.verify.outputs.tag }}.tar.gz"
+            echo "- dirtybird-miner-win64-$TAG.zip"
+            echo "- dirtybird-miner-amd64-$TAG.tar.gz"
+            echo "- dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
+            echo "- dirtybird-miner-${TAG}_aarch64_android.tar.gz"
             echo "- SHA256SUMS.txt"
             echo
             if [ -n "$PREV_TAG" ]; then
               echo "## Changes since $PREV_TAG"
-              git log --pretty=format:"- %s (%h)" "$PREV_TAG..${GITHUB_REF_NAME}"
+              git log --pretty=format:"- %s (%h)" "$PREV_TAG..HEAD"
             else
               echo "## Initial release"
               git log --pretty=format:"- %s (%h)" | head -20
@@ -320,23 +356,54 @@ jobs:
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
-      - name: Generate checksums
+      - name: Verify assets and generate checksums
         run: |
+          set -euo pipefail
+          TAG="${{ needs.verify.outputs.tag }}"
           cd artifacts
-          shopt -s nullglob
+          test -f "dirtybird-miner-win64-$TAG.zip"
+          test -f "dirtybird-miner-amd64-$TAG.tar.gz"
+          test -f "dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
+          test -f "dirtybird-miner-${TAG}_aarch64_android.tar.gz"
           sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: DIRTYBIRD Miner ${{ needs.verify.outputs.tag }}
-          body_path: RELEASE_NOTES.md
-          files: |
-            artifacts/*.zip
-            artifacts/*.tar.gz
-            artifacts/SHA256SUMS.txt
-          draft: false
-          prerelease: ${{ contains(needs.verify.outputs.tag, '-') }}
+      - name: Verify packaged Linux binary
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.verify.outputs.tag }}"
+          mkdir verify-linux
+          tar -xzf "artifacts/dirtybird-miner-amd64-$TAG.tar.gz" -C verify-linux
+          BIN="$(find verify-linux -type f -name dirtybird-miner-cpu -print -quit)"
+          test -n "$BIN"
+          test "$("$BIN" --version)" = "Dirtybird Miner v${{ needs.verify.outputs.version }}"
+          "$BIN" --selftest
+
+      - name: Create immutable-ready release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.verify.outputs.tag }}"
+          TAG_OBJECT="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG" --jq '.object.sha')"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$TAG_OBJECT" --jq '.object.sha')" = \
+            "${{ needs.verify.outputs.commit }}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$TAG_OBJECT" \
+            --jq '.verification.verified')" = "true"
+          ASSETS=(artifacts/*.zip artifacts/*.tar.gz artifacts/SHA256SUMS.txt)
+          gh release create "$TAG" "${ASSETS[@]}" \
+            --verify-tag --title "DIRTYBIRD Miner $TAG" \
+            --notes-file RELEASE_NOTES.md
+          test "$(gh release view "$TAG" --json isImmutable \
+            --jq '.isImmutable')" = true
+          for attempt in 1 2 3; do
+            ok=true
+            gh release verify "$TAG" || ok=false
+            for asset in "${ASSETS[@]}"; do
+              gh release verify-asset "$TAG" "$asset" || ok=false
+            done
+            $ok && exit 0
+            sleep 5
+          done
+          exit 1

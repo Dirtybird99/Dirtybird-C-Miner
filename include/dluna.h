@@ -52,7 +52,7 @@ enum {
  * a design mistake.
  */
 struct MinerState {
-    /* Job state (jobMutex protects blob/jobId/height on writes) */
+    /* Job state (jobMutex protects blob/jobId on writes) */
     std::atomic<uint64_t> jobEpoch{0};
     std::atomic<uint64_t> difficulty{0};
     std::atomic<bool>     connected{false};
@@ -61,7 +61,7 @@ struct MinerState {
     std::string blob;           /* hex, 96 chars */
     uint8_t     blobBin[48];    /* decoded binary */
     std::string jobId;
-    int64_t     height{0};
+    std::atomic<int64_t> height{0};
     std::mutex  jobMutex;
     std::condition_variable newJob;
 
@@ -106,7 +106,7 @@ void log_line(const char *level, const char *fmt, ...)
 #endif
 	;
 void dluna_console_init(void);
-bool dluna_is_tty(void);       /* stdout is an interactive console */
+bool dluna_is_tty(void);       /* stdout is an interactive VT-capable console */
 const char *dluna_clr_eol(void); /* ANSI erase-to-EOL, or "" when unavailable */
 
 /* Visible width of the console in columns. 0 means stdout is NOT a console (a
@@ -118,7 +118,7 @@ int dluna_term_cols(void);
 
 /* One reporter tick's worth of numbers, ready to render. */
 struct DlunaStatus {
-	double      rate;      /* instantaneous KH/s */
+	double      rate;      /* trailing 10-sample KH/s */
 	double      avg;       /* cumulative KH/s */
 	long long   height;
 	long long   accepted;  /* daemon "miniblocks" */
