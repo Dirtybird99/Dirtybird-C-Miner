@@ -45,19 +45,22 @@ jobs:
             exit 1
           fi
 
-          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
+          TAG_OBJECT="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG" \
+            --jq '.object.sha')"
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG" \
+              --jq '.object.type')" != "tag" ]; then
             echo "::error::$TAG must be an annotated tag"
             exit 1
           fi
 
           COMMIT="$(git rev-parse HEAD)"
-          TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
+          TAG_COMMIT="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
+            --jq '.object.sha')"
           if [ "$COMMIT" != "$TAG_COMMIT" ]; then
             echo "::error::Checkout $COMMIT does not match $TAG ($TAG_COMMIT)"
             exit 1
           fi
 
-          TAG_OBJECT="$(git rev-parse "refs/tags/$TAG")"
           if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
               --jq '.verification.verified')" != "true" ]; then
             echo "::error::$TAG does not have a signature verified by GitHub"
