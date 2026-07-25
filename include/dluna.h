@@ -22,10 +22,13 @@
 #include <windows.h>
 static inline void dluna_sleep_ms(int ms) { Sleep(ms); }
 #else
-#include <thread>
-#include <chrono>
+#include <poll.h>
+/* poll(nullptr, 0, ms) sleeps ms ms without calling nanosleep.
+ * The binary links --wrap=nanosleep to neutralise DRM penalty paths in the
+ * AstroSPSA library; this would make std::this_thread::sleep_for a no-op too,
+ * causing the reporter thread to busy-spin and compute rate = 0 always. */
 static inline void dluna_sleep_ms(int ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    ::poll(nullptr, 0, ms);
 }
 #endif
 
