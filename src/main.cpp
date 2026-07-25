@@ -69,8 +69,6 @@ bool from_hex(const std::string &hex, uint8_t *out, int max)
 extern "C" int __llvm_profile_write_file(void);
 #endif
 
-extern "C" uint64_t dluna_get_nanosleep_calls();
-
 namespace {
 
 struct HashrateTracker {

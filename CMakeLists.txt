@@ -128,9 +128,10 @@ set(CMAKE_C_FLAGS_RELEASE   "${BASE_C_FLAGS}")
 
 # ---- SHA-NI wrap flags ----
 # Redirect OpenSSL SHA256 calls to our SHA-NI hardware implementation.
-# The nanosleep wrap is a legacy link-compat no-op; the miner uses
-# Sleep()/dluna_sleep_ms (see include/dluna.h) for all timing.
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--wrap=SHA256_Init -Wl,--wrap=SHA256_Update -Wl,--wrap=SHA256_Final -Wl,--wrap=nanosleep")
+# (A legacy -Wl,--wrap=nanosleep lived here too; it neutralised
+# std::this_thread::sleep_for and broke every POSIX dluna_sleep_ms --
+# see test sleep_ms. Nothing linked here calls nanosleep anymore.)
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--wrap=SHA256_Init -Wl,--wrap=SHA256_Update -Wl,--wrap=SHA256_Final")
 
 # USE_ASTRO_SPSA gates the x86-only, AVX2 Tritonn verification path (and its
 # extra workerData fields). The live hash path (descriptor-SA / libsais /
