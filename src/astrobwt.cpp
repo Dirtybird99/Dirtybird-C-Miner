@@ -120,22 +120,6 @@ static inline uint8_t wolfBranch(uint8_t val, uint8_t pos2val, uint32_t opcode)
 	return val;
 }
 
-/* nanosleep override 2026-04-25 (via linker --wrap) — see dluna_hash().
- * The library's DRM penalty path calls nanosleep(50µs); the wrap below
- * makes it a no-op, removing the per-hash penalty. */
-#include <time.h>
-/* nanosleep no-op override — see dluna_hash().
- * The libastroSPSA library calls nanosleep ~25M times/sec from
- * multiple DRM check sites. Even with --wrap returning 0 immediately,
- * the function-call overhead alone caps hashrate at ~9.5 KH/s.
- * Single-site cmpb-immediate patches in the .a archive (see
- * pike-miner/lib/astrospsa/libastroSPSA_*PATCHED.a) didn't help —
- * the DRM is multi-layered. */
-extern "C" int __wrap_nanosleep(const struct timespec* /*req*/, struct timespec* /*rem*/) {
-	return 0;
-}
-extern "C" uint64_t dluna_get_nanosleep_calls() { return 0; }
-
 /* ---- AVX2 verify: test all 256 opcodes against scalar ---- */
 #if PIKE_HAS_AVX2_HEADER
 bool verify_avx2_wolf()

@@ -72,6 +72,14 @@ target_include_directories(test_statusline PRIVATE
 target_link_libraries(test_statusline PRIVATE dluna_runtime)
 dluna_copy_runtime_dlls(test_statusline)
 
+add_executable(test_sleep_ms test_sleep_ms.cpp)
+target_include_directories(test_sleep_ms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(test_sleep_ms PRIVATE dluna_runtime)
+dluna_copy_runtime_dlls(test_sleep_ms)
+
 add_test(NAME cap_format COMMAND test_cap_format)
 # Runs from the binary output dir, not this target's build dir: the test shells
 # out to "./dirtybird-miner-cpu-replay" by relative path, and every executable
@@ -97,6 +105,7 @@ add_test(NAME statusline_env_cols COMMAND test_statusline)
 set_tests_properties(statusline_env_cols PROPERTIES
     ENVIRONMENT "DIRTYBIRD_COLS=56"
 )
+add_test(NAME sleep_ms COMMAND test_sleep_ms)
 # Stage5 contract tests need a PowerShell driver plus a capture corpus, neither
 # of which ships in this repo. Registering them unconditionally made `ctest` fail
 # out of the box on a fresh clone with an error about a missing -File argument,

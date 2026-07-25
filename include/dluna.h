@@ -23,12 +23,14 @@
 static inline void dluna_sleep_ms(int ms) { Sleep(ms); }
 #else
 #include <poll.h>
-/* poll(nullptr, 0, ms) sleeps ms ms without calling nanosleep.
- * The binary links --wrap=nanosleep to neutralise DRM penalty paths in the
- * AstroSPSA library; this would make std::this_thread::sleep_for a no-op too,
- * causing the reporter thread to busy-spin and compute rate = 0 always. */
+/* poll(nullptr, 0, ms) sleeps ms milliseconds without touching the nanosleep
+ * symbol. A legacy -Wl,--wrap=nanosleep (DRM neutraliser for the proprietary
+ * AstroSPSA library, since removed) turned std::this_thread::sleep_for into a
+ * POSIX no-op: reporter busy-spin, 0.00 KH/s display, instant reconnect
+ * backoff. Test sleep_ms pins the contract that this really sleeps.
+ * ms <= 0 returns immediately -- poll(-1) would block forever. */
 static inline void dluna_sleep_ms(int ms) {
-    ::poll(nullptr, 0, ms);
+    if (ms > 0) ::poll(nullptr, 0, ms);
 }
 #endif
 
