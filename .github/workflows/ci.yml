@@ -290,8 +290,9 @@ jobs:
       # SC2059 notes. Errors are the ones that mean "this script is broken".
       - name: Shell script lint
         run: |
-          sudo apt-get update && sudo apt-get install -y shellcheck
+          sudo apt-get update && sudo apt-get install -y jq shellcheck
           for f in $(git ls-files '*.sh'); do
             bash -n "$f" || exit 1
           done
           shellcheck --severity=error $(git ls-files '*.sh')
+          bash tests/termux-setup-smoke.sh
