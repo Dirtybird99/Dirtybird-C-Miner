@@ -48,10 +48,15 @@ else()
     set(IS_CLANG FALSE)
 endif()
 
+# MinGW CMake can leave this empty outside a developer shell.
+if(NOT CMAKE_SYSTEM_PROCESSOR)
+    set(CMAKE_SYSTEM_PROCESSOR "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+endif()
+
 # ---- Base optimization flags (arch-aware) ----
 # x86-64: AVX2 baseline tuned for Raptor Lake; auto-vec off (icache/thermal, verified).
-# aarch64: ARMv8-A + crypto extensions (SHA/AES); the hot path uses the portable
-#          scalar/soft fallbacks (wolfBranch + sha256_block_soft), no x86 intrinsics.
+# aarch64: ARMv8-A + crypto extensions (SHA/AES); SHA uses OpenSSL's
+#          runtime-dispatched ARM implementation, with no x86 intrinsics.
 # -flto: +7.4% sustained on x86 (enabled by default for Release).
 # -O3 base: measured equivalent to -O2 under LTO+2-pass-PGO (2026-07-25,
 # 3x145s interleaved A/B on i7-13700HX @20T: 19.21 vs 19.08 KH/s, orderings
@@ -135,7 +140,9 @@ set(CMAKE_C_FLAGS_RELEASE   "${BASE_C_FLAGS}")
 # (A legacy -Wl,--wrap=nanosleep lived here too; it neutralised
 # std::this_thread::sleep_for and broke every POSIX dluna_sleep_ms --
 # see test sleep_ms. Nothing linked here calls nanosleep anymore.)
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--wrap=SHA256_Init -Wl,--wrap=SHA256_Update -Wl,--wrap=SHA256_Final")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--wrap=SHA256_Init -Wl,--wrap=SHA256_Update -Wl,--wrap=SHA256_Final")
+endif()
 
 # USE_ASTRO_SPSA gates the x86-only, AVX2 Tritonn verification path (and its
 # extra workerData fields). The live hash path (descriptor-SA / libsais /
@@ -186,7 +193,6 @@ endfunction()
 add_library(dluna_stages OBJECT
     src/astrobwt.cpp
     src/branch.cpp
-    src/sha256_ni.cpp
     src/salsa20.cpp
     src/libsais.c
     src/spsa.cpp
@@ -201,6 +207,7 @@ add_library(dluna_stages OBJECT
 # (aarch64) don't pull in <immintrin.h>.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
     target_sources(dluna_stages PRIVATE
+        src/sha256_ni.cpp
         src/spsa_tritonn.cpp
         src/spsa_tritonn_helpers.cpp
     )
