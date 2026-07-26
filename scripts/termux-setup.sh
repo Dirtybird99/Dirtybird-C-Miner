@@ -175,19 +175,25 @@ cd "$INSTALL_DIR"
 # HTTP fetcher for API calls (stdout): curl preferred, wget fallback
 fetch() {
     if command -v curl &>/dev/null; then
-        curl -fsSL "$1"
+        curl -fsSL --connect-timeout 5 --max-time 10 "$1"
     else
-        wget -qO- "$1"
+        wget -qO- -T 10 "$1"
     fi
 }
 
+latest_release_tag() {
+    fetch "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null || true
+}
+
 LATEST_TAG=""
-if [ "$FORCE_UPDATE" = false ] && [ -f "$VERSION_FILE" ]; then
-    info "Already installed ($(cat "$VERSION_FILE")). Use --update to upgrade."
+if [ "$FORCE_UPDATE" = false ] && [ -f "$VERSION_FILE" ] && [ -x "./$BINARY_NAME" ]; then
+    info "Using installed release marker: $(cat "$VERSION_FILE")."
+    info "Checking for updates..."
+    LATEST_TAG="$(latest_release_tag)"
 else
     info "Fetching latest release info..."
-    LATEST_TAG="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
-        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    LATEST_TAG="$(latest_release_tag)"
 
     if [ -z "$LATEST_TAG" ]; then
         err "Could not determine latest release. Check network connection."
@@ -244,6 +250,19 @@ else
     chmod +x "./$BINARY_NAME"
     echo "$LATEST_TAG" > "$VERSION_FILE"
     info "Installed $LATEST_TAG."
+fi
+
+if ! BINARY_VERSION="$(./"$BINARY_NAME" --version 2>/dev/null)" ||
+   [ -z "$BINARY_VERSION" ]; then
+    err "Installed miner could not report its version."
+    err "Run this script with --update to repair the installation."
+    exit 1
+fi
+
+if [ -n "$LATEST_TAG" ] && [ "$BINARY_VERSION" != "Dirtybird Miner $LATEST_TAG" ]; then
+    warn "Update available: $BINARY_VERSION -> Dirtybird Miner $LATEST_TAG."
+    warn "Update before benchmarking:"
+    note "curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/termux-setup.sh | bash -s -- --update"
 fi
 
 # ── step 4: pick a daemon / pool ─────────────────────────────────────────────
@@ -338,24 +357,27 @@ else
     info "Using existing config.json (use --reconfigure to change)."
 fi
 
-# ── step 8: battery / thermal advisory ────────────────────────────────────────
+# ── step 8: battery advisory ──────────────────────────────────────────────────
 if command -v termux-battery-status &>/dev/null; then
-    BAT_PCT="$(termux-battery-status 2>/dev/null | jq -r '.percentage // empty' 2>/dev/null || true)"
-    BAT_PLUGGED="$(termux-battery-status 2>/dev/null | jq -r '.plugged // empty' 2>/dev/null || true)"
+    BATTERY_JSON="$(termux-battery-status 2>/dev/null || true)"
+    BAT_PCT="$(printf '%s' "$BATTERY_JSON" | jq -r '.percentage // empty' 2>/dev/null || true)"
+    BAT_PLUGGED="$(printf '%s' "$BATTERY_JSON" | jq -r '.plugged // empty' 2>/dev/null || true)"
     if [ -n "$BAT_PCT" ] && [ "$BAT_PCT" -lt 40 ] 2>/dev/null; then
         warn "Battery is ${BAT_PCT}%. Mining drains battery fast; consider charging."
     fi
-    if [ "$BAT_PLUGGED" != "PLUGGED_TYPE_AC" ] && [ "$BAT_PLUGGED" != "PLUGGED_TYPE_USB" ] 2>/dev/null; then
-        warn "Device is not charging. Thermal throttling may reduce hashrate."
+    if [ "$BAT_PLUGGED" = "UNPLUGGED" ]; then
+        warn "Device is running on battery power. Mining drains battery fast."
     fi
 fi
 
 # ── step 9: acquire wake-lock ────────────────────────────────────────────────
 WAKE_LOCK=false
 if command -v termux-wake-lock &>/dev/null; then
-    termux-wake-lock 2>/dev/null && WAKE_LOCK=true || true
-    if [ "$WAKE_LOCK" = true ]; then
+    if termux-wake-lock 2>/dev/null; then
+        WAKE_LOCK=true
         info "Wake-lock acquired (Android Doze will not suspend the miner)."
+    else
+        warn "Could not acquire wake-lock. Android Doze may pause the miner in background."
     fi
 else
     note "Install termux-api + 'pkg install termux-api' for wake-lock support."
@@ -364,6 +386,7 @@ fi
 
 # ── step 10: run with auto-restart ────────────────────────────────────────────
 printf "\n"
+printf "  Version:  ${GREEN}%s${NC}\n" "$BINARY_VERSION"
 printf "  Pool:     ${GREEN}%s${NC}\n" "$(jq -r '.["daemon-address"]' config.json)"
 printf "  Wallet:   ${GREEN}%s${NC}\n" "$(jq -r '.wallet' config.json)"
 printf "  Threads:  ${GREEN}%s${NC}\n" "$(jq -r '.threads' config.json)"
