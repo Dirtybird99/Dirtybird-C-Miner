@@ -305,10 +305,24 @@ if [ "$RECONFIGURE" = true ] || [ ! -f "config.json" ]; then
         exit 1
     fi
 
-    # ── step 6: detect threads (nproc - 1, minimum 1) ───────────────────────
+    # ── step 6: choose threads (nproc - 1 by default, minimum 1) ────────────
     CORES="$(nproc 2>/dev/null || echo 4)"
-    THREADS=$((CORES - 1))
-    [ "$THREADS" -lt 1 ] && THREADS=1
+    DEFAULT_THREADS=$((CORES - 1))
+    [ "$DEFAULT_THREADS" -lt 1 ] && DEFAULT_THREADS=1
+
+    printf "\n"
+    printf "${CYAN}Mining threads${NC}\n"
+    while true; do
+        read -rp "  Threads [${DEFAULT_THREADS}] (1-${CORES}): " INPUT_THREADS </dev/tty ||
+            INPUT_THREADS=""
+        INPUT_THREADS="${INPUT_THREADS:-$DEFAULT_THREADS}"
+        if printf '%s' "$INPUT_THREADS" | grep -qE '^[1-9][0-9]*$' &&
+           [ "$INPUT_THREADS" -le "$CORES" ]; then
+            THREADS="$INPUT_THREADS"
+            break
+        fi
+        warn "Enter a number from 1 to $CORES."
+    done
 
     # ── step 7: write config.json ────────────────────────────────────────────
     cat > config.json <<EOF

@@ -81,8 +81,9 @@ bash scripts/termux-setup.sh --uninstall  # remove installed files
 ```
 
 Requirements: Termux (aarch64 / 64-bit ARM only). Install `termux-api` in Termux for
-wake-lock support. Use `-p max` only when charging (headless) — `-p normal` is
-thermal-safe for mobile.
+wake-lock support. On Android, `-p max` is currently a no-op because priority tuning
+is Windows-only. Use the installer thread prompt (or `-t`) to balance hashrate,
+temperature, and battery use.
 
 ## License
 
