@@ -152,10 +152,10 @@ jobs:
         with:
           platforms: arm64
 
-      # Build + run the pow("a") KAT inside a native arm64 userland (emulated).
+      # Build + run the ARM checks inside a native arm64 userland (emulated).
       # Native arm64 apt provides arm64 OpenSSL, so no cross-compile/cross-apt
       # gymnastics; --selftest exits 0 only if the ARM hashes match the KAT.
-      - name: Build + pow(a) KAT in arm64 container
+      - name: Build + test in arm64 container
         run: |
           docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src arm64v8/ubuntu:24.04 bash -c '
             set -e
@@ -165,10 +165,24 @@ jobs:
             cmake -S . -B build-arm64 -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-            cmake --build build-arm64 --target dirtybird-miner-cpu --parallel
+            cmake --build build-arm64 \
+              --target dirtybird-miner-cpu dirtybird-pgo-train test_stage5_descriptor \
+              --parallel
             echo "=== arch: $(uname -m) ==="
             echo "=== pow(a) KAT (native arm64) ==="
             ./build-arm64/bin/dirtybird-miner-cpu --selftest
+            echo "=== stage5 descriptor ==="
+            ./build-arm64/bin/test_stage5_descriptor
+            echo "=== benchmark warmup ==="
+            ./build-arm64/bin/dirtybird-pgo-train \
+              -t 1 --warmup-seconds 1 --seconds 1 --rotate-ms 0 |
+              tee benchmark.log
+            grep -Eq "^benchmark_result threads=1 warmup_s=1 elapsed_s=[0-9.]+ hashes=[1-9][0-9]* kh_s=[0-9.]+" benchmark.log
+            echo "=== profiler unit ==="
+            DLUNA_PROFILE=1 ./build-arm64/bin/dirtybird-pgo-train \
+              -t 1 --seconds 300 --hashes 1024 --rotate-ms 0 |
+              tee profiler.log
+            grep -Eq "^\[PROF tid=.* ns/hash=[1-9][0-9]*" profiler.log
           '
 
   build-android:
@@ -188,7 +202,10 @@ jobs:
           echo "Using NDK: $NDK"
           export ANDROID_NDK_ROOT="$NDK"
           export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          git clone --depth 1 https://github.com/openssl/openssl ossl-src
+          git clone --depth 1 --branch openssl-3.5.7 \
+            https://github.com/openssl/openssl ossl-src
+          test "$(git -C ossl-src rev-parse HEAD)" = \
+            "8cf17aaeb4599f8af87fefd810b5b5fee90fe69e"
           cd ossl-src
           ./Configure android-arm64 -D__ANDROID_API__=24 no-shared no-tests no-docs \
             --prefix="$GITHUB_WORKSPACE/ossl-android"
@@ -213,13 +230,28 @@ jobs:
             -DDIRTYBIRD_VERSION=0.0.0-ci
 
       - name: Build
-        run: cmake --build build-android --target dirtybird-miner-cpu --parallel
+        run: |
+          cmake --build build-android \
+            --target dirtybird-miner-cpu dirtybird-pgo-train \
+            --parallel
 
-      - name: Verify ELF (aarch64)
+      - name: Verify ELFs (aarch64)
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          "$READELF" -h build-android/bin/dirtybird-miner-cpu | grep -iE 'Machine|Class'
+          for binary in dirtybird-miner-cpu dirtybird-pgo-train; do
+            "$READELF" -h "build-android/bin/$binary" |
+              grep -q 'Machine:.*AArch64'
+          done
+
+      - name: Upload Android test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtybird-miner-android-arm64-ci
+          path: |
+            build-android/bin/dirtybird-miner-cpu
+            build-android/bin/dirtybird-pgo-train
+          retention-days: 7
 
   lint:
     name: Repo Hygiene
