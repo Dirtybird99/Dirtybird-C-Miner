@@ -85,11 +85,6 @@ public:
 
   bool isSame = false;
 
-  #ifndef USE_ASTRO_SPSA
-  int bA[256];
-  int bB[256*256];
-  #endif
-
   byte step_3[256];
   /* Note 2026-04-25: tried alignas(64) on sData — caused slight regression
    * vs natural alignment (likely padding overhead exceeded benefit). */

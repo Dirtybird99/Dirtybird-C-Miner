@@ -34,9 +34,6 @@ static inline void dluna_sleep_ms(int ms) {
 }
 #endif
 
-/* Feature flags -- compile-time, not runtime knobs. */
-#define USE_ASTRO_SPSA 1
-
 #include "astroworker.h"
 
 /*
