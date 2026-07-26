@@ -202,7 +202,10 @@ jobs:
           echo "Using NDK: $NDK"
           export ANDROID_NDK_ROOT="$NDK"
           export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          git clone --depth 1 https://github.com/openssl/openssl ossl-src
+          git clone --depth 1 --branch openssl-3.5.7 \
+            https://github.com/openssl/openssl ossl-src
+          test "$(git -C ossl-src rev-parse HEAD)" = \
+            "8cf17aaeb4599f8af87fefd810b5b5fee90fe69e"
           cd ossl-src
           ./Configure android-arm64 -D__ANDROID_API__=24 no-shared no-tests no-docs \
             --prefix="$GITHUB_WORKSPACE/ossl-android"
