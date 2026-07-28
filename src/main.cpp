@@ -199,18 +199,31 @@ static void reporter_thread()
 			 * phone terminal). dluna_format_status() picks the widest layout that
 			 * fits, re-querying the width each tick so a resize re-fits within a
 			 * second. Ends with \033[0m + \033[K and NO trailing pad. */
-			char line[512];
-			DlunaStatus st{};
-			st.rate     = rate;
-			st.avg      = avg;
-			st.height   = (long long)G.height.load(std::memory_order_relaxed);
-			st.accepted = (long long)G.accepted.load();
-			st.blocks   = (long long)G.blocks.load();
-			st.rejected = (long long)G.rejected.load();
-			st.diff     = diffbuf;
-			st.hh = hh; st.mm = mm; st.ss = ss;
-			dluna_format_status(line, sizeof line, st, dluna_term_cols());
-			fputs(line, stdout);
+			/* Nothing is being hashed while disconnected or before the
+			 * first job, so the rate is a real zero that says nothing
+			 * the logs have not already said. Only the interactive row
+			 * is gated: the redirected branch below keeps emitting one
+			 * record per tick, because that stream is machine-parsed
+			 * (HiveOS) and a run of 0.00 there is the correct report
+			 * while a gap is not. Rate accumulation above is untouched,
+			 * so the readout does not have to climb back after a
+			 * reconnect. */
+			if (dluna_status_row_visible(
+			        G.connected.load(std::memory_order_relaxed),
+			        (unsigned long long)G.jobEpoch.load(std::memory_order_relaxed))) {
+				char line[512];
+				DlunaStatus st{};
+				st.rate     = rate;
+				st.avg      = avg;
+				st.height   = (long long)G.height.load(std::memory_order_relaxed);
+				st.accepted = (long long)G.accepted.load();
+				st.blocks   = (long long)G.blocks.load();
+				st.rejected = (long long)G.rejected.load();
+				st.diff     = diffbuf;
+				st.hh = hh; st.mm = mm; st.ss = ss;
+				dluna_format_status(line, sizeof line, st, dluna_term_cols());
+				fputs(line, stdout);
+			}
 		} else {
 			/* Redirected to a file/pipe: same fields, no ANSI, newline-terminated. */
 			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "

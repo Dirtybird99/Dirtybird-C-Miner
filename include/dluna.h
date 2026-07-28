@@ -143,6 +143,29 @@ struct DlunaStatus {
  * (excluding the NUL). */
 size_t dluna_format_status(char *out, size_t cap, const DlunaStatus &s, int cols);
 
+/* Whether the live status row has anything true to report this tick.
+ *
+ * A displayed 0.00 KH/s is not a rare fault -- it is what every launch prints.
+ * getwork sends no job at connect time (the first arrives on a dispatch tick
+ * ~500ms later), so dial + TLS + upgrade + first job is ~1-3s of genuine zero
+ * and the first tick at t=1s lands inside it. Reconnect is the same story.
+ *
+ * No DERO miner in the ecosystem displays a live zero. tnn-miner suppresses its
+ * row two ways ("if (!isConnected) return 1;" in src/core/reporter.cpp:31, plus
+ * a first-hashrate gate commented "Mining hasn't started yet - don't print
+ * status, just accumulate stats"); 8lecramm/dero-c-miner calls print_status
+ * only from inside the worker thread, after the job check; DEROFDN/netrunner's
+ * GUI shows a grey "---" placeholder and a separate "Offline" label.
+ *
+ * Suppressing beats naming the reason because the transitions are already
+ * logged, and log_line() emits \r + erase first -- so a log record wipes any
+ * row already on screen instead of leaving a stale one. Pure, so it is directly
+ * unit-testable alongside dluna_format_status(). */
+static inline bool dluna_status_row_visible(bool connected, unsigned long long jobEpoch)
+{
+	return connected && jobEpoch > 0;
+}
+
 /* Thread entry points */
 void mine_thread(int tid);
 void network_thread(void);
