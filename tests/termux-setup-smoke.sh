@@ -46,8 +46,14 @@ exit 99
 EOF
 done
 
+# TEST_TERMUX_HANG reproduces the real-world case the timeout guards exist for:
+# the termux-api PACKAGE installed (so `command -v` succeeds) but the companion
+# APP absent, where every termux-* call blocks forever.
 cat > "$FAKE_BIN/termux-battery-status" <<'EOF'
 #!/usr/bin/env bash
+if [ "${TEST_TERMUX_HANG:-0}" = 1 ]; then
+    sleep 300
+fi
 printf '{"percentage":80,"plugged":"%s"}\n' "${TEST_PLUGGED:-PLUGGED_USB}"
 EOF
 
@@ -133,6 +139,44 @@ fi
 
 if [ -e "$TEST_UNLOCK_MARKER" ]; then
     echo "wake unlock ran even though wake lock acquisition failed" >&2
+    exit 1
+fi
+
+# A hung termux-api must not stall the installer. Without the `timeout` guards
+# this call blocks before mining ever starts, so the phone sits idle with no
+# output and no error -- 20s here is ~4x the 5s guard and far below the stub's
+# 300s sleep, so it cannot pass by accident.
+set +e
+timeout 20 env HOME="$TEST_DIR/home" PATH="$FAKE_BIN:$PATH" \
+    TEST_TERMUX_HANG=1 bash "$ROOT/scripts/termux-setup.sh" >/dev/null 2>&1
+HANG_RC=$?
+set -e
+if [ "$HANG_RC" -eq 124 ]; then
+    echo "installer hung on a blocked termux-api call (missing timeout guard)" >&2
+    exit 1
+fi
+
+# The wallet regex is the ONLY guard against a truncated paste: the miner itself
+# checks only that the address is non-empty, so a short wallet mines to nobody
+# and is discovered hours later.
+if ! grep -q 'a-z0-9\]{60,}' "$ROOT/scripts/termux-setup.sh"; then
+    echo "wallet validation lost its length floor" >&2
+    exit 1
+fi
+if printf 'dero1abc' | grep -qE '^(dero1|deto1)[a-z0-9]{60,}$'; then
+    echo "truncated wallet accepted by the validation pattern" >&2
+    exit 1
+fi
+if ! printf 'dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y' \
+        | grep -qE '^(dero1|deto1)[a-z0-9]{60,}$'; then
+    echo "a real wallet address is rejected by the validation pattern" >&2
+    exit 1
+fi
+
+# The documented one-liner pipes straight into bash, so it must fail closed:
+# without -f, GitHub's 404/rate-limit HTML body is handed to the shell.
+if grep -qE 'curl -[a-zA-Z]*sL[a-zA-Z]* .*termux-setup\.sh' "$ROOT/README.md"; then
+    echo "README pipes an unchecked curl into bash -- use curl -fsSL" >&2
     exit 1
 fi
 

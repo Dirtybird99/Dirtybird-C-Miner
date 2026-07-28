@@ -317,10 +317,13 @@ if [ "$RECONFIGURE" = true ] || [ ! -f "config.json" ]; then
     read -rp "  Wallet: " INPUT_WALLET </dev/tty
     WALLET="${INPUT_WALLET:-$DEFAULT_WALLET}"
 
-    # validate wallet format
-    if ! printf '%s' "$WALLET" | grep -qE '^(dero1|deto1)[a-z0-9]+$'; then
+    # Validate wallet format. The length floor matters: the miner itself only
+    # checks the address is non-empty, so this regex is the sole guard against
+    # a truncated paste -- which otherwise mines to nobody until someone
+    # notices hours later. A real address is 66 characters.
+    if ! printf '%s' "$WALLET" | grep -qE '^(dero1|deto1)[a-z0-9]{60,}$'; then
         err "Invalid wallet address: $WALLET"
-        err "Must start with 'dero1' or 'deto1' followed by lowercase alphanumerics."
+        err "Must start with 'dero1' or 'deto1' followed by 60+ lowercase alphanumerics."
         exit 1
     fi
 
@@ -358,8 +361,12 @@ else
 fi
 
 # ── step 8: battery advisory ──────────────────────────────────────────────────
+# Every termux-* call is wrapped in `timeout`: `command -v` only proves the
+# termux-api PACKAGE is installed, not that the companion APP is present. With
+# the package but no app, these block indefinitely -- and this one runs before
+# mining starts, so the phone would sit idle with no output and no error.
 if command -v termux-battery-status &>/dev/null; then
-    BATTERY_JSON="$(termux-battery-status 2>/dev/null || true)"
+    BATTERY_JSON="$(timeout 5 termux-battery-status 2>/dev/null || true)"
     BAT_PCT="$(printf '%s' "$BATTERY_JSON" | jq -r '.percentage // empty' 2>/dev/null || true)"
     BAT_PLUGGED="$(printf '%s' "$BATTERY_JSON" | jq -r '.plugged // empty' 2>/dev/null || true)"
     if [ -n "$BAT_PCT" ] && [ "$BAT_PCT" -lt 40 ] 2>/dev/null; then
@@ -373,7 +380,7 @@ fi
 # ── step 9: acquire wake-lock ────────────────────────────────────────────────
 WAKE_LOCK=false
 if command -v termux-wake-lock &>/dev/null; then
-    if termux-wake-lock 2>/dev/null; then
+    if timeout 5 termux-wake-lock 2>/dev/null; then
         WAKE_LOCK=true
         info "Wake-lock acquired (Android Doze will not suspend the miner)."
     else
@@ -397,7 +404,7 @@ printf "\n"
 
 release_lock() {
     if [ "$WAKE_LOCK" = true ]; then
-        termux-wake-unlock 2>/dev/null || true
+        timeout 5 termux-wake-unlock 2>/dev/null || true
         info "Wake-lock released."
     fi
 }
