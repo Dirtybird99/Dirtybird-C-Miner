@@ -68,7 +68,7 @@ which at phone hashrates means hours between rewards — the counters sit at zer
 enough to look broken, even though nothing is wrong.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-C-Miner/master/scripts/termux-setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-C-Miner/master/scripts/termux-setup.sh | bash
 ```
 
 Or run it directly from a checkout:
