@@ -238,8 +238,12 @@ static void reporter_thread()
 		 * submitted ~ acc with ~0 stale/sendfail => healthy; high stale or
 		 * sendfail, or submitted >> acc, points at a real submit/accept problem. */
 		if (g_verbose) {
-			printf("\n[funnel] submitted:%lld acc:%lld rej:%lld "
+			/* found should equal stale + dropped + submitted + sendfail. The
+			 * single-slot mailbox could not satisfy that identity: it destroyed
+			 * shares without counting them anywhere. */
+			printf("\n[funnel] found:%lld queued:%lld submitted:%lld acc:%lld rej:%lld "
 			       "stale:%lld sendfail:%lld dropped:%lld\n",
+			       (long long)G.found.load(), (long long)G.enqueued.load(),
 			       (long long)G.submitted.load(), (long long)G.accepted.load(),
 			       (long long)G.rejected.load(), (long long)G.staleDrops.load(),
 			       (long long)G.sendFails.load(), (long long)G.submitDrops.load());
