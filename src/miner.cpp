@@ -36,10 +36,8 @@ static void submit_share(const uint8_t *blob, int blob_len,
         return;
     }
 
-    G.submitJobId = jobId;
-    G.submitBlob  = std::move(hex);
-    G.submitEpoch = jobEpoch;
-    G.submitReady.store(true, std::memory_order_release);
+    /* Counts the share this write destroys, if one was still waiting. */
+    dluna_mailbox_stage(G, jobId, std::move(hex), jobEpoch);
 }
 
 /* ---- mining thread ---- */

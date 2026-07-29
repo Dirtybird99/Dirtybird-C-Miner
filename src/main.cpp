@@ -239,10 +239,10 @@ static void reporter_thread()
 		 * sendfail, or submitted >> acc, points at a real submit/accept problem. */
 		if (g_verbose) {
 			printf("\n[funnel] submitted:%lld acc:%lld rej:%lld "
-			       "stale:%lld sendfail:%lld\n",
+			       "stale:%lld sendfail:%lld dropped:%lld\n",
 			       (long long)G.submitted.load(), (long long)G.accepted.load(),
 			       (long long)G.rejected.load(), (long long)G.staleDrops.load(),
-			       (long long)G.sendFails.load());
+			       (long long)G.sendFails.load(), (long long)G.submitDrops.load());
 		}
 		fflush(stdout);
 
