@@ -85,6 +85,13 @@ struct MinerState {
     std::atomic<int64_t> submitted{0};
     std::atomic<int64_t> sendFails{0};
     std::atomic<int64_t> staleDrops{0};
+    /* Shares destroyed because one was still waiting in the single-slot
+     * mailbox when the next was found. Without this the loss is invisible:
+     * staleDrops only counts epoch mismatches, so the funnel identity
+     *   submitted + staleDrops + sendFails + submitDrops == shares found
+     * silently failed to balance and there was no way to tell from a running
+     * rig whether the mailbox depth of 1 was costing anything. */
+    std::atomic<int64_t> submitDrops{0};
 
     /* Config -- set once at startup, read-only after.
      * Defaults let the binary run with no args; override via -d/-w. */
@@ -96,6 +103,33 @@ struct MinerState {
 
 extern MinerState G;
 extern bool       g_has_avx2;
+
+/* Stage a found share into the single-slot mailbox. THE CALLER MUST HOLD
+ * G.submitMutex.
+ *
+ * Returns false when a share was already waiting: that share is destroyed by
+ * this write and can never be sent. The network thread drains one share per
+ * recv iteration on the 50ms poll, so two discoveries inside ~50ms collide.
+ * That is negligible at solo difficulty and materially more likely against a
+ * pool, where difficulty is low and shares arrive seconds apart.
+ *
+ * The overwrite is not fixed here -- it is only made VISIBLE, so the question
+ * "does mailbox depth 1 actually cost payouts on real rigs?" can be answered
+ * from submitDrops instead of argued from first principles. Split out of
+ * submit_share() so it is unit-testable without a live miner. */
+static inline bool dluna_mailbox_stage(MinerState &st, const std::string &jobId,
+                                       std::string blobHex, uint64_t jobEpoch)
+{
+	const bool overwrote = st.submitReady.load(std::memory_order_acquire);
+	if (overwrote)
+		st.submitDrops.fetch_add(1, std::memory_order_relaxed);
+
+	st.submitJobId = jobId;
+	st.submitBlob  = std::move(blobHex);
+	st.submitEpoch = jobEpoch;
+	st.submitReady.store(true, std::memory_order_release);
+	return !overwrote;
+}
 
 /* Console output coordination.
  *   g_console_mtx -- serializes every write to the console so timestamped
