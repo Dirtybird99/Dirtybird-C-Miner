@@ -304,6 +304,14 @@ static const int CONNECT_TIMEOUT_MS = 10000;
  * (but legitimate) read doesn't trip it. */
 static const long long CONNECT_DEADLINE_MS = 20000;
 
+/* True once THIS session has received a job. Until then the miner is still
+ * hashing the previous session's work, and any share it finds is for a job the
+ * new daemon connection never issued -- jobEpoch is monotonic across
+ * reconnects, so the per-item epoch check cannot tell the difference. Gating
+ * the drain on this is what actually takes cross-session replay to zero;
+ * clearing the queue at connect only shrinks the window. */
+static std::atomic<bool> g_session_has_job{false};
+
 static void cleanup(void)
 {
 	if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = nullptr; }
@@ -434,6 +442,26 @@ static bool ws_connect(void)
 	}
 
 	set_timeout_ms(g_sock, 50);
+
+	/* Discard anything staged while we were down, immediately before this
+	 * session can send. cleanup() already cleared the queue, but that runs
+	 * BEFORE the dial: workers never stop mining, so they refill it throughout
+	 * the TCP+TLS+upgrade window and those shares would be the first thing sent
+	 * on the new connection.
+	 *
+	 * The per-item epoch check cannot catch these: jobEpoch is monotonic across
+	 * reconnects, so a share staged moments ago still matches the current
+	 * epoch. Clearing here is necessary but NOT sufficient on its own -- see
+	 * g_session_has_job below. */
+	{
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		if (!G.submitQueue.empty()) {
+			G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+			G.submitQueue.clear();
+		}
+	}
+	g_session_has_job.store(false, std::memory_order_release);
+
 	G.connected.store(true);
 	long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - connect_start).count();
@@ -598,6 +626,7 @@ static bool handle_job(const std::string &json)
 
 		if (workChanged)
 			G.jobEpoch.fetch_add(1);
+			g_session_has_job.store(true, std::memory_order_release);
 	}
 
 	if (workChanged) {
@@ -619,6 +648,17 @@ static bool submit_share(void)
 	/* Drain the WHOLE queue per call. Swap it out under the lock, then send
 	 * outside the lock: ws_send_text() does a blocking SSL_write, and holding
 	 * submitMutex across it would stall every enqueuing miner thread. */
+	/* Nothing may be sent before this session has issued a job: whatever is
+	 * queued was found against the previous session's work. */
+	if (!g_session_has_job.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		if (!G.submitQueue.empty()) {
+			G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+			G.submitQueue.clear();
+		}
+		return true;
+	}
+
 	std::deque<MinerState::PendingSubmit> batch;
 	{
 		std::lock_guard<std::mutex> lk(G.submitMutex);
