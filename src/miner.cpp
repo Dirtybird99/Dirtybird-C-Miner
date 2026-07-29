@@ -20,6 +20,8 @@ __attribute__((cold))
 static void submit_share(const uint8_t *blob, int blob_len,
                          const std::string &jobId, uint64_t jobEpoch)
 {
+    G.found.fetch_add(1, std::memory_order_relaxed);  /* every find, before any gate */
+
     /* stale gate 1: job changed while we were hashing */
     if (G.jobEpoch.load(std::memory_order_acquire) != jobEpoch) {
         G.staleDrops.fetch_add(1, std::memory_order_relaxed);
@@ -36,10 +38,10 @@ static void submit_share(const uint8_t *blob, int blob_len,
         return;
     }
 
-    G.submitJobId = jobId;
-    G.submitBlob  = std::move(hex);
-    G.submitEpoch = jobEpoch;
-    G.submitReady.store(true, std::memory_order_release);
+    /* Enqueue rather than overwrite: with 20+ threads, two near-simultaneous
+     * finds must both reach the network thread. Counts an eviction if the queue
+     * is somehow full, which at depth 32 means the drain has stopped. */
+    dluna_submit_enqueue(G, jobId, std::move(hex), jobEpoch);
 }
 
 /* ---- mining thread ---- */

@@ -199,18 +199,31 @@ static void reporter_thread()
 			 * phone terminal). dluna_format_status() picks the widest layout that
 			 * fits, re-querying the width each tick so a resize re-fits within a
 			 * second. Ends with \033[0m + \033[K and NO trailing pad. */
-			char line[512];
-			DlunaStatus st{};
-			st.rate     = rate;
-			st.avg      = avg;
-			st.height   = (long long)G.height.load(std::memory_order_relaxed);
-			st.accepted = (long long)G.accepted.load();
-			st.blocks   = (long long)G.blocks.load();
-			st.rejected = (long long)G.rejected.load();
-			st.diff     = diffbuf;
-			st.hh = hh; st.mm = mm; st.ss = ss;
-			dluna_format_status(line, sizeof line, st, dluna_term_cols());
-			fputs(line, stdout);
+			/* Nothing is being hashed while disconnected or before the
+			 * first job, so the rate is a real zero that says nothing
+			 * the logs have not already said. Only the interactive row
+			 * is gated: the redirected branch below keeps emitting one
+			 * record per tick, because that stream is machine-parsed
+			 * (HiveOS) and a run of 0.00 there is the correct report
+			 * while a gap is not. Rate accumulation above is untouched,
+			 * so the readout does not have to climb back after a
+			 * reconnect. */
+			if (dluna_status_row_visible(
+			        G.connected.load(std::memory_order_relaxed),
+			        (unsigned long long)G.jobEpoch.load(std::memory_order_relaxed))) {
+				char line[512];
+				DlunaStatus st{};
+				st.rate     = rate;
+				st.avg      = avg;
+				st.height   = (long long)G.height.load(std::memory_order_relaxed);
+				st.accepted = (long long)G.accepted.load();
+				st.blocks   = (long long)G.blocks.load();
+				st.rejected = (long long)G.rejected.load();
+				st.diff     = diffbuf;
+				st.hh = hh; st.mm = mm; st.ss = ss;
+				dluna_format_status(line, sizeof line, st, dluna_term_cols());
+				fputs(line, stdout);
+			}
 		} else {
 			/* Redirected to a file/pipe: same fields, no ANSI, newline-terminated. */
 			printf("[DIRTYBIRD] %.2f KH/s (%.2f KH/s avg) | Height:%lld | "
@@ -225,11 +238,15 @@ static void reporter_thread()
 		 * submitted ~ acc with ~0 stale/sendfail => healthy; high stale or
 		 * sendfail, or submitted >> acc, points at a real submit/accept problem. */
 		if (g_verbose) {
-			printf("\n[funnel] submitted:%lld acc:%lld rej:%lld "
-			       "stale:%lld sendfail:%lld\n",
+			/* found should equal stale + dropped + submitted + sendfail. The
+			 * single-slot mailbox could not satisfy that identity: it destroyed
+			 * shares without counting them anywhere. */
+			printf("\n[funnel] found:%lld queued:%lld submitted:%lld acc:%lld rej:%lld "
+			       "stale:%lld sendfail:%lld dropped:%lld\n",
+			       (long long)G.found.load(), (long long)G.enqueued.load(),
 			       (long long)G.submitted.load(), (long long)G.accepted.load(),
 			       (long long)G.rejected.load(), (long long)G.staleDrops.load(),
-			       (long long)G.sendFails.load());
+			       (long long)G.sendFails.load(), (long long)G.submitDrops.load());
 		}
 		fflush(stdout);
 
@@ -519,6 +536,21 @@ int main(int argc, char **argv)
 	/* Signal handlers */
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+#ifndef _WIN32
+	/* SSL_write() to a peer that has gone away raises SIGPIPE, and its default
+	 * action TERMINATES the process. Without this the miner died outright on
+	 * every dropped connection -- exit 141 -- so none of the reconnect logic
+	 * below (backoff, useful-session gate, send-failure redial) could ever run
+	 * on Linux or Android. Measured: killing the daemon mid-send exited the
+	 * miner in under a second with a single "Connecting" line in its log.
+	 *
+	 * It survived this long because Windows has no SIGPIPE and that is the
+	 * primary development platform; the failure is invisible there. The zig
+	 * sibling handles the same hazard with MSG_NOSIGNAL per send (net.zig).
+	 * Ignoring it process-wide is the portable equivalent: SSL_write then
+	 * returns -1/EPIPE and the existing error path reconnects. */
+	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	/* Spawn threads */
 	std::thread net(network_thread);
