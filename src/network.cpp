@@ -309,6 +309,17 @@ static void cleanup(void)
 	if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = nullptr; }
 	if (g_sock != SOCK_INVALID) { sock_close(g_sock); g_sock = SOCK_INVALID; }
 	G.connected.store(false);
+	/* Drop anything still queued. jobEpoch is monotonic across reconnects, so an
+	 * item staged on the dead session can still match the current epoch and would
+	 * be sent onto the fresh connection -- the per-item check cannot catch it.
+	 * They are stale on the new session regardless, so dropping is correct.
+	 * (The Go sibling had exactly this bug: its submit channel outlived the
+	 * connection with no equivalent clear, and replayed the backlog on redial.) */
+	{
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+		G.submitQueue.clear();
+	}
 }
 
 static bool ws_connect(void)
@@ -605,42 +616,47 @@ static bool handle_job(const std::string &json)
  * be stale on the new connection anyway. */
 static bool submit_share(void)
 {
-	std::string jid, blob;
-	uint64_t epoch;
-
+	/* Drain the WHOLE queue per call. Swap it out under the lock, then send
+	 * outside the lock: ws_send_text() does a blocking SSL_write, and holding
+	 * submitMutex across it would stall every enqueuing miner thread. */
+	std::deque<MinerState::PendingSubmit> batch;
 	{
 		std::lock_guard<std::mutex> lk(G.submitMutex);
-		if (!G.submitReady.load()) return true;
-		jid   = G.submitJobId;
-		blob  = G.submitBlob;
-		epoch = G.submitEpoch;
-		G.submitReady.store(false);
+		if (G.submitQueue.empty()) return true;
+		batch.swap(G.submitQueue);
 	}
 
-	/* Stale check */
-	if (epoch != G.jobEpoch.load()) {
-		G.staleDrops.fetch_add(1);
-		if (g_verbose)
-			log_line("INFO", "stale share dropped (epoch %llu vs %llu)",
-				(unsigned long long)epoch, (unsigned long long)G.jobEpoch.load());
-		return true;
-	}
+	const uint64_t curEpoch = G.jobEpoch.load();
+	for (const auto &item : batch) {            /* FIFO: oldest find first */
+		/* Per-item stale check: the job may have changed between this share
+		 * being queued and the drain reaching it. */
+		if (item.epoch != curEpoch) {
+			G.staleDrops.fetch_add(1);
+			if (g_verbose)
+				log_line("INFO", "stale share dropped (epoch %llu vs %llu)",
+					(unsigned long long)item.epoch, (unsigned long long)curEpoch);
+			continue;
+		}
 
-	/* Build JSON manually -- no allocator overhead */
-	char json[512];
-	snprintf(json, sizeof json,
-		"{\"jobid\":\"%s\",\"mbl_blob\":\"%s\"}",
-		jid.c_str(), blob.c_str());
+		/* Build JSON manually -- no allocator overhead */
+		char json[512];
+		snprintf(json, sizeof json,
+			"{\"jobid\":\"%s\",\"mbl_blob\":\"%s\"}",
+			item.jobId.c_str(), item.blobHex.c_str());
 
-	if (ws_send_text(json) == 0) {
-		G.submitted.fetch_add(1);
-		if (g_verbose)
-			log_line("INFO", "share submitted for job %s", jid.c_str());
-		return true;
+		if (ws_send_text(json) == 0) {
+			G.submitted.fetch_add(1);
+			if (g_verbose)
+				log_line("INFO", "share submitted for job %s", item.jobId.c_str());
+		} else {
+			/* Socket dead -- reconnect. The rest of the batch is discarded:
+			 * it would be stale on the new session anyway. */
+			G.sendFails.fetch_add(1);
+			log_line("WARN", "share send failed — reconnecting");
+			return false;
+		}
 	}
-	G.sendFails.fetch_add(1);
-	log_line("WARN", "share send failed — reconnecting");
-	return false;
+	return true;
 }
 
 /* Sleep up to ms, but in <=250ms slices that re-check G.quit, so a Ctrl-C during
@@ -712,7 +728,7 @@ void network_thread(void)
 			/* Check for pending share submission. A send failure means the
 			 * socket is dead -- break out to reconnect (recv usually catches
 			 * the drop first, but this is the belt-and-braces path). */
-			if (G.submitReady.load() && !submit_share())
+			if (!submit_share())  /* drains the queue; early-returns if empty */
 				break;
 		}
 

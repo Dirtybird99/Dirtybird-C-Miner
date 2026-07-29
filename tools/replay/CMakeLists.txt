@@ -80,13 +80,13 @@ target_include_directories(test_sleep_ms PRIVATE
 target_link_libraries(test_sleep_ms PRIVATE dluna_runtime)
 dluna_copy_runtime_dlls(test_sleep_ms)
 
-add_executable(test_share_mailbox test_share_mailbox.cpp)
-target_include_directories(test_share_mailbox PRIVATE
+add_executable(test_share_queue test_share_queue.cpp)
+target_include_directories(test_share_queue PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/include
 )
-target_link_libraries(test_share_mailbox PRIVATE OpenSSL::Crypto)
-dluna_copy_runtime_dlls(test_share_mailbox)
+target_link_libraries(test_share_queue PRIVATE OpenSSL::Crypto)
+dluna_copy_runtime_dlls(test_share_queue)
 
 add_test(NAME cap_format COMMAND test_cap_format)
 # Runs from the binary output dir, not this target's build dir: the test shells
@@ -114,7 +114,7 @@ set_tests_properties(statusline_env_cols PROPERTIES
     ENVIRONMENT "DIRTYBIRD_COLS=56"
 )
 add_test(NAME sleep_ms COMMAND test_sleep_ms)
-add_test(NAME share_mailbox COMMAND test_share_mailbox)
+add_test(NAME share_queue COMMAND test_share_queue)
 # Stage5 contract tests need a PowerShell driver plus a capture corpus, neither
 # of which ships in this repo. Registering them unconditionally made `ctest` fail
 # out of the box on a fresh clone with an error about a missing -File argument,

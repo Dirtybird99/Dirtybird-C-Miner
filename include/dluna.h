@@ -13,6 +13,7 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -70,11 +71,17 @@ struct MinerState {
     std::mutex  jobMutex;
     std::condition_variable newJob;
 
-    /* Share submission -- single-slot mailbox */
-    std::atomic<bool> submitReady{false};
-    std::string submitJobId;
-    std::string submitBlob;
-    uint64_t    submitEpoch{0};
+    /* Share submission -- bounded FIFO queue (submitMutex guards submitQueue).
+     * Replaces the single-slot mailbox, which silently DESTROYED a found share
+     * when a second thread found one before the network thread drained it. With
+     * 20+ worker threads two near-simultaneous finds must both reach the wire. */
+    struct PendingSubmit {
+        std::string jobId;
+        std::string blobHex;
+        uint64_t    epoch;
+    };
+    static constexpr size_t SUBMIT_QUEUE_MAX = 32; /* safety valve; overflow is pathological */
+    std::deque<PendingSubmit> submitQueue;         /* under submitMutex */
     std::mutex  submitMutex;
 
     /* Counters */
@@ -84,14 +91,20 @@ struct MinerState {
     std::atomic<int64_t> blocks{0};
     std::atomic<int64_t> submitted{0};
     std::atomic<int64_t> sendFails{0};
-    std::atomic<int64_t> staleDrops{0};
-    /* Shares destroyed because one was still waiting in the single-slot
-     * mailbox when the next was found. Without this the loss is invisible:
-     * staleDrops only counts epoch mismatches, so the funnel identity
-     *   submitted + staleDrops + sendFails + submitDrops == shares found
-     * silently failed to balance and there was no way to tell from a running
-     * rig whether the mailbox depth of 1 was costing anything. */
+    std::atomic<int64_t> staleDrops{0};  /* gate1 + gate2 (pre-enqueue) and per-item at drain */
+    /* Shares lost to queue pressure: the oldest entry evicted because the queue
+     * was already at SUBMIT_QUEUE_MAX. Under the old single-slot mailbox this
+     * fired on every collision; with a 32-deep queue it should never fire at
+     * all, which is exactly what makes it useful -- a non-zero value now means
+     * the network thread is not draining, not that the mailbox was too small.
+     * Keeps its name from the depth-1 era so the -V field stays stable. */
     std::atomic<int64_t> submitDrops{0};
+    /* The funnel identity, which the single-slot mailbox could not satisfy:
+     *   found == staleDrops + submitDrops + submitted + sendFails
+     * `found` counts every discovery BEFORE any gate; `enqueued` counts those
+     * that survived both pre-enqueue stale gates. */
+    std::atomic<int64_t> found{0};
+    std::atomic<int64_t> enqueued{0};
 
     /* Config -- set once at startup, read-only after.
      * Defaults let the binary run with no args; override via -d/-w. */
@@ -104,31 +117,35 @@ struct MinerState {
 extern MinerState G;
 extern bool       g_has_avx2;
 
-/* Stage a found share into the single-slot mailbox. THE CALLER MUST HOLD
+/* Queue a found share for the network thread. THE CALLER MUST HOLD
  * G.submitMutex.
  *
- * Returns false when a share was already waiting: that share is destroyed by
- * this write and can never be sent. The network thread drains one share per
- * recv iteration on the 50ms poll, so two discoveries inside ~50ms collide.
- * That is negligible at solo difficulty and materially more likely against a
- * pool, where difficulty is low and shares arrive seconds apart.
+ * Returns false only when the queue was already full and the OLDEST entry had
+ * to be evicted to make room. Dropping the oldest is deliberate: it is the
+ * entry nearest the stale boundary, so it is the one most likely to be rejected
+ * anyway, and a fresher share is worth more than an older one.
  *
- * The overwrite is not fixed here -- it is only made VISIBLE, so the question
- * "does mailbox depth 1 actually cost payouts on real rigs?" can be answered
- * from submitDrops instead of argued from first principles. Split out of
- * submit_share() so it is unit-testable without a live miner. */
-static inline bool dluna_mailbox_stage(MinerState &st, const std::string &jobId,
-                                       std::string blobHex, uint64_t jobEpoch)
+ * This replaces a single-slot mailbox that overwrote unconditionally, so any
+ * second find arriving before the network thread drained destroyed the first.
+ * Depth 32 puts that beyond reach for a worker count in the tens: overflow now
+ * means the network thread has stopped draining, which is a different and
+ * louder problem than a mailbox being one deep.
+ *
+ * Lock is held only for the push -- no I/O underneath it, so 20+ concurrent
+ * enqueuers do not serialise on the socket. Split out so it is unit-testable
+ * without a live miner. */
+static inline bool dluna_submit_enqueue(MinerState &st, const std::string &jobId,
+                                        std::string blobHex, uint64_t jobEpoch)
 {
-	const bool overwrote = st.submitReady.load(std::memory_order_acquire);
-	if (overwrote)
+	bool evicted = false;
+	if (st.submitQueue.size() >= MinerState::SUBMIT_QUEUE_MAX) {
+		st.submitQueue.pop_front();
 		st.submitDrops.fetch_add(1, std::memory_order_relaxed);
-
-	st.submitJobId = jobId;
-	st.submitBlob  = std::move(blobHex);
-	st.submitEpoch = jobEpoch;
-	st.submitReady.store(true, std::memory_order_release);
-	return !overwrote;
+		evicted = true;
+	}
+	st.submitQueue.push_back({jobId, std::move(blobHex), jobEpoch});
+	st.enqueued.fetch_add(1, std::memory_order_relaxed);
+	return !evicted;
 }
 
 /* Console output coordination.
