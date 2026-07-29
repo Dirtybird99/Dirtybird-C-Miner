@@ -536,6 +536,21 @@ int main(int argc, char **argv)
 	/* Signal handlers */
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+#ifndef _WIN32
+	/* SSL_write() to a peer that has gone away raises SIGPIPE, and its default
+	 * action TERMINATES the process. Without this the miner died outright on
+	 * every dropped connection -- exit 141 -- so none of the reconnect logic
+	 * below (backoff, useful-session gate, send-failure redial) could ever run
+	 * on Linux or Android. Measured: killing the daemon mid-send exited the
+	 * miner in under a second with a single "Connecting" line in its log.
+	 *
+	 * It survived this long because Windows has no SIGPIPE and that is the
+	 * primary development platform; the failure is invisible there. The zig
+	 * sibling handles the same hazard with MSG_NOSIGNAL per send (net.zig).
+	 * Ignoring it process-wide is the portable equivalent: SSL_write then
+	 * returns -1/EPIPE and the existing error path reconnects. */
+	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	/* Spawn threads */
 	std::thread net(network_thread);
