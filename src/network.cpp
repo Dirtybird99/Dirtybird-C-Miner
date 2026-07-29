@@ -304,11 +304,30 @@ static const int CONNECT_TIMEOUT_MS = 10000;
  * (but legitimate) read doesn't trip it. */
 static const long long CONNECT_DEADLINE_MS = 20000;
 
+/* True once THIS session has received a job. Until then the miner is still
+ * hashing the previous session's work, and any share it finds is for a job the
+ * new daemon connection never issued -- jobEpoch is monotonic across
+ * reconnects, so the per-item epoch check cannot tell the difference. Gating
+ * the drain on this is what actually takes cross-session replay to zero;
+ * clearing the queue at connect only shrinks the window. */
+static std::atomic<bool> g_session_has_job{false};
+
 static void cleanup(void)
 {
 	if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = nullptr; }
 	if (g_sock != SOCK_INVALID) { sock_close(g_sock); g_sock = SOCK_INVALID; }
 	G.connected.store(false);
+	/* Drop anything still queued. jobEpoch is monotonic across reconnects, so an
+	 * item staged on the dead session can still match the current epoch and would
+	 * be sent onto the fresh connection -- the per-item check cannot catch it.
+	 * They are stale on the new session regardless, so dropping is correct.
+	 * (The Go sibling had exactly this bug: its submit channel outlived the
+	 * connection with no equivalent clear, and replayed the backlog on redial.) */
+	{
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+		G.submitQueue.clear();
+	}
 }
 
 static bool ws_connect(void)
@@ -423,6 +442,26 @@ static bool ws_connect(void)
 	}
 
 	set_timeout_ms(g_sock, 50);
+
+	/* Discard anything staged while we were down, immediately before this
+	 * session can send. cleanup() already cleared the queue, but that runs
+	 * BEFORE the dial: workers never stop mining, so they refill it throughout
+	 * the TCP+TLS+upgrade window and those shares would be the first thing sent
+	 * on the new connection.
+	 *
+	 * The per-item epoch check cannot catch these: jobEpoch is monotonic across
+	 * reconnects, so a share staged moments ago still matches the current
+	 * epoch. Clearing here is necessary but NOT sufficient on its own -- see
+	 * g_session_has_job below. */
+	{
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		if (!G.submitQueue.empty()) {
+			G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+			G.submitQueue.clear();
+		}
+	}
+	g_session_has_job.store(false, std::memory_order_release);
+
 	G.connected.store(true);
 	long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - connect_start).count();
@@ -587,6 +626,7 @@ static bool handle_job(const std::string &json)
 
 		if (workChanged)
 			G.jobEpoch.fetch_add(1);
+			g_session_has_job.store(true, std::memory_order_release);
 	}
 
 	if (workChanged) {
@@ -605,42 +645,58 @@ static bool handle_job(const std::string &json)
  * be stale on the new connection anyway. */
 static bool submit_share(void)
 {
-	std::string jid, blob;
-	uint64_t epoch;
+	/* Drain the WHOLE queue per call. Swap it out under the lock, then send
+	 * outside the lock: ws_send_text() does a blocking SSL_write, and holding
+	 * submitMutex across it would stall every enqueuing miner thread. */
+	/* Nothing may be sent before this session has issued a job: whatever is
+	 * queued was found against the previous session's work. */
+	if (!g_session_has_job.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lk(G.submitMutex);
+		if (!G.submitQueue.empty()) {
+			G.staleDrops.fetch_add((int64_t)G.submitQueue.size());
+			G.submitQueue.clear();
+		}
+		return true;
+	}
 
+	std::deque<MinerState::PendingSubmit> batch;
 	{
 		std::lock_guard<std::mutex> lk(G.submitMutex);
-		if (!G.submitReady.load()) return true;
-		jid   = G.submitJobId;
-		blob  = G.submitBlob;
-		epoch = G.submitEpoch;
-		G.submitReady.store(false);
+		if (G.submitQueue.empty()) return true;
+		batch.swap(G.submitQueue);
 	}
 
-	/* Stale check */
-	if (epoch != G.jobEpoch.load()) {
-		G.staleDrops.fetch_add(1);
-		if (g_verbose)
-			log_line("INFO", "stale share dropped (epoch %llu vs %llu)",
-				(unsigned long long)epoch, (unsigned long long)G.jobEpoch.load());
-		return true;
-	}
+	const uint64_t curEpoch = G.jobEpoch.load();
+	for (const auto &item : batch) {            /* FIFO: oldest find first */
+		/* Per-item stale check: the job may have changed between this share
+		 * being queued and the drain reaching it. */
+		if (item.epoch != curEpoch) {
+			G.staleDrops.fetch_add(1);
+			if (g_verbose)
+				log_line("INFO", "stale share dropped (epoch %llu vs %llu)",
+					(unsigned long long)item.epoch, (unsigned long long)curEpoch);
+			continue;
+		}
 
-	/* Build JSON manually -- no allocator overhead */
-	char json[512];
-	snprintf(json, sizeof json,
-		"{\"jobid\":\"%s\",\"mbl_blob\":\"%s\"}",
-		jid.c_str(), blob.c_str());
+		/* Build JSON manually -- no allocator overhead */
+		char json[512];
+		snprintf(json, sizeof json,
+			"{\"jobid\":\"%s\",\"mbl_blob\":\"%s\"}",
+			item.jobId.c_str(), item.blobHex.c_str());
 
-	if (ws_send_text(json) == 0) {
-		G.submitted.fetch_add(1);
-		if (g_verbose)
-			log_line("INFO", "share submitted for job %s", jid.c_str());
-		return true;
+		if (ws_send_text(json) == 0) {
+			G.submitted.fetch_add(1);
+			if (g_verbose)
+				log_line("INFO", "share submitted for job %s", item.jobId.c_str());
+		} else {
+			/* Socket dead -- reconnect. The rest of the batch is discarded:
+			 * it would be stale on the new session anyway. */
+			G.sendFails.fetch_add(1);
+			log_line("WARN", "share send failed — reconnecting");
+			return false;
+		}
 	}
-	G.sendFails.fetch_add(1);
-	log_line("WARN", "share send failed — reconnecting");
-	return false;
+	return true;
 }
 
 /* Sleep up to ms, but in <=250ms slices that re-check G.quit, so a Ctrl-C during
@@ -712,7 +768,7 @@ void network_thread(void)
 			/* Check for pending share submission. A send failure means the
 			 * socket is dead -- break out to reconnect (recv usually catches
 			 * the drop first, but this is the belt-and-braces path). */
-			if (G.submitReady.load() && !submit_share())
+			if (!submit_share())  /* drains the queue; early-returns if empty */
 				break;
 		}
 

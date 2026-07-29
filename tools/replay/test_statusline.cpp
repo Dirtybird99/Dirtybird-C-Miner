@@ -233,6 +233,29 @@ int main()
 		            "(%d rendered)\n", got, vis);
 	}
 
+	/* The row is silent until there is something true to report. A 0.00 KH/s
+	 * readout is not a rare fault -- it is what every launch printed, because
+	 * getwork sends no job at connect time and the first tick lands in that
+	 * gap. Reconnect is the same story. */
+	{
+		/* Every launch: not connected, no job. */
+		CHECK(!dluna_status_row_visible(false, 0),
+		      "painted a row before connecting");
+		/* Connected, but no job pushed yet -- workers are still parked, so
+		 * the rate is a genuine zero. */
+		CHECK(!dluna_status_row_visible(true, 0),
+		      "painted a row before the first job arrived");
+		/* Mining. */
+		CHECK(dluna_status_row_visible(true, 1),
+		      "suppressed the row while actually mining");
+		/* Dropped mid-run: a job was seen earlier so jobEpoch stays high,
+		 * but nothing can hash until the redial lands. Having once had a
+		 * job must not keep the row alive. */
+		CHECK(!dluna_status_row_visible(false, 5),
+		      "kept the row alive across a disconnect");
+		std::printf("statusline: idle-row suppression OK\n");
+	}
+
 	if (g_failures == 0) {
 		std::printf("statusline: PASS\n");
 		return 0;

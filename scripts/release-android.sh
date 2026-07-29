@@ -45,7 +45,8 @@ Run (Termux or adb shell):
   chmod +x ./dirtybird-miner-cpu
   ./dirtybird-miner-cpu -d <daemon host:port> -w <your DERO wallet> -t <threads>
 
-Use -p max for headless (more hashrate); -p normal (default) is gentler.
+On Android, -p max is currently a no-op; priority tuning is Windows-only.
+Use -t <threads> to balance hashrate, temperature, and battery use.
 Startup prints a pow("a") self-test; it must say PASS.
 EOF
 

@@ -175,19 +175,25 @@ cd "$INSTALL_DIR"
 # HTTP fetcher for API calls (stdout): curl preferred, wget fallback
 fetch() {
     if command -v curl &>/dev/null; then
-        curl -fsSL "$1"
+        curl -fsSL --connect-timeout 5 --max-time 10 "$1"
     else
-        wget -qO- "$1"
+        wget -qO- -T 10 "$1"
     fi
 }
 
+latest_release_tag() {
+    fetch "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null || true
+}
+
 LATEST_TAG=""
-if [ "$FORCE_UPDATE" = false ] && [ -f "$VERSION_FILE" ]; then
-    info "Already installed ($(cat "$VERSION_FILE")). Use --update to upgrade."
+if [ "$FORCE_UPDATE" = false ] && [ -f "$VERSION_FILE" ] && [ -x "./$BINARY_NAME" ]; then
+    info "Using installed release marker: $(cat "$VERSION_FILE")."
+    info "Checking for updates..."
+    LATEST_TAG="$(latest_release_tag)"
 else
     info "Fetching latest release info..."
-    LATEST_TAG="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
-        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    LATEST_TAG="$(latest_release_tag)"
 
     if [ -z "$LATEST_TAG" ]; then
         err "Could not determine latest release. Check network connection."
@@ -246,6 +252,19 @@ else
     info "Installed $LATEST_TAG."
 fi
 
+if ! BINARY_VERSION="$(./"$BINARY_NAME" --version 2>/dev/null)" ||
+   [ -z "$BINARY_VERSION" ]; then
+    err "Installed miner could not report its version."
+    err "Run this script with --update to repair the installation."
+    exit 1
+fi
+
+if [ -n "$LATEST_TAG" ] && [ "$BINARY_VERSION" != "Dirtybird Miner $LATEST_TAG" ]; then
+    warn "Update available: $BINARY_VERSION -> Dirtybird Miner $LATEST_TAG."
+    warn "Update before benchmarking:"
+    note "curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/termux-setup.sh | bash -s -- --update"
+fi
+
 # ── step 4: pick a daemon / pool ─────────────────────────────────────────────
 # Rejected input re-prompts instead of exiting: this is the one interactive step
 # a phone user is likely to fat-finger, and the download has already succeeded by
@@ -298,17 +317,34 @@ if [ "$RECONFIGURE" = true ] || [ ! -f "config.json" ]; then
     read -rp "  Wallet: " INPUT_WALLET </dev/tty
     WALLET="${INPUT_WALLET:-$DEFAULT_WALLET}"
 
-    # validate wallet format
-    if ! printf '%s' "$WALLET" | grep -qE '^(dero1|deto1)[a-z0-9]+$'; then
+    # Validate wallet format. The length floor matters: the miner itself only
+    # checks the address is non-empty, so this regex is the sole guard against
+    # a truncated paste -- which otherwise mines to nobody until someone
+    # notices hours later. A real address is 66 characters.
+    if ! printf '%s' "$WALLET" | grep -qE '^(dero1|deto1)[a-z0-9]{60,}$'; then
         err "Invalid wallet address: $WALLET"
-        err "Must start with 'dero1' or 'deto1' followed by lowercase alphanumerics."
+        err "Must start with 'dero1' or 'deto1' followed by 60+ lowercase alphanumerics."
         exit 1
     fi
 
-    # ── step 6: detect threads (nproc - 1, minimum 1) ───────────────────────
+    # ── step 6: choose threads (nproc - 1 by default, minimum 1) ────────────
     CORES="$(nproc 2>/dev/null || echo 4)"
-    THREADS=$((CORES - 1))
-    [ "$THREADS" -lt 1 ] && THREADS=1
+    DEFAULT_THREADS=$((CORES - 1))
+    [ "$DEFAULT_THREADS" -lt 1 ] && DEFAULT_THREADS=1
+
+    printf "\n"
+    printf "${CYAN}Mining threads${NC}\n"
+    while true; do
+        read -rp "  Threads [${DEFAULT_THREADS}] (1-${CORES}): " INPUT_THREADS </dev/tty ||
+            INPUT_THREADS=""
+        INPUT_THREADS="${INPUT_THREADS:-$DEFAULT_THREADS}"
+        if printf '%s' "$INPUT_THREADS" | grep -qE '^[1-9][0-9]*$' &&
+           [ "$INPUT_THREADS" -le "$CORES" ]; then
+            THREADS="$INPUT_THREADS"
+            break
+        fi
+        warn "Enter a number from 1 to $CORES."
+    done
 
     # ── step 7: write config.json ────────────────────────────────────────────
     cat > config.json <<EOF
@@ -324,24 +360,31 @@ else
     info "Using existing config.json (use --reconfigure to change)."
 fi
 
-# ── step 8: battery / thermal advisory ────────────────────────────────────────
+# ── step 8: battery advisory ──────────────────────────────────────────────────
+# Every termux-* call is wrapped in `timeout`: `command -v` only proves the
+# termux-api PACKAGE is installed, not that the companion APP is present. With
+# the package but no app, these block indefinitely -- and this one runs before
+# mining starts, so the phone would sit idle with no output and no error.
 if command -v termux-battery-status &>/dev/null; then
-    BAT_PCT="$(termux-battery-status 2>/dev/null | jq -r '.percentage // empty' 2>/dev/null || true)"
-    BAT_PLUGGED="$(termux-battery-status 2>/dev/null | jq -r '.plugged // empty' 2>/dev/null || true)"
+    BATTERY_JSON="$(timeout 5 termux-battery-status 2>/dev/null || true)"
+    BAT_PCT="$(printf '%s' "$BATTERY_JSON" | jq -r '.percentage // empty' 2>/dev/null || true)"
+    BAT_PLUGGED="$(printf '%s' "$BATTERY_JSON" | jq -r '.plugged // empty' 2>/dev/null || true)"
     if [ -n "$BAT_PCT" ] && [ "$BAT_PCT" -lt 40 ] 2>/dev/null; then
         warn "Battery is ${BAT_PCT}%. Mining drains battery fast; consider charging."
     fi
-    if [ "$BAT_PLUGGED" != "PLUGGED_TYPE_AC" ] && [ "$BAT_PLUGGED" != "PLUGGED_TYPE_USB" ] 2>/dev/null; then
-        warn "Device is not charging. Thermal throttling may reduce hashrate."
+    if [ "$BAT_PLUGGED" = "UNPLUGGED" ]; then
+        warn "Device is running on battery power. Mining drains battery fast."
     fi
 fi
 
 # ── step 9: acquire wake-lock ────────────────────────────────────────────────
 WAKE_LOCK=false
 if command -v termux-wake-lock &>/dev/null; then
-    termux-wake-lock 2>/dev/null && WAKE_LOCK=true || true
-    if [ "$WAKE_LOCK" = true ]; then
+    if timeout 5 termux-wake-lock 2>/dev/null; then
+        WAKE_LOCK=true
         info "Wake-lock acquired (Android Doze will not suspend the miner)."
+    else
+        warn "Could not acquire wake-lock. Android Doze may pause the miner in background."
     fi
 else
     note "Install termux-api + 'pkg install termux-api' for wake-lock support."
@@ -350,6 +393,7 @@ fi
 
 # ── step 10: run with auto-restart ────────────────────────────────────────────
 printf "\n"
+printf "  Version:  ${GREEN}%s${NC}\n" "$BINARY_VERSION"
 printf "  Pool:     ${GREEN}%s${NC}\n" "$(jq -r '.["daemon-address"]' config.json)"
 printf "  Wallet:   ${GREEN}%s${NC}\n" "$(jq -r '.wallet' config.json)"
 printf "  Threads:  ${GREEN}%s${NC}\n" "$(jq -r '.threads' config.json)"
@@ -360,7 +404,7 @@ printf "\n"
 
 release_lock() {
     if [ "$WAKE_LOCK" = true ]; then
-        termux-wake-unlock 2>/dev/null || true
+        timeout 5 termux-wake-unlock 2>/dev/null || true
         info "Wake-lock released."
     fi
 }
