@@ -376,12 +376,64 @@ jobs:
           name: release-linux-arm64
           path: dist/*.tar.gz
 
+  build-macos:
+    name: Build macOS (arm64) Release
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          lfs: true
+
+      # The asset name hard-codes arm64; fail loudly if the runner alias ever
+      # changes architecture instead of shipping a mislabeled binary.
+      - name: Assert arm64 runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install dependencies
+        run: brew install openssl@3 ninja
+
+      # Apple clang + ld64 (CMake gates -fuse-ld=lld off on APPLE; ld64 does LTO
+      # natively). Static Homebrew OpenSSL so the tarball is self-contained.
+      # PGO trains natively on the M-series runner; PROFDATA points build-pgo.sh
+      # at the Xcode-toolchain llvm-profdata that matches Apple clang's profile
+      # format.
+      - name: Build (LTO + PGO)
+        run: |
+          export CMAKE_ARGS="-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) -DOPENSSL_USE_STATIC_LIBS=TRUE -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }}"
+          export PROFDATA="$(xcrun -f llvm-profdata)"
+          export TRAIN_SECS=60
+          bash scripts/build-pgo.sh
+
+      # Gate on hash correctness (first macOS release path; a fast wrong hash is
+      # worse than a slow right one). --selftest exits 1 on pow("a") mismatch.
+      - name: Version, self-test, and smoke
+        run: |
+          test "$(./build/bin/dirtybird-miner-cpu --version)" = \
+            "Dirtybird Miner v${{ needs.verify.outputs.version }}"
+          ./build/bin/dirtybird-miner-cpu --selftest
+          ./build/bin/dirtybird-miner-cpu --help > /dev/null
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+      - name: Package (macOS)
+        run: bash ./scripts/release-macos.sh "${{ needs.verify.outputs.tag }}" build dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-macos
+          path: dist/*.tar.gz
+
   release:
     name: Publish Release
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name == 'push'
-    needs: [verify, build-windows, build-linux, build-hiveos, build-android, build-linux-arm64]
+    needs: [verify, build-windows, build-linux, build-hiveos, build-android, build-linux-arm64, build-macos]
     permissions:
       contents: write
     steps:
@@ -412,6 +464,7 @@ jobs:
             echo "- dirtybird-miner-arm64-$TAG.tar.gz"
             echo "- dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
             echo "- dirtybird-miner-${TAG}_aarch64_android.tar.gz"
+            echo "- dirtybird-miner-macos-arm64-$TAG.tar.gz"
             echo "- SHA256SUMS.txt"
             echo
             if [ -n "$PREV_TAG" ]; then
@@ -434,6 +487,7 @@ jobs:
           test -f "dirtybird-miner-arm64-$TAG.tar.gz"
           test -f "dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
           test -f "dirtybird-miner-${TAG}_aarch64_android.tar.gz"
+          test -f "dirtybird-miner-macos-arm64-$TAG.tar.gz"
           sha256sum *.zip *.tar.gz > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
           cat SHA256SUMS.txt
