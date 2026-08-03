@@ -24,7 +24,13 @@ BUILD_ROOT="$REPO_ROOT/$BUILD_DIR"
 BIN_DIR="$BUILD_ROOT/bin"
 BINARY_PATH="$BIN_DIR/$BINARY_NAME"
 STAGE_ROOT="$REPO_ROOT/$OUTPUT_DIR"
-PACKAGE_NAME="dirtybird-miner-amd64-$ASSET_VERSION"
+PACKAGE_ARCH="${PACKAGE_ARCH:-amd64}"
+case "$PACKAGE_ARCH" in
+    amd64) CPU_NOTE="64-bit AVX2 CPUs." ;;
+    arm64) CPU_NOTE="64-bit ARMv8 (aarch64) glibc Linux." ;;
+    *) echo "Unsupported PACKAGE_ARCH: $PACKAGE_ARCH" >&2; exit 1 ;;
+esac
+PACKAGE_NAME="dirtybird-miner-$PACKAGE_ARCH-$ASSET_VERSION"
 PACKAGE_DIR="$STAGE_ROOT/$PACKAGE_NAME"
 ARCHIVE_PATH="$STAGE_ROOT/$PACKAGE_NAME.tar.gz"
 LIB_DIR="$PACKAGE_DIR/lib"
@@ -136,7 +142,7 @@ Quick start:
 Use -p max for headless/AFK (more hashrate); -p normal (default) is desktop-safe.
 
 Notes:
-- 64-bit AVX2 CPUs. Non-core runtime libraries are bundled under ./lib.
+- $CPU_NOTE Non-core runtime libraries are bundled under ./lib.
 - Startup prints a pow("a") self-test; it must say PASS.
 EOF
 

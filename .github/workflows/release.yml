@@ -1,9 +1,12 @@
 name: Release
 
+# workflow_dispatch is a dry run: every build job runs and uploads artifacts,
+# but the publish job is skipped, so nothing reaches the release page.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,9 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      commit: ${{ steps.version.outputs.commit }}
+      version: ${{ steps.version.outputs.version || steps.dryrun.outputs.version }}
+      tag: ${{ steps.version.outputs.tag || steps.dryrun.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit || steps.dryrun.outputs.commit }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,6 +33,7 @@ jobs:
 
       - name: Resolve tag
         id: version
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -75,7 +79,19 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
+      # Dry-run identity: a version that can never collide with a real tag, so
+      # the build jobs run byte-identical logic against needs.verify.outputs.*.
+      - name: Resolve dry-run version
+        id: dryrun
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          echo "tag=v0.0.0-dry" >> "$GITHUB_OUTPUT"
+          echo "version=0.0.0-dry" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Show changelog preview
+        if: github.event_name == 'push'
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
           if [ -n "$PREV_TAG" ]; then
@@ -307,11 +323,65 @@ jobs:
           name: release-android
           path: dist/*.tar.gz
 
+  build-linux-arm64:
+    name: Build Linux (aarch64) Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          lfs: true
+
+      - name: Set up QEMU (arm64)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      # Everything runs inside a native arm64 userland (emulated): apt provides
+      # arm64 OpenSSL, and release.sh's ldd/patchelf bundling only works with an
+      # arm64 toolchain. Same LTO+PGO recipe as the other platforms; emulated
+      # training follows the Android job (TRAIN_SECS=40 @ 4 threads). llvm is
+      # needed for llvm-profdata, binutils for readelf.
+      - name: Build, self-test, and package (arm64 container)
+        run: |
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src \
+            arm64v8/ubuntu:24.04 bash -c '
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              clang lld llvm cmake ninja-build libssl-dev patchelf \
+              binutils ca-certificates git
+            export CMAKE_ARGS="-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }}"
+            export TRAIN_SECS=40 TRAIN_THREADS=4
+            bash scripts/build-pgo.sh
+            test "$(./build/bin/dirtybird-miner-cpu --version)" = \
+              "Dirtybird Miner v${{ needs.verify.outputs.version }}"
+            ./build/bin/dirtybird-miner-cpu --selftest
+            ./build/bin/dirtybird-miner-cpu --help > /dev/null
+            PACKAGE_ARCH=arm64 bash ./scripts/release.sh \
+              "${{ needs.verify.outputs.tag }}" build dist
+            mkdir -p /tmp/verify
+            tar -xzf "dist/dirtybird-miner-arm64-${{ needs.verify.outputs.tag }}.tar.gz" \
+              -C /tmp/verify
+            /tmp/verify/*/dirtybird-miner-cpu --selftest
+          '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-arm64
+          path: dist/*.tar.gz
+
   release:
     name: Publish Release
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [verify, build-windows, build-linux, build-hiveos, build-android]
+    if: github.event_name == 'push'
+    needs: [verify, build-windows, build-linux, build-hiveos, build-android, build-linux-arm64]
     permissions:
       contents: write
     steps:
@@ -339,6 +409,7 @@ jobs:
             echo "Assets:"
             echo "- dirtybird-miner-win64-$TAG.zip"
             echo "- dirtybird-miner-amd64-$TAG.tar.gz"
+            echo "- dirtybird-miner-arm64-$TAG.tar.gz"
             echo "- dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
             echo "- dirtybird-miner-${TAG}_aarch64_android.tar.gz"
             echo "- SHA256SUMS.txt"
@@ -360,6 +431,7 @@ jobs:
           cd artifacts
           test -f "dirtybird-miner-win64-$TAG.zip"
           test -f "dirtybird-miner-amd64-$TAG.tar.gz"
+          test -f "dirtybird-miner-arm64-$TAG.tar.gz"
           test -f "dirtybird-miner-${TAG}_linux_hiveos_mmpos.tar.gz"
           test -f "dirtybird-miner-${TAG}_aarch64_android.tar.gz"
           sha256sum *.zip *.tar.gz > SHA256SUMS.txt
