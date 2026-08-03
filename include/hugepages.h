@@ -50,10 +50,16 @@ static inline void free_huge(void *p) {
 static inline bool enable_huge_page_privilege(void) { return true; }
 
 static inline void *alloc_huge(size_t size) {
+#ifdef MAP_HUGETLB
     size = (size + (2<<20) - 1) & ~((2<<20) - 1);
     void *p = mmap(NULL, size, PROT_READ|PROT_WRITE,
                    MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
     return (p == MAP_FAILED) ? NULL : p;
+#else
+    /* macOS has no MAP_HUGETLB; alloc_pinned falls back to malloc + mlock. */
+    (void)size;
+    return NULL;
+#endif
 }
 
 static inline void free_huge(void *p) {

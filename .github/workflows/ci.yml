@@ -30,6 +30,10 @@ jobs:
             os: ubuntu-latest
             artifact_name: dirtybird-miner-linux-bin
             artifact_path: build/bin/*
+          - name: macOS
+            os: macos-latest
+            artifact_name: dirtybird-miner-macos-bin
+            artifact_path: build/bin/*
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,6 +76,10 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++
 
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install openssl@3 ninja
+
       - name: Configure (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -81,6 +89,16 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++
 
+      # Apple clang (default toolchain); static Homebrew OpenSSL, same as the
+      # release job, so CI compiles exactly what a release would ship.
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
+
       # Builds every target, not just the miner: the unit tests below live in
       # tools/replay and would not exist otherwise.
       - name: Build (Windows)
@@ -88,8 +106,8 @@ jobs:
         shell: msys2 {0}
         run: cmake --build build --parallel
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
         run: cmake --build build --parallel
 
       # The unit suite (statusline layout, stage5 descriptor, v1.14 encode,
@@ -100,8 +118,8 @@ jobs:
         shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure
 
-      - name: Unit tests (Linux)
-        if: runner.os == 'Linux'
+      - name: Unit tests (Linux/macOS)
+        if: runner.os != 'Windows'
         run: ctest --test-dir build --output-on-failure
 
       - name: Smoke test (Windows)
@@ -109,8 +127,8 @@ jobs:
         shell: msys2 {0}
         run: ./build/bin/dirtybird-miner-cpu.exe --help > /dev/null
 
-      - name: Smoke test (Linux)
-        if: runner.os == 'Linux'
+      - name: Smoke test (Linux/macOS)
+        if: runner.os != 'Windows'
         run: ./build/bin/dirtybird-miner-cpu --help > /dev/null
 
       - name: Package verification (Linux)
@@ -125,8 +143,8 @@ jobs:
         shell: msys2 {0}
         run: ./build/bin/dirtybird-miner-cpu.exe --test-dero
 
-      - name: Diagnostic self-test (Linux)
-        if: runner.os == 'Linux'
+      - name: Diagnostic self-test (Linux/macOS)
+        if: runner.os != 'Windows'
         continue-on-error: true
         run: ./build/bin/dirtybird-miner-cpu --test-dero
 

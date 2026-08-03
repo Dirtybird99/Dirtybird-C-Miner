@@ -351,10 +351,11 @@ static void parse_args(int argc, char **argv)
 
 static void set_affinity(std::thread &t, int core)
 {
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__APPLE__)
 	// MinGW/winpthreads: std::thread::native_handle() returns pthread_t, not HANDLE.
-	// Android/Bionic has no pthread_setaffinity_np. In both cases, no-op and let
-	// the OS scheduler place threads. TODO: pin inside mine_thread if needed.
+	// Android/Bionic has no pthread_setaffinity_np. macOS has neither the API nor
+	// scheduler support (Apple Silicon ignores affinity hints). In all cases, no-op
+	// and let the OS scheduler place threads. TODO: pin inside mine_thread if needed.
 	(void)t; (void)core;
 #else
 	cpu_set_t cpuset;
