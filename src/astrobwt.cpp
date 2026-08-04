@@ -379,6 +379,23 @@ after_op:
         while (w.data_len > 0 && w.sData[w.data_len - 1] == 0) {
                 --w.data_len;
         }
+
+        /* Tripwire for the SA tail-slack contract: every SA output buffer must
+         * hold data_len + 7 elements. Enable with DLUNA_TRACK_DATALEN=1. */
+        static const bool track_len = [] {
+                const char* e = getenv("DLUNA_TRACK_DATALEN");
+                return e && e[0] && strcmp(e, "0") != 0;
+        }();
+        if (track_len) {
+                static std::atomic<uint32_t> max_len{0};
+                uint32_t prev = max_len.load(std::memory_order_relaxed);
+                while (w.data_len > prev &&
+                       !max_len.compare_exchange_weak(prev, w.data_len,
+                                                      std::memory_order_relaxed)) {
+                }
+                if (w.data_len > prev)
+                        fprintf(stderr, "[DATALEN] new max=%u\n", w.data_len);
+        }
 }
 
 /* 2026-05-01 stage-3 replay wrapper accessor.
@@ -719,13 +736,19 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
             }
         } else if (sa_use_descriptor || sa_verify_descriptor) {
             desc_scratch = &live_stage5_scratch();
-            const size_t sa_cap = static_cast<size_t>(w.data_len) * 4u;
+            /* Pass the real buffer capacity, not the logical SA size: the
+             * materialize step needs >= 28 bytes of tail slack beyond
+             * data_len*4 before it may use 32-byte block stores. */
+            size_t sa_cap = sizeof(w.sa);
             uint8_t* desc_out = reinterpret_cast<uint8_t*>(w.sa);
             if (sa_verify_descriptor) {
-                if (desc_scratch->descriptor_sa.size() < sa_cap) {
-                    desc_scratch->descriptor_sa.resize(sa_cap);
+                const size_t verify_cap =
+                    static_cast<size_t>(w.data_len) * 4u + 32u;
+                if (desc_scratch->descriptor_sa.size() < verify_cap) {
+                    desc_scratch->descriptor_sa.resize(verify_cap);
                 }
                 desc_out = desc_scratch->descriptor_sa.data();
+                sa_cap = desc_scratch->descriptor_sa.size();
             }
             desc_ready = build_v114_descriptor_sa(w, *desc_scratch,
                                                   desc_out, sa_cap,

@@ -111,7 +111,10 @@ public:
   uint16_t zeroRunCount = 0;
   uint32_t sa_prelim[120*256+1] = {(uint32_t)-1};
   #endif
-  int32_t sa[277*256+1];
+  /* +16 over the 277*256 logical maximum: the stage-5 materialize step may
+   * store 32 bytes at a time for short runs, so every SA output buffer must
+   * have at least 7 elements of writable slack past data_len. */
+  int32_t sa[277*256+16];
 
   templateMarker astroTemplate[277];
   int templateIdx = 0;
