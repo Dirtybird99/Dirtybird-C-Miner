@@ -249,6 +249,18 @@ static void reporter_thread()
 			       (long long)G.rejected.load(), (long long)G.staleDrops.load(),
 			       (long long)G.sendFails.load(), (long long)G.submitDrops.load());
 		}
+
+		/* Hashes spent on jobs the network had already replaced. Counted only
+		 * under DLUNA_COUNT_STALE=1; reported live so the figure survives a
+		 * hard kill. */
+		{
+			long long sh = G.staleHashesObserved.load(std::memory_order_relaxed);
+			if (sh > 0) {
+				long long th = G.totalHashes.load(std::memory_order_relaxed);
+				printf("\n[stale] hashes:%lld of %lld (%.2f%%)\n", sh, th,
+				       th > 0 ? 100.0 * (double)sh / (double)th : 0.0);
+			}
+		}
 		fflush(stdout);
 
 #ifdef DLUNA_PGO_GENERATE
