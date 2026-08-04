@@ -101,6 +101,9 @@ struct MinerState {
      * that survived both pre-enqueue stale gates. */
     std::atomic<int64_t> found{0};
     std::atomic<int64_t> enqueued{0};
+    /* Hashes computed against an already-advanced epoch. Only counted when
+     * DLUNA_COUNT_STALE=1 -- measurement for job-poll cadence tuning. */
+    std::atomic<int64_t> staleHashesObserved{0};
 
     /* Config -- set once at startup, read-only after.
      * Defaults let the binary run with no args; override via -d/-w. */

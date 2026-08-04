@@ -48,10 +48,42 @@ static void submit_share(const uint8_t *blob, int blob_len,
 
 /* ---- mining thread ---- */
 
+/* Job-poll cadence: how often, in nonces, a worker checks for a new job.
+ * Default 1 = check every iteration, which is what the derohe reference miner
+ * and five of the other readable DERO miners do; they abandon stale work within
+ * one hash (~1 ms). Env-tunable via DLUNA_JOB_POLL (rounded up to a power of
+ * two) so the cadence can be loosened for A/B. */
+static uint32_t job_poll_mask()
+{
+    static const uint32_t m = []() -> uint32_t {
+        const char *e = getenv("DLUNA_JOB_POLL");
+        int v = (e && e[0]) ? atoi(e) : 1;
+        if (v < 1) v = 1;
+        uint32_t p = 1;
+        while (p < (uint32_t)v) p <<= 1;
+        return p - 1u;
+    }();
+    return m;
+}
+
+/* DLUNA_COUNT_STALE=1 counts hashes computed against an already-advanced
+ * epoch. Measurement only -- those hashes cannot yield a valid share. */
+static bool count_stale_enabled()
+{
+    static const bool b = [] {
+        const char *e = getenv("DLUNA_COUNT_STALE");
+        return e && e[0] == '1';
+    }();
+    return b;
+}
+
 void mine_thread(int tid)
 {
     dluna_tune_mining_thread();
     dluna_pin_mining_thread(tid);
+    const uint32_t poll_mask = job_poll_mask();
+    const bool count_stale = count_stale_enabled();
+    int64_t localStale = 0;
 
     bool huge = false;
     auto *worker = (workerData *)alloc_pinned(sizeof(workerData), &huge);
@@ -128,9 +160,21 @@ void mine_thread(int tid)
             if (G.quit.load(std::memory_order_relaxed))
                 goto done;
 
-            if ((nonce & 127) == 0 &&
+            /* Poll for a new job every poll_mask+1 nonces (default: every
+             * iteration, ~1 ms) rather than every 128 (~140 ms at 20T). The
+             * work blob changes often, and every hash computed after the epoch
+             * advances is on stale work that cannot yield a valid share. The
+             * jobEpoch load is an L1 hit -- the line is written only on a job
+             * change and this loop already reads G.quit each iteration -- so
+             * the tighter poll costs no measurable raw hashrate. Hash output is
+             * unchanged. */
+            if ((nonce & poll_mask) == 0 &&
                 G.jobEpoch.load(std::memory_order_acquire) != epoch)
                 break;
+
+            if (count_stale &&
+                G.jobEpoch.load(std::memory_order_relaxed) != epoch)
+                localStale += use_x2 ? 2 : 1;
 
             if (use_x2) {
                 const uint32_t na = ++nonce;
@@ -196,6 +240,8 @@ done:
     /* flush residual */
     if (localHashCount > 0)
         G.totalHashes.fetch_add(localHashCount, std::memory_order_relaxed);
+    if (localStale > 0)
+        G.staleHashesObserved.fetch_add(localStale, std::memory_order_relaxed);
 
     if (worker_b)
         free_pinned(worker_b, sizeof(workerData), huge_b);

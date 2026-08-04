@@ -611,5 +611,17 @@ int main(int argc, char **argv)
 	printf("\nShutdown complete. %lld hashes, %lld miniblocks (%lld blocks), %lld rejected.\n",
 	       (long long)G.totalHashes.load(), (long long)G.accepted.load(),
 	       (long long)G.blocks.load(), (long long)G.rejected.load());
+
+	/* Share funnel: found == staleDrops + submitDrops + submitted + sendFails.
+	 * staleHashesObserved is populated only under DLUNA_COUNT_STALE=1. */
+	long long total = G.totalHashes.load();
+	long long stale_hashes = G.staleHashesObserved.load();
+	printf("Submission: found=%lld submitted=%lld staleDrops=%lld submitDrops=%lld sendFails=%lld enqueued=%lld\n",
+	       (long long)G.found.load(), (long long)G.submitted.load(),
+	       (long long)G.staleDrops.load(), (long long)G.submitDrops.load(),
+	       (long long)G.sendFails.load(), (long long)G.enqueued.load());
+	if (stale_hashes > 0)
+		printf("Stale hashes: %lld of %lld (%.2f%%)\n", stale_hashes, total,
+		       total > 0 ? 100.0 * (double)stale_hashes / (double)total : 0.0);
 	return 0;
 }

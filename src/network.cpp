@@ -441,7 +441,11 @@ static bool ws_connect(void)
 		return false;
 	}
 
-	set_timeout_ms(g_sock, 50);
+	/* 10 ms, not 50: the submit drain runs after each recv poll returns, so
+	 * this timeout is the worst-case delay between a worker finding a share and
+	 * it going out on the wire. Shares are rare, so the extra idle wakeups cost
+	 * nothing measurable. */
+	set_timeout_ms(g_sock, 10);
 
 	/* Discard anything staged while we were down, immediately before this
 	 * session can send. cleanup() already cleared the queue, but that runs
