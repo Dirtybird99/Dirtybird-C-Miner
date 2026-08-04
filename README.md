@@ -44,7 +44,11 @@ dirtybird-miner-cpu [-d <host:port>] [-w <wallet>] [-t <threads>] [-p normal|max
 | `-w` | DERO wallet address (overrides `wallet`) |
 | `-t` | mining threads (overrides `threads`) |
 | `-p` | priority profile: `normal` (default, desktop-safe) or `max` (headless) |
+| `--no-pin` | disable CPU pinning (default: pin workers, P-core-first on hybrid CPUs; also `"pin": false` in config.json or `DLUNA_NO_PIN=1`) |
 | `-h`, `--help` / `-v`, `--version` | help / version |
+
+On CPUs with SHA-NI each worker mines two nonces at a time and finishes them
+on interleaved SHA-256 streams; set `DLUNA_NO_SHA_X2=1` to disable.
 
 ## Correctness
 
@@ -53,8 +57,8 @@ At startup the miner computes `pow("a")` and verifies it equals
 
 ## Performance
 
-~20 KH/s sustained at 20 threads on an i7-13700HX. Measure over >=10 minutes for a
-representative sustained figure.
+~21 KH/s sustained at 20 threads on an i7-13700HX (2-hour live average 20.8,
+flat). Measure over >=10 minutes for a representative sustained figure.
 
 ## Android / Termux (mobile)
 
