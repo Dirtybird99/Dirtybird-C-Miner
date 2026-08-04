@@ -304,6 +304,20 @@ static void test_compact_fused_raw_matches_compact_descriptor_and_libsais() {
     CHECK(from_fused == from_trusted);
     CHECK(from_fused == from_libsais);
 
+    // A capacity of exactly logical_len*4 takes the narrow store path; +32 or
+    // more of slack enables the 32-byte block stores. Both must produce the
+    // same logical SA bytes.
+    std::vector<uint8_t> from_fused_wide(logical_len * 4u + 64u);
+    size_t fused_wide_len = 0;
+    bool fused_wide_ok =
+        deroluna::stages::v114::stage_v114_sa_build_compact_fused_raw(
+            data.data(), logical_len, static_cast<uint32_t>(data.size()),
+            flags.data(), static_cast<uint32_t>(flags.size()),
+            from_fused_wide.data(), from_fused_wide.size(), &fused_wide_len);
+    CHECK(fused_wide_ok);
+    CHECK(fused_wide_len == fused_len);
+    CHECK(std::memcmp(from_fused_wide.data(), from_fused.data(), fused_len) == 0);
+
     std::vector<uint8_t> fused_hash(32);
     bool hash_ok = deroluna::stages::v114::stage_v114_hash_compact_fused_raw(
         data.data(), logical_len, static_cast<uint32_t>(data.size()),

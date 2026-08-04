@@ -1713,8 +1713,11 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
      * memcpy is branch-mispredict bound at ~3.5 positions per run); the
      * overshoot is overwritten by the next group or lies past logical_len.
      * Requires 28 bytes of writable slack past the logical SA, and 8 readable
-     * elements past every arena run (guaranteed by the arena tail pad). */
-    const bool wide_ok = out_cap >= needed + 32u;
+     * elements past every arena run — the arena-size clause re-checks the
+     * emit phase's tail-pad guarantee rather than assuming it. */
+    const bool wide_ok = out_cap >= needed + 32u &&
+                         scratch->arena_positions.size() >=
+                             static_cast<size_t>(view.logical_len) + 8;
 
     std::vector<Stage5Run>& runs = scratch->runs;
     std::vector<Stage5Run>& radix_tmp = scratch->radix_tmp;
