@@ -11,6 +11,7 @@
 #include "simd_wolf.h"
 #include "hex.h"
 #include "runtime_tune.h"
+#include "cpu_topology.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -278,6 +279,9 @@ static void print_usage(FILE *out, const char *argv0)
 		"        (env equivalent: DLUNA_PRIORITY=normal|max)\n"
 		"        NOTE: the default is 'normal'. Use -p max for the previous\n"
 		"        aggressive behavior.\n"
+		"  --no-pin       do not pin worker threads to CPUs (default: pin,\n"
+		"                 P-core-first on hybrid CPUs)\n"
+		"        (env equivalent: DLUNA_NO_PIN=1; config.json: \"pin\": false)\n"
 		"  -V, --verbose  show per-job / per-share event logging (default: off)\n"
 		"        (env equivalent: DLUNA_VERBOSE=1)\n"
 		"  --selftest     compute the pow(\"a\") KAT and exit (0=PASS, 1=FAIL)\n"
@@ -320,6 +324,13 @@ static void parse_args(int argc, char **argv)
 #else
 			setenv("DLUNA_PRIORITY", v, 1);
 #endif
+		} else if (!strcmp(argv[i], "--no-pin")) {
+			/* Same env funnel as -p: cpu_topology reads DLUNA_NO_PIN. */
+#ifdef _WIN32
+			_putenv_s("DLUNA_NO_PIN", "1");
+#else
+			setenv("DLUNA_NO_PIN", "1", 1);
+#endif
 		} else if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--verbose")) {
 			g_verbose = true;
 		} else if (!strcmp(argv[i], "--selftest")) {
@@ -345,24 +356,6 @@ static void parse_args(int argc, char **argv)
 		G.nthreads = (int)std::thread::hardware_concurrency();
 	if (G.nthreads <= 0)
 		G.nthreads = 4;
-}
-
-/* --- thread affinity --- */
-
-static void set_affinity(std::thread &t, int core)
-{
-#if defined(_WIN32) || defined(__ANDROID__) || defined(__APPLE__)
-	// MinGW/winpthreads: std::thread::native_handle() returns pthread_t, not HANDLE.
-	// Android/Bionic has no pthread_setaffinity_np. macOS has neither the API nor
-	// scheduler support (Apple Silicon ignores affinity hints). In all cases, no-op
-	// and let the OS scheduler place threads. TODO: pin inside mine_thread if needed.
-	(void)t; (void)core;
-#else
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	CPU_SET(core, &cpuset);
-	pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
-#endif
 }
 
 /* --- config.json loader (minimal; no JSON lib — same flat-key approach as network.cpp) --- */
@@ -442,6 +435,30 @@ static void load_config(const char *path)
 		setenv("DLUNA_PRIORITY", prio.c_str(), 1);
 #endif
 	}
+
+	/* "pin": false (or 0, "false", "off") disables worker pinning. The bare
+	 * false/0 tokens don't fit cfg_str/cfg_int, so peek at the value's first
+	 * non-space character. */
+	{
+		std::string pat = "\"pin\":";
+		size_t p = j.find(pat);
+		if (p != std::string::npos) {
+			p += pat.size();
+			while (p < j.size() && (j[p] == ' ' || j[p] == '\t' ||
+			                        j[p] == '\n' || j[p] == '\r')) p++;
+			std::string v = (p < j.size() && j[p] == '"') ? cfg_str(j, "pin")
+			                                              : std::string();
+			bool off = (p < j.size() && (j[p] == 'f' || j[p] == '0')) ||
+			           v == "false" || v == "off" || v == "0";
+			if (off) {
+#ifdef _WIN32
+				_putenv_s("DLUNA_NO_PIN", "1");
+#else
+				setenv("DLUNA_NO_PIN", "1", 1);
+#endif
+			}
+		}
+	}
 }
 
 /* --- main --- */
@@ -459,6 +476,14 @@ int main(int argc, char **argv)
 	log_line("INFO", "Server:  %s:%d", G.host.c_str(), G.port);
 	log_line("INFO", "Wallet:  %s", G.wallet.c_str());
 	log_line("INFO", "Threads: %d", G.nthreads);
+#if !defined(__ANDROID__) && !defined(__APPLE__)
+	if (!dluna_pin_enabled())
+		log_line("INFO", "Pinning: off");
+	else if (dluna_cpu_order().detected)
+		log_line("INFO", "Pinning: P-core-first (%d CPUs)", dluna_cpu_order().count);
+	else
+		log_line("INFO", "Pinning: round-robin (%d CPUs)", dluna_cpu_order().count);
+#endif
 	printf("\n");
 
 	DlunaPriorityLevel prio = dluna_runtime_tune_options_from_env().level;
@@ -553,7 +578,7 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
-	/* Spawn threads */
+	/* Spawn threads; each worker pins itself (dluna_pin_mining_thread) */
 	std::thread net(network_thread);
 	std::thread rpt(reporter_thread);
 
@@ -561,13 +586,6 @@ int main(int argc, char **argv)
 	miners.reserve(G.nthreads);
 	for (int i = 0; i < G.nthreads; i++)
 		miners.emplace_back(mine_thread, i);
-
-	/* Pin mining threads to cores */
-	int ncores = (int)std::thread::hardware_concurrency();
-	for (int i = 0; i < G.nthreads; i++) {
-		int core = (ncores > 0) ? (i % ncores) : i;
-		set_affinity(miners[i], core);
-	}
 
 	/* Wait for quit */
 	for (auto &t : miners)

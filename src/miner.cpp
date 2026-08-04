@@ -7,6 +7,7 @@
 #include "hugepages.h"
 #include "hex.h"
 #include "runtime_tune.h"
+#include "cpu_topology.h"
 
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,7 @@ static void submit_share(const uint8_t *blob, int blob_len,
 void mine_thread(int tid)
 {
     dluna_tune_mining_thread();
+    dluna_pin_mining_thread(tid);
 
     bool huge = false;
     auto *worker = (workerData *)alloc_pinned(sizeof(workerData), &huge);

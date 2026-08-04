@@ -4,6 +4,7 @@
 #include "hugepages.h"
 #include "spsa.hpp"
 #include "simd_wolf.h"
+#include "runtime_tune.h"
 
 #include <algorithm>
 #include <chrono>
@@ -154,6 +155,9 @@ static void init_training_runtime(const TrainOptions& opt) {
 
 int main(int argc, char** argv) {
     TrainOptions opt = parse_args(argc, argv);
+    /* Same process tuning as the miner (DLUNA_PRIORITY=max -> HIGH class), so
+     * training runs and benchmarks see the production runtime environment. */
+    dluna_tune_process_runtime();
     std::printf("DIRTYBIRD PGO trainer threads=%d warmup_seconds=%d seconds=%d "
                 "hashes=%llu rotate_ms=%d\n",
                 opt.threads, opt.warmup_seconds, opt.seconds,

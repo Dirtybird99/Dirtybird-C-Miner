@@ -220,6 +220,7 @@ target_link_libraries(dluna_stages PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 add_library(dluna_runtime OBJECT
     src/runtime_tune.cpp
     src/console.cpp
+    src/cpu_topology.cpp
 )
 target_include_directories(dluna_runtime PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # console.cpp -> astroworker.h -> <openssl/sha.h>: needs the OpenSSL include path
