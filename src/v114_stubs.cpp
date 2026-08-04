@@ -879,10 +879,11 @@ uint32_t stage5_run_count(const Stage5Run& run) {
 void fused_stage5_profile_note_emit_shape(
     FusedStage5Profile* profile,
     const std::vector<Stage5Run>& runs,
-    const std::vector<uint32_t>& arena_positions) {
+    const std::vector<uint32_t>& arena_positions,
+    size_t arena_len) {
     if (!profile) return;
     profile->emit_appends += runs.size();
-    profile->emit_arena_positions += arena_positions.size();
+    profile->emit_arena_positions += arena_len;
     profile->emit_run_capacity += runs.capacity();
     profile->emit_arena_capacity += arena_positions.capacity();
     for (const Stage5Run& run : runs) {
@@ -915,7 +916,11 @@ struct Stage5Scratch {
 
 struct FusedStage5Scratch {
     std::vector<uint32_t> order;
+    /* arena_positions is cursor-managed: sized once to logical_len+8 per
+     * hash and filled through arena_len, so appends never pay vector
+     * resize value-initialization. Elements past arena_len are stale. */
     std::vector<uint32_t> arena_positions;
+    size_t arena_len = 0;
     std::vector<uint32_t> group_positions;
     std::vector<uint32_t> merge_positions;
     std::vector<uint32_t> run_lengths;
@@ -1189,29 +1194,31 @@ uint32_t fused_run_pos(const std::vector<uint32_t>& arena_positions,
     return arena_positions[static_cast<size_t>(begin) + rel];
 }
 
-bool append_fused_order_group(std::vector<Stage5Run>* runs,
-                              std::vector<uint32_t>* arena_positions,
+bool append_fused_order_group(FusedStage5Scratch* scratch,
                               uint32_t key, const uint32_t* order,
                               uint32_t first, uint32_t count,
                               bool count1_singletons) {
-    if (!runs || !arena_positions || !order || count == 0) return false;
+    if (!scratch || !order || count == 0) return false;
     const uint32_t ordered_key = stage5_radix_order_key(key);
 
     if (count == 1 && !count1_singletons) {
-        runs->push_back(make_stage5_run(ordered_key, order[first], 1, true));
+        scratch->runs.push_back(
+            make_stage5_run(ordered_key, order[first], 1, true));
         return true;
     }
 
-    const size_t begin = arena_positions->size();
+    const size_t begin = scratch->arena_len;
     if (begin > kDescriptorArenaIndexCount ||
-        count > kDescriptorArenaIndexCount - begin) {
+        count > kDescriptorArenaIndexCount - begin ||
+        begin + count > scratch->arena_positions.size()) {
         return false;
     }
-    arena_positions->resize(begin + count);
-    std::memcpy(arena_positions->data() + begin, order + first,
+    std::memcpy(scratch->arena_positions.data() + begin, order + first,
                 static_cast<size_t>(count) * sizeof(uint32_t));
-    runs->push_back(make_stage5_run(ordered_key, static_cast<uint32_t>(begin),
-                                    count, false));
+    scratch->arena_len = begin + count;
+    scratch->runs.push_back(
+        make_stage5_run(ordered_key, static_cast<uint32_t>(begin), count,
+                        false));
     return true;
 }
 
@@ -1223,7 +1230,7 @@ bool emit_fused_literal_records(const Stage4InputView& view, uint32_t start,
     for (uint32_t rel = 0; rel < count; ++rel) {
         const uint32_t pos = start + rel;
         uint32_t one = pos;
-        if (!append_fused_order_group(&scratch->runs, &scratch->arena_positions,
+        if (!append_fused_order_group(scratch,
                                       load24_fast(view, pos, padded), &one, 0, 1,
                                       count1_singletons)) {
             return false;
@@ -1248,17 +1255,14 @@ bool emit_full_group_run_compact_fused_two(const Stage4InputView& view,
         const uint32_t key0 = load24_fast(view, order[0], padded);
         const uint32_t key1 = load24_fast(view, order[1], padded);
         if (key0 == key1) {
-            if (!append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions, key0,
+            if (!append_fused_order_group(scratch, key0,
                                           order, 0, 2, count1_singletons)) {
                 return false;
             }
         } else {
-            if (!append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions, key0,
+            if (!append_fused_order_group(scratch, key0,
                                           order, 0, 1, count1_singletons) ||
-                !append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions, key1,
+                !append_fused_order_group(scratch, key1,
                                           order, 1, 1, count1_singletons)) {
                 return false;
             }
@@ -1305,8 +1309,7 @@ bool emit_full_group_run_compact_fused_fixed(const Stage4InputView& view,
             while (group_end < GroupCount && keys[group_end] == key) {
                 ++group_end;
             }
-            if (!append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions, key,
+            if (!append_fused_order_group(scratch, key,
                                           order, group_start,
                                           group_end - group_start,
                                           count1_singletons)) {
@@ -1377,8 +1380,7 @@ bool emit_full_group_run_compact_fused_short(const Stage4InputView& view,
             while (group_end < group_count && keys[group_end] == key) {
                 ++group_end;
             }
-            if (!append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions, key,
+            if (!append_fused_order_group(scratch, key,
                                           order, group_start,
                                           group_end - group_start,
                                           count1_singletons)) {
@@ -1452,8 +1454,7 @@ bool emit_full_group_run_compact_fused(const Stage4InputView& view,
                 ++group_end;
             }
 
-            if (!append_fused_order_group(&scratch->runs,
-                                          &scratch->arena_positions,
+            if (!append_fused_order_group(scratch,
                                           key, order.data(), group_start,
                                           group_end - group_start,
                                           count1_singletons)) {
@@ -1506,12 +1507,10 @@ bool fused_try_write_literal_equal_key_group_after_key(
         positions[j] = pos;
     }
 
-    size_t write_pos = *out_pos;
-    for (size_t i = 0; i < count; ++i) {
-        write_u32_le(out + write_pos * 4u, positions[i]);
-        ++write_pos;
-    }
-    *out_pos = write_pos;
+    /* Bulk copy of native u32s == write_u32_le per element on little-endian
+     * hosts (the arena single-run branch already relies on this). */
+    std::memcpy(out + *out_pos * 4u, positions, count * sizeof(uint32_t));
+    *out_pos += count;
     return true;
 }
 
@@ -1720,9 +1719,6 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
     std::vector<Stage5Run>& runs = scratch->runs;
     std::vector<Stage5Run>& radix_tmp = scratch->radix_tmp;
     std::vector<uint32_t>& arena_positions = scratch->arena_positions;
-    if (wide_ok) {
-        arena_positions.resize(arena_positions.size() + 8);
-    }
     std::vector<uint32_t>& group_positions = scratch->group_positions;
     std::vector<uint32_t>& merge_positions = scratch->merge_positions;
     std::vector<uint32_t>& run_lengths = scratch->run_lengths;
@@ -1833,10 +1829,9 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
                                            &next_run_lengths);
             if (profile) profile->merge += stage5_prof_rdtsc() - merge0;
             const uint64_t output0 = profile ? stage5_prof_rdtsc() : 0;
-            for (uint32_t pos : group_positions) {
-                write_u32_le(out + out_pos * 4u, pos);
-                ++out_pos;
-            }
+            std::memcpy(out + out_pos * 4u, group_positions.data(),
+                        group_positions.size() * sizeof(uint32_t));
+            out_pos += group_positions.size();
             if (profile) profile->output += stage5_prof_rdtsc() - output0;
         }
         group_start = group_end;
@@ -2473,14 +2468,21 @@ bool stage_v114_sa_build_compact_fused_raw(const uint8_t* data,
         scratch = new FusedStage5Scratch;
     }
 
-    scratch->arena_positions.clear();
+    /* Arena appends total at most logical_len positions (each position lands
+     * in exactly one group per rel-level walk); +8 read slack covers the
+     * materialize step's 32-byte block copies. Size once, then track the fill
+     * with arena_len — per-group vector resizes would value-initialize every
+     * appended element before the memcpy overwrites it. */
+    if (scratch->arena_positions.size() <
+        static_cast<size_t>(logical_len) + 8) {
+        scratch->arena_positions.resize(static_cast<size_t>(logical_len) + 8);
+    }
+    scratch->arena_len = 0;
     scratch->group_positions.clear();
     scratch->merge_positions.clear();
     scratch->run_lengths.clear();
     scratch->next_run_lengths.clear();
     scratch->runs.clear();
-    /* +8 keeps the materialize step's arena tail pad from reallocating. */
-    scratch->arena_positions.reserve(static_cast<size_t>(logical_len) + 8);
     scratch->runs.reserve(logical_len);
 
     const uint32_t full_groups = logical_len >> 8;
@@ -2512,13 +2514,13 @@ bool stage_v114_sa_build_compact_fused_raw(const uint8_t* data,
     }
     if (profile) profile->emit += stage5_prof_rdtsc() - emit0;
     fused_stage5_profile_note_emit_shape(
-        profile, scratch->runs, scratch->arena_positions);
+        profile, scratch->runs, scratch->arena_positions, scratch->arena_len);
 
     const bool ok = write_fused_runs_to_sa(stage5, scratch, out, out_cap, out_len);
     if (profile) {
         profile->total += stage5_prof_rdtsc() - total0;
         profile->runs += scratch->runs.size();
-        profile->arena += scratch->arena_positions.size();
+        profile->arena += scratch->arena_len;
         ++profile->calls;
         fused_stage5_profile_maybe_flush(profile);
     }
@@ -2560,13 +2562,16 @@ bool stage_v114_hash_compact_fused_raw(const uint8_t* data,
         scratch = new FusedStage5Scratch;
     }
 
-    scratch->arena_positions.clear();
+    if (scratch->arena_positions.size() <
+        static_cast<size_t>(logical_len) + 8) {
+        scratch->arena_positions.resize(static_cast<size_t>(logical_len) + 8);
+    }
+    scratch->arena_len = 0;
     scratch->group_positions.clear();
     scratch->merge_positions.clear();
     scratch->run_lengths.clear();
     scratch->next_run_lengths.clear();
     scratch->runs.clear();
-    scratch->arena_positions.reserve(logical_len);
     scratch->runs.reserve(logical_len);
 
     const uint32_t full_groups = logical_len >> 8;
