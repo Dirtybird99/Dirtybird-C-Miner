@@ -1710,10 +1710,19 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
     if (needed > std::numeric_limits<size_t>::max() || out_cap < needed) {
         return false;
     }
+    /* Short arena runs use one unconditional 32-byte store (the run-length
+     * memcpy is branch-mispredict bound at ~3.5 positions per run); the
+     * overshoot is overwritten by the next group or lies past logical_len.
+     * Requires 28 bytes of writable slack past the logical SA, and 8 readable
+     * elements past every arena run (guaranteed by the arena tail pad). */
+    const bool wide_ok = out_cap >= needed + 32u;
 
     std::vector<Stage5Run>& runs = scratch->runs;
     std::vector<Stage5Run>& radix_tmp = scratch->radix_tmp;
     std::vector<uint32_t>& arena_positions = scratch->arena_positions;
+    if (wide_ok) {
+        arena_positions.resize(arena_positions.size() + 8);
+    }
     std::vector<uint32_t>& group_positions = scratch->group_positions;
     std::vector<uint32_t>& merge_positions = scratch->merge_positions;
     std::vector<uint32_t>& run_lengths = scratch->run_lengths;
@@ -1757,9 +1766,15 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
                     previous_single_arena = true;
                     previous_single_arena_end = run_begin + run_count;
                 }
-                std::memcpy(out + out_pos * 4u,
-                            arena_positions.data() + run_begin,
-                            static_cast<size_t>(run_count) * sizeof(uint32_t));
+                if (wide_ok && run_count <= 8u) {
+                    std::memcpy(out + out_pos * 4u,
+                                arena_positions.data() + run_begin, 32u);
+                } else {
+                    std::memcpy(out + out_pos * 4u,
+                                arena_positions.data() + run_begin,
+                                static_cast<size_t>(run_count) *
+                                    sizeof(uint32_t));
+                }
                 out_pos += run_count;
             } else {
                 if (profile) {
@@ -2464,7 +2479,8 @@ bool stage_v114_sa_build_compact_fused_raw(const uint8_t* data,
     scratch->run_lengths.clear();
     scratch->next_run_lengths.clear();
     scratch->runs.clear();
-    scratch->arena_positions.reserve(logical_len);
+    /* +8 keeps the materialize step's arena tail pad from reallocating. */
+    scratch->arena_positions.reserve(static_cast<size_t>(logical_len) + 8);
     scratch->runs.reserve(logical_len);
 
     const uint32_t full_groups = logical_len >> 8;
