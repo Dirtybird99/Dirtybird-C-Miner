@@ -526,7 +526,22 @@ int main(int argc, char **argv)
 	                bool tracker_pass = hashrate_tracker_selftest();
 	                printf("selftest hashrate tracker: %s\n", tracker_pass ? "PASS" : "FAIL");
 	                printf("selftest pow(a): %s %s\n", h.c_str(), pass ? "PASS" : "FAIL");
-	                delete w; exit(pass && tracker_pass ? 0 : 1);
+	                bool x2_pass = true;
+	                if (dluna_hash_x2_available()) {
+	                        workerData *wb = new workerData();
+	                        memset(wb, 0, sizeof(workerData));
+#if defined(USE_ASTRO_SPSA)
+	                        for (int i = 0; i < 256; i++) wb->iota8[i] = i;
+#endif
+	                        uint8_t oa[32], ob[32];
+	                        char ia[] = "a", ib[] = "a";
+	                        dluna_hash_x2((uint8_t*)ia, (uint8_t*)ib, 1,
+	                                      oa, ob, *w, *wb);
+	                        x2_pass = hexStr(oa, 32) == h && hexStr(ob, 32) == h;
+	                        printf("selftest pow(a) x2: %s\n", x2_pass ? "PASS" : "FAIL");
+	                        delete wb;
+	                }
+	                delete w; exit(pass && tracker_pass && x2_pass ? 0 : 1);
 	        }
 	        if (g_verbose) printf("Test pow(a): %s\n", h.c_str());
 	        if (pass) {

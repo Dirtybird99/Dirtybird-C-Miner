@@ -209,6 +209,7 @@ add_library(dluna_stages OBJECT
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
     target_sources(dluna_stages PRIVATE
         src/sha256_ni.cpp
+        src/sha256_x2.cpp
         src/spsa_tritonn.cpp
         src/spsa_tritonn_helpers.cpp
     )

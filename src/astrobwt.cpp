@@ -10,6 +10,9 @@
 
 #include "dluna.h"
 #include "dluna_v114.h"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include "sha256_x2.h"
+#endif
 #include "spsa.hpp"
 #include "simd_wolf.h"
 #include "fnv1a.h"
@@ -620,7 +623,35 @@ extern "C" void dbg_emit_get(uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_
 
 /* ---- dluna_hash: the complete AstroBWT v3 hash function ---- */
 
-void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
+struct DlunaHashProf {
+	uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
+};
+
+static void dluna_hash_prof_tail(const DlunaHashProf& p)
+{
+	if (!prof_enabled) return;
+	prof_init();
+	uint64_t tend = prof_rdtsc();
+	prof_ticks[0] += (p.t1 - p.t0);
+	prof_ticks[1] += (p.t2 - p.t1);
+	prof_ticks[2] += (p.t3 - p.t2);
+	prof_ticks[3] += (p.t4 - p.t3);
+	prof_ticks[4] += (p.t5 - p.t4);
+	prof_ticks[5] += (tend - p.t5);
+	prof_ticks[6] += (tend - p.t0);
+	prof_hashes++;
+	prof_flush();
+}
+
+enum { DLUNA_HASH_SA_READY = 0, DLUNA_HASH_DONE = 1 };
+
+/* Stages 1-6: prologue through the suffix array. Returns SA_READY when the
+ * caller owes the final SHA-256 over w.sa[0 .. data_len*4); DONE when output
+ * already holds the hash (SPSA padding short-circuit, or the env-gated
+ * streamed descriptor hash — reachable only when allow_stream_hash). */
+static int dluna_hash_prepare(byte* input, int inputLen, byte* output,
+                              workerData& w, bool allow_stream_hash,
+                              DlunaHashProf& prof)
 {
 	uint8_t scratch[384] = {0};
 	uint64_t t0 = prof_enabled ? prof_rdtsc() : 0;
@@ -659,15 +690,9 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 	for (int i = 0; i < 32; i++) if (w.padding[i] != 0) { padding_nonzero = true; break; }
 	if (padding_nonzero) {
 		memcpy(output, w.padding, 32);
-		if (prof_enabled) {
-			prof_init();
-			uint64_t tend = prof_rdtsc();
-			prof_ticks[0] += (t1 - t0); prof_ticks[1] += (t2 - t1);
-			prof_ticks[2] += (t3 - t2); prof_ticks[3] += (t4 - t3);
-			prof_ticks[6] += (tend - t0);
-			prof_hashes++; prof_flush();
-		}
-		return;
+		prof.t0 = t0; prof.t1 = t1; prof.t2 = t2; prof.t3 = t3;
+		prof.t4 = t4; prof.t5 = t4;
+		return DLUNA_HASH_DONE;
 	}
 #else
 	uint64_t t4 = prof_enabled ? prof_rdtsc() : 0;
@@ -719,7 +744,7 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
         bool desc_ready = false;
         bool descriptor_hash_ready = false;
         const bool can_stream_descriptor_hash =
-            sa_stream_descriptor_hash && sa_use_descriptor &&
+            allow_stream_hash && sa_stream_descriptor_hash && sa_use_descriptor &&
             !sa_verify_descriptor && !sa_materialize_for_tritonn;
         if (can_stream_descriptor_hash) {
             desc_scratch = &live_stage5_scratch();
@@ -961,20 +986,64 @@ void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
 	/* ---- END VALIDATION HARNESS ---- */
 #endif // USE_ASTRO_SPSA
 
-        if (!descriptor_hash_ready) {
-            hashSHA256((byte*)w.sa, output, w.data_len * 4);
-        }
-        if (prof_enabled) {
-            prof_init();
-            uint64_t tend = prof_rdtsc();
-            prof_ticks[0] += (t1 - t0);
-            prof_ticks[1] += (t2 - t1);
-            prof_ticks[2] += (t3 - t2);
-            prof_ticks[3] += (t4 - t3);
-            prof_ticks[4] += (t5 - t4);
-            prof_ticks[5] += (tend - t5);
-            prof_ticks[6] += (tend - t0);
-            prof_hashes++;
-            prof_flush();
-        }
+        prof.t0 = t0; prof.t1 = t1; prof.t2 = t2; prof.t3 = t3;
+        prof.t4 = t4; prof.t5 = t5;
+        return descriptor_hash_ready ? DLUNA_HASH_DONE : DLUNA_HASH_SA_READY;
+}
+
+void dluna_hash(byte* input, int inputLen, byte* output, workerData& w)
+{
+	DlunaHashProf prof;
+	if (dluna_hash_prepare(input, inputLen, output, w, true, prof) ==
+	    DLUNA_HASH_SA_READY) {
+		hashSHA256((byte*)w.sa, output, w.data_len * 4);
+	}
+	dluna_hash_prof_tail(prof);
+}
+
+bool dluna_hash_x2_available(void)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+	return dluna_sha256_x2_available();
+#else
+	return false;
+#endif
+}
+
+void dluna_hash_x2(byte* input_a, byte* input_b, int inputLen,
+                   byte* output_a, byte* output_b,
+                   workerData& wa, workerData& wb)
+{
+	/* The streamed descriptor hash consumes the SA during the build, which
+	 * leaves nothing for the batched SHA — the two are mutually exclusive,
+	 * so the x2 path always materializes. */
+	static const bool stream_requested =
+	    []{ return env_flag_enabled("DLUNA_STREAM_STAGE5_HASH"); }();
+	static std::atomic<bool> stream_warned{false};
+	if (stream_requested && !stream_warned.exchange(true)) {
+		fprintf(stderr,
+		        "DLUNA_STREAM_STAGE5_HASH is ignored on the 2-way SHA path "
+		        "(disable with DLUNA_NO_SHA_X2=1 to stream)\n");
+	}
+
+	DlunaHashProf prof_a, prof_b;
+	int ra = dluna_hash_prepare(input_a, inputLen, output_a, wa, false, prof_a);
+	int rb = dluna_hash_prepare(input_b, inputLen, output_b, wb, false, prof_b);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+	if (ra == DLUNA_HASH_SA_READY && rb == DLUNA_HASH_SA_READY &&
+	    dluna_sha256_x2_available()) {
+		dluna_sha256_x2(reinterpret_cast<const uint8_t*>(wa.sa),
+		                static_cast<size_t>(wa.data_len) * 4u, output_a,
+		                reinterpret_cast<const uint8_t*>(wb.sa),
+		                static_cast<size_t>(wb.data_len) * 4u, output_b);
+		ra = DLUNA_HASH_DONE;
+		rb = DLUNA_HASH_DONE;
+	}
+#endif
+	if (ra == DLUNA_HASH_SA_READY)
+		hashSHA256((byte*)wa.sa, output_a, wa.data_len * 4);
+	if (rb == DLUNA_HASH_SA_READY)
+		hashSHA256((byte*)wb.sa, output_b, wb.data_len * 4);
+	dluna_hash_prof_tail(prof_a);
+	dluna_hash_prof_tail(prof_b);
 }

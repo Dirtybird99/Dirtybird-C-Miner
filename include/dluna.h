@@ -223,6 +223,16 @@ bool check_hash(const uint8_t hash[32], const uint8_t target[32]);
 
 /* AstroBWT v3 hash */
 void dluna_hash(uint8_t *input, int len, uint8_t *output, workerData &w);
+
+/* Two-nonce variant: runs both workers' pipelines through the SA stage
+ * serially, then batches the two final SHA-256 passes on interleaved SHA-NI
+ * streams. Byte-identical to two dluna_hash calls. Callers must check
+ * dluna_hash_x2_available() first; where it is false, dluna_hash_x2 simply
+ * performs two sequential hashes with no batching benefit. */
+bool dluna_hash_x2_available(void);
+void dluna_hash_x2(uint8_t *input_a, uint8_t *input_b, int len,
+                   uint8_t *output_a, uint8_t *output_b,
+                   workerData &wa, workerData &wb);
 void init_lut(void);
 
 /* SHA-256 via SHA-NI linker wraps on x86 or OpenSSL's ARM dispatcher. */

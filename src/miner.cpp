@@ -10,6 +10,7 @@
 #include "cpu_topology.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 extern bool g_huge_pages_avail;
@@ -64,9 +65,33 @@ void mine_thread(int tid)
 #endif
     memset(worker->salsaInput, 0, 256);
 
+    /* Second worker for the 2-way SHA path: two nonces in flight, SA stages
+     * serial per lane, final SHA-256 batched on interleaved SHA-NI streams.
+     * Opt out with DLUNA_NO_SHA_X2=1. */
+    static const bool want_x2 = [] {
+        const char *e = getenv("DLUNA_NO_SHA_X2");
+        if (e && e[0] && strcmp(e, "0") != 0) return false;
+        return dluna_hash_x2_available();
+    }();
+    workerData *worker_b = nullptr;
+    bool huge_b = false;
+    if (want_x2) {
+        worker_b = (workerData *)alloc_pinned(sizeof(workerData), &huge_b);
+        if (worker_b) {
+            memset(worker_b, 0, sizeof(workerData));
+#if defined(USE_ASTRO_SPSA)
+            memcpy(worker_b->iota8, iota8_g, 256);
+#endif
+            memset(worker_b->salsaInput, 0, 256);
+        }
+    }
+    const bool use_x2 = want_x2 && worker_b != nullptr;
+
     uint8_t localBlob[MINIBLOCK_SIZE];
+    uint8_t localBlobB[MINIBLOCK_SIZE];
     uint8_t target[HASH_SIZE];
     uint8_t outputHash[HASH_SIZE];
+    uint8_t outputHashB[HASH_SIZE];
     uint32_t nonce = 0;
     int64_t localHashCount = 0;
 
@@ -95,6 +120,8 @@ void mine_thread(int tid)
 
         compute_target(diff, target);
         nonce = (uint32_t)tid << 24;
+        if (use_x2)
+            memcpy(localBlobB, localBlob, MINIBLOCK_SIZE);
 
         /* inner hash loop */
         for (;;) {
@@ -105,25 +132,59 @@ void mine_thread(int tid)
                 G.jobEpoch.load(std::memory_order_acquire) != epoch)
                 break;
 
-            ++nonce;
+            if (use_x2) {
+                const uint32_t na = ++nonce;
+                const uint32_t nb = ++nonce;
 
-            /* big-endian nonce at NONCE_OFFSET */
-            localBlob[NONCE_OFFSET + 0] = (uint8_t)(nonce >> 24);
-            localBlob[NONCE_OFFSET + 1] = (uint8_t)(nonce >> 16);
-            localBlob[NONCE_OFFSET + 2] = (uint8_t)(nonce >> 8);
-            localBlob[NONCE_OFFSET + 3] = (uint8_t)(nonce);
+                localBlob[NONCE_OFFSET + 0] = (uint8_t)(na >> 24);
+                localBlob[NONCE_OFFSET + 1] = (uint8_t)(na >> 16);
+                localBlob[NONCE_OFFSET + 2] = (uint8_t)(na >> 8);
+                localBlob[NONCE_OFFSET + 3] = (uint8_t)(na);
+                localBlob[THREAD_ID_OFFSET] = (uint8_t)tid;
 
-            localBlob[THREAD_ID_OFFSET] = (uint8_t)tid;
+                localBlobB[NONCE_OFFSET + 0] = (uint8_t)(nb >> 24);
+                localBlobB[NONCE_OFFSET + 1] = (uint8_t)(nb >> 16);
+                localBlobB[NONCE_OFFSET + 2] = (uint8_t)(nb >> 8);
+                localBlobB[NONCE_OFFSET + 3] = (uint8_t)(nb);
+                localBlobB[THREAD_ID_OFFSET] = (uint8_t)tid;
 
-            dluna_hash(localBlob, MINIBLOCK_SIZE, outputHash, *worker);
+                dluna_hash_x2(localBlob, localBlobB, MINIBLOCK_SIZE,
+                              outputHash, outputHashB, *worker, *worker_b);
 
-            if (check_hash(outputHash, target)) {
-                if (g_verbose)
-                    log_line("INFO", "T%d found share nonce=%08x", tid, nonce);
-                submit_share(localBlob, MINIBLOCK_SIZE, jobId, epoch);
+                if (check_hash(outputHash, target)) {
+                    if (g_verbose)
+                        log_line("INFO", "T%d found share nonce=%08x", tid, na);
+                    submit_share(localBlob, MINIBLOCK_SIZE, jobId, epoch);
+                }
+                if (check_hash(outputHashB, target)) {
+                    if (g_verbose)
+                        log_line("INFO", "T%d found share nonce=%08x", tid, nb);
+                    submit_share(localBlobB, MINIBLOCK_SIZE, jobId, epoch);
+                }
+
+                localHashCount += 2;
+            } else {
+                ++nonce;
+
+                /* big-endian nonce at NONCE_OFFSET */
+                localBlob[NONCE_OFFSET + 0] = (uint8_t)(nonce >> 24);
+                localBlob[NONCE_OFFSET + 1] = (uint8_t)(nonce >> 16);
+                localBlob[NONCE_OFFSET + 2] = (uint8_t)(nonce >> 8);
+                localBlob[NONCE_OFFSET + 3] = (uint8_t)(nonce);
+
+                localBlob[THREAD_ID_OFFSET] = (uint8_t)tid;
+
+                dluna_hash(localBlob, MINIBLOCK_SIZE, outputHash, *worker);
+
+                if (check_hash(outputHash, target)) {
+                    if (g_verbose)
+                        log_line("INFO", "T%d found share nonce=%08x", tid, nonce);
+                    submit_share(localBlob, MINIBLOCK_SIZE, jobId, epoch);
+                }
+
+                ++localHashCount;
             }
 
-            ++localHashCount;
             if ((localHashCount & 63) == 0) {
                 G.totalHashes.fetch_add(64, std::memory_order_relaxed);
                 localHashCount = 0;
@@ -136,5 +197,7 @@ done:
     if (localHashCount > 0)
         G.totalHashes.fetch_add(localHashCount, std::memory_order_relaxed);
 
+    if (worker_b)
+        free_pinned(worker_b, sizeof(workerData), huge_b);
     free_pinned(worker, sizeof(workerData), huge);
 }

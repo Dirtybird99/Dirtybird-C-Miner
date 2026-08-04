@@ -64,6 +64,16 @@ target_include_directories(test_runtime_tune PRIVATE
 target_link_libraries(test_runtime_tune PRIVATE dluna_runtime)
 dluna_copy_runtime_dlls(test_runtime_tune)
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    add_executable(test_sha256_x2 test_sha256_x2.cpp replay_globals.cpp)
+    target_include_directories(test_sha256_x2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_sha256_x2 PRIVATE dluna_stages)
+    dluna_copy_runtime_dlls(test_sha256_x2)
+endif()
+
 add_executable(test_cpu_topology test_cpu_topology.cpp)
 target_include_directories(test_cpu_topology PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -117,6 +127,23 @@ add_test(NAME stage3_tail COMMAND test_stage3_tail)
 add_test(NAME stage5_descriptor COMMAND test_stage5_descriptor)
 add_test(NAME runtime_tune_policy COMMAND test_runtime_tune)
 add_test(NAME cpu_topology_policy COMMAND test_cpu_topology)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[0-9]86)$")
+    # Self-skips on CPUs without SHA-NI.
+    add_test(NAME sha256_x2 COMMAND test_sha256_x2)
+    # Encoding gate: the two-lane compress must stay legacy-SSE. Needs
+    # llvm-objdump and python; skipped when either is absent.
+    find_program(DLUNA_LLVM_OBJDUMP llvm-objdump)
+    find_program(DLUNA_PYTHON3 NAMES python3 python)
+    if(DLUNA_LLVM_OBJDUMP AND DLUNA_PYTHON3)
+        add_test(NAME sha256_x2_novex
+            COMMAND ${DLUNA_PYTHON3}
+                ${CMAKE_SOURCE_DIR}/scripts/check_sha_x2_novex.py
+                $<TARGET_FILE:test_sha256_x2> ${DLUNA_LLVM_OBJDUMP}
+        )
+    else()
+        message(STATUS "sha256_x2_novex: llvm-objdump/python absent, test skipped")
+    endif()
+endif()
 add_test(NAME statusline COMMAND test_statusline)
 add_test(NAME statusline_env_cols COMMAND test_statusline)
 set_tests_properties(statusline_env_cols PROPERTIES
