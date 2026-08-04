@@ -354,7 +354,7 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends \
               clang lld llvm cmake ninja-build libssl-dev patchelf \
-              binutils ca-certificates git
+              libclang-rt-dev binutils ca-certificates git
             export CMAKE_ARGS="-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DDIRTYBIRD_VERSION=${{ needs.verify.outputs.version }}"
             export TRAIN_SECS=40 TRAIN_THREADS=4
             bash scripts/build-pgo.sh
