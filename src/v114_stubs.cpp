@@ -221,13 +221,22 @@ uint32_t load24_padded(const Stage4InputView& view, uint32_t pos) {
 }
 
 uint32_t load24_unchecked(const uint8_t* p) {
+#if !defined(__BYTE_ORDER__) || (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    /* One unaligned load instead of three byte loads + shifts. Reads p[3],
+     * so callers must guarantee 3 readable bytes past the last position —
+     * has_load24_padding enforces data_len >= logical_len + 3. */
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v & 0xffffffu;
+#else
     return static_cast<uint32_t>(p[0]) |
            (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16);
+#endif
 }
 
 bool has_load24_padding(const Stage4InputView& view) {
-    return view.data_len >= view.logical_len + 2u;
+    return view.data_len >= view.logical_len + 3u;
 }
 
 uint32_t load24_fast(const Stage4InputView& view, uint32_t pos, bool padded) {
