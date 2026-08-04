@@ -878,16 +878,15 @@ uint32_t stage5_run_count(const Stage5Run& run) {
 
 void fused_stage5_profile_note_emit_shape(
     FusedStage5Profile* profile,
-    const std::vector<Stage5Run>& runs, size_t runs_len,
+    const std::vector<Stage5Run>& runs,
     const std::vector<uint32_t>& arena_positions,
     size_t arena_len) {
     if (!profile) return;
-    profile->emit_appends += runs_len;
+    profile->emit_appends += runs.size();
     profile->emit_arena_positions += arena_len;
     profile->emit_run_capacity += runs.capacity();
     profile->emit_arena_capacity += arena_positions.capacity();
-    for (size_t i = 0; i < runs_len; ++i) {
-        const Stage5Run& run = runs[i];
+    for (const Stage5Run& run : runs) {
         const uint32_t count = stage5_run_count(run);
         profile->emit_positions += count;
         if (stage5_run_is_literal(run)) {
@@ -917,10 +916,9 @@ struct Stage5Scratch {
 
 struct FusedStage5Scratch {
     std::vector<uint32_t> order;
-    /* arena_positions and runs are cursor-managed: sized once per hash and
-     * filled through arena_len / runs_len, so appends never pay vector
-     * resize value-initialization or per-push capacity checks. Elements
-     * past the cursors are stale. */
+    /* arena_positions is cursor-managed: sized once to logical_len+8 per
+     * hash and filled through arena_len, so appends never pay vector
+     * resize value-initialization. Elements past arena_len are stale. */
     std::vector<uint32_t> arena_positions;
     size_t arena_len = 0;
     std::vector<uint32_t> group_positions;
@@ -928,7 +926,6 @@ struct FusedStage5Scratch {
     std::vector<uint32_t> run_lengths;
     std::vector<uint32_t> next_run_lengths;
     std::vector<Stage5Run> runs;
-    size_t runs_len = 0;
     std::vector<Stage5Run> radix_tmp;
 };
 
@@ -971,19 +968,19 @@ void radix_sort_runs_by_key(std::vector<Stage5Run>* runs,
 }
 
 void radix_sort_runs_by_stored_key(std::vector<Stage5Run>* runs,
-                                   std::vector<Stage5Run>* tmp, size_t n) {
+                                   std::vector<Stage5Run>* tmp) {
+    const size_t n = runs->size();
     if (n <= 1) return;
-    if (tmp->size() < n) tmp->resize(n);
+    tmp->resize(n);
 
     uint32_t counts0[256] = {};
     uint32_t counts1[256] = {};
     uint32_t counts2[256] = {};
 
-    const Stage5Run* src = runs->data();
-    for (size_t i = 0; i < n; ++i) {
-        ++counts0[src[i].key & 0xffu];
-        ++counts1[(src[i].key >> 8) & 0xffu];
-        ++counts2[(src[i].key >> 16) & 0xffu];
+    for (const Stage5Run& run : *runs) {
+        ++counts0[run.key & 0xffu];
+        ++counts1[(run.key >> 8) & 0xffu];
+        ++counts2[(run.key >> 16) & 0xffu];
     }
 
     // Pass 0
@@ -993,9 +990,8 @@ void radix_sort_runs_by_stored_key(std::vector<Stage5Run>* runs,
         counts0[i] = sum0;
         sum0 += c;
     }
-    Stage5Run* d0 = tmp->data();
-    for (size_t i = 0; i < n; ++i) {
-        d0[counts0[src[i].key & 0xffu]++] = src[i];
+    for (const Stage5Run& run : *runs) {
+        (*tmp)[counts0[run.key & 0xffu]++] = run;
     }
 
     // Pass 1
@@ -1005,9 +1001,8 @@ void radix_sort_runs_by_stored_key(std::vector<Stage5Run>* runs,
         counts1[i] = sum1;
         sum1 += c;
     }
-    Stage5Run* d1 = runs->data();
-    for (size_t i = 0; i < n; ++i) {
-        d1[counts1[(d0[i].key >> 8) & 0xffu]++] = d0[i];
+    for (const Stage5Run& run : *tmp) {
+        (*runs)[counts1[(run.key >> 8) & 0xffu]++] = run;
     }
 
     // Pass 2
@@ -1017,8 +1012,8 @@ void radix_sort_runs_by_stored_key(std::vector<Stage5Run>* runs,
         counts2[i] = sum2;
         sum2 += c;
     }
-    for (size_t i = 0; i < n; ++i) {
-        d0[counts2[(d1[i].key >> 16) & 0xffu]++] = d1[i];
+    for (const Stage5Run& run : *runs) {
+        (*tmp)[counts2[(run.key >> 16) & 0xffu]++] = run;
     }
     runs->swap(*tmp);
 }
@@ -1204,12 +1199,11 @@ bool append_fused_order_group(FusedStage5Scratch* scratch,
                               uint32_t first, uint32_t count,
                               bool count1_singletons) {
     if (!scratch || !order || count == 0) return false;
-    if (scratch->runs_len >= scratch->runs.size()) return false;
     const uint32_t ordered_key = stage5_radix_order_key(key);
 
     if (count == 1 && !count1_singletons) {
-        scratch->runs[scratch->runs_len++] =
-            make_stage5_run(ordered_key, order[first], 1, true);
+        scratch->runs.push_back(
+            make_stage5_run(ordered_key, order[first], 1, true));
         return true;
     }
 
@@ -1222,9 +1216,9 @@ bool append_fused_order_group(FusedStage5Scratch* scratch,
     std::memcpy(scratch->arena_positions.data() + begin, order + first,
                 static_cast<size_t>(count) * sizeof(uint32_t));
     scratch->arena_len = begin + count;
-    scratch->runs[scratch->runs_len++] =
+    scratch->runs.push_back(
         make_stage5_run(ordered_key, static_cast<uint32_t>(begin), count,
-                        false);
+                        false));
     return true;
 }
 
@@ -1736,17 +1730,16 @@ bool write_fused_runs_to_sa(const Stage5InputView& view,
     FusedStage5Profile* profile =
         fused_stage5_profile_enabled() ? &fused_stage5_profile() : nullptr;
     const uint64_t sort0 = profile ? stage5_prof_rdtsc() : 0;
-    radix_sort_runs_by_stored_key(&runs, &radix_tmp, scratch->runs_len);
+    radix_sort_runs_by_stored_key(&runs, &radix_tmp);
     if (profile) profile->sort += stage5_prof_rdtsc() - sort0;
 
-    const size_t runs_len = scratch->runs_len;
     size_t group_start = 0;
     size_t out_pos = 0;
     bool previous_single_arena = false;
     uint32_t previous_single_arena_end = 0;
-    while (group_start < runs_len) {
+    while (group_start < runs.size()) {
         size_t group_end = group_start + 1;
-        while (group_end < runs_len &&
+        while (group_end < runs.size() &&
                runs[group_start].key == runs[group_end].key) {
             ++group_end;
         }
@@ -1869,16 +1862,15 @@ bool write_fused_runs_to_hash(const Stage5InputView& view,
     std::vector<uint32_t>& run_lengths = scratch->run_lengths;
     std::vector<uint32_t>& next_run_lengths = scratch->next_run_lengths;
 
-    radix_sort_runs_by_stored_key(&runs, &radix_tmp, scratch->runs_len);
+    radix_sort_runs_by_stored_key(&runs, &radix_tmp);
 
     FusedHashSink sink;
     fused_hash_sink_init(&sink);
 
-    const size_t runs_len = scratch->runs_len;
     size_t group_start = 0;
-    while (group_start < runs_len) {
+    while (group_start < runs.size()) {
         size_t group_end = group_start + 1;
-        while (group_end < runs_len &&
+        while (group_end < runs.size() &&
                runs[group_start].key == runs[group_end].key) {
             ++group_end;
         }
@@ -2493,10 +2485,8 @@ bool stage_v114_sa_build_compact_fused_raw(const uint8_t* data,
     scratch->merge_positions.clear();
     scratch->run_lengths.clear();
     scratch->next_run_lengths.clear();
-    if (scratch->runs.size() < static_cast<size_t>(logical_len)) {
-        scratch->runs.resize(logical_len);
-    }
-    scratch->runs_len = 0;
+    scratch->runs.clear();
+    scratch->runs.reserve(logical_len);
 
     const uint32_t full_groups = logical_len >> 8;
     uint32_t run_start = 0;
@@ -2527,13 +2517,12 @@ bool stage_v114_sa_build_compact_fused_raw(const uint8_t* data,
     }
     if (profile) profile->emit += stage5_prof_rdtsc() - emit0;
     fused_stage5_profile_note_emit_shape(
-        profile, scratch->runs, scratch->runs_len, scratch->arena_positions,
-        scratch->arena_len);
+        profile, scratch->runs, scratch->arena_positions, scratch->arena_len);
 
     const bool ok = write_fused_runs_to_sa(stage5, scratch, out, out_cap, out_len);
     if (profile) {
         profile->total += stage5_prof_rdtsc() - total0;
-        profile->runs += scratch->runs_len;
+        profile->runs += scratch->runs.size();
         profile->arena += scratch->arena_len;
         ++profile->calls;
         fused_stage5_profile_maybe_flush(profile);
@@ -2585,10 +2574,8 @@ bool stage_v114_hash_compact_fused_raw(const uint8_t* data,
     scratch->merge_positions.clear();
     scratch->run_lengths.clear();
     scratch->next_run_lengths.clear();
-    if (scratch->runs.size() < static_cast<size_t>(logical_len)) {
-        scratch->runs.resize(logical_len);
-    }
-    scratch->runs_len = 0;
+    scratch->runs.clear();
+    scratch->runs.reserve(logical_len);
 
     const uint32_t full_groups = logical_len >> 8;
     uint32_t run_start = 0;
