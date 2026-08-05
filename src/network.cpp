@@ -131,7 +131,7 @@ static void set_tcp_nodelay(sock_t s)
  * rigs over a remote pool).
  *
  * Windows: keepalive exhaustion surfaces as WSAETIMEDOUT (10060) -- the SAME code
- * ssl_read_is_timeout deliberately KEEPs (dual-purpose with the 50ms poll) -- so
+ * ssl_read_is_timeout deliberately KEEPs (dual-purpose with the recv poll) -- so
  * it does NOT flip recv_all to dead. Here keepalive is only OS-side resource
  * release / NAT refresh; a silently-dead link on Windows is a documented gap (see
  * the deferred liveness-watchdog follow-up). We do NOT special-case 10060 -- that
@@ -162,6 +162,11 @@ static void set_keepalive(sock_t s)
 #endif
 }
 
+/* Mining-loop SO_RCVTIMEO. Also the worst-case delay between a worker finding a
+ * share and the drain sending it, since submit_share() runs after each recv
+ * poll returns. */
+static const int RECV_TIMEOUT_MS = 10;
+
 static void set_timeout_ms(sock_t s, int ms)
 {
 #ifdef _WIN32
@@ -177,9 +182,10 @@ static void set_timeout_ms(sock_t s, int ms)
 
 /* Send-side timeout. Set ONCE per connection (generous) and never toggled --
  * keeping it out of set_timeout_ms() is deliberate: that helper drops RCVTIMEO
- * to 50ms for the mining loop, and a 50ms SO_SNDTIMEO would make submit_share()
- * /pong sends spuriously fail under transient TCP backpressure and force a
- * needless reconnect. SNDTIMEO only needs to bound a wedged handshake/send. */
+ * to RECV_TIMEOUT_MS for the mining loop, and an SO_SNDTIMEO that short would
+ * make submit_share()/pong sends spuriously fail under transient TCP
+ * backpressure and force a needless reconnect. SNDTIMEO only needs to bound a
+ * wedged handshake/send. */
 static void set_snd_timeout_ms(sock_t s, int ms)
 {
 #ifdef _WIN32
@@ -247,7 +253,7 @@ static int recv_all(void *buf, int len, bool first)
 	int stall_polls = 0;
 	/* Bound a stalled mid-frame read: a peer that sends a frame header then
 	 * goes silent (or vanishes with no RST/FIN) must not wedge the thread. */
-	const int MAX_STALL_POLLS = 200; /* 200 * 50ms SO_RCVTIMEO = 10s */
+	const int MAX_STALL_POLLS = 200; /* 200 * RECV_TIMEOUT_MS = 2s */
 	while (got < len) {
 		int n = SSL_read(g_ssl, p + got, len - got);
 		if (n > 0) { got += n; stall_polls = 0; continue; }
@@ -262,7 +268,7 @@ static int recv_all(void *buf, int len, bool first)
 				return -1;          /* don't block shutdown mid-frame */
 			if (++stall_polls >= MAX_STALL_POLLS) {
 				log_line("WARN", "stalled mid-frame %d ms — reconnecting",
-				         MAX_STALL_POLLS * 50);
+				         MAX_STALL_POLLS * RECV_TIMEOUT_MS);
 				return -1;          /* header arrived, body never did */
 			}
 			continue;                   /* mid-frame: wait for the rest */
@@ -374,7 +380,7 @@ static bool ws_connect(void)
 	 * without this SSL_connect() and the upgrade SSL_read loop would wait
 	 * forever on a peer that finishes TCP but stalls during TLS or never sends
 	 * the response terminator. 10s is generous for a real handshake over a
-	 * high-RTT link yet bounds a wedge. This RCVTIMEO is replaced by the 50ms
+	 * high-RTT link yet bounds a wedge. This RCVTIMEO is replaced by the short
 	 * mining-loop timeout (set_timeout_ms below) once the upgrade succeeds;
 	 * SNDTIMEO is set once and kept for the connection's whole life. */
 	set_timeout_ms(g_sock, CONNECT_TIMEOUT_MS);
@@ -441,11 +447,7 @@ static bool ws_connect(void)
 		return false;
 	}
 
-	/* 10 ms, not 50: the submit drain runs after each recv poll returns, so
-	 * this timeout is the worst-case delay between a worker finding a share and
-	 * it going out on the wire. Shares are rare, so the extra idle wakeups cost
-	 * nothing measurable. */
-	set_timeout_ms(g_sock, 10);
+	set_timeout_ms(g_sock, RECV_TIMEOUT_MS);
 
 	/* Discard anything staged while we were down, immediately before this
 	 * session can send. cleanup() already cleared the queue, but that runs
@@ -754,7 +756,7 @@ void network_thread(void)
 		auto session_start = std::chrono::steady_clock::now();
 
 		/* Main loop: interleave recv and submit.
-		 * SO_RCVTIMEO is 50ms so we don't block long. */
+		 * SO_RCVTIMEO is RECV_TIMEOUT_MS so we don't block long. */
 		while (!G.quit.load()) {
 			/* Try to read a message */
 			std::string msg;

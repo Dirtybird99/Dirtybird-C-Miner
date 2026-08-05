@@ -50,6 +50,13 @@ dirtybird-miner-cpu [-d <host:port>] [-w <wallet>] [-t <threads>] [-p normal|max
 On CPUs with SHA-NI each worker mines two nonces at a time and finishes them
 on interleaved SHA-256 streams; set `DLUNA_NO_SHA_X2=1` to disable.
 
+Workers check for a new job every nonce, so work the daemon has replaced is
+abandoned within one hash. `DLUNA_JOB_POLL=<n>` loosens that to every `n`
+nonces (rounded up to a power of two) for comparison; `0` and `1` both mean
+every nonce. `DLUNA_COUNT_STALE=1` adds a `[stale]` line under `-V` reporting
+what share of hashes went to already-replaced jobs. A `Submission:` funnel
+line is printed at shutdown.
+
 ## Correctness
 
 At startup the miner computes `pow("a")` and verifies it equals

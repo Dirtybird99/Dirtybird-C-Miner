@@ -251,9 +251,10 @@ static void reporter_thread()
 		}
 
 		/* Hashes spent on jobs the network had already replaced. Counted only
-		 * under DLUNA_COUNT_STALE=1; reported live so the figure survives a
-		 * hard kill. */
-		{
+		 * under DLUNA_COUNT_STALE=1, and printed only under -V: like [funnel]
+		 * above, this is a multi-line diagnostic and would otherwise scroll the
+		 * in-place status line. */
+		if (g_verbose) {
 			long long sh = G.staleHashesObserved.load(std::memory_order_relaxed);
 			if (sh > 0) {
 				long long th = G.totalHashes.load(std::memory_order_relaxed);

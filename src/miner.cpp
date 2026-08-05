@@ -232,6 +232,11 @@ void mine_thread(int tid)
             if ((localHashCount & 63) == 0) {
                 G.totalHashes.fetch_add(64, std::memory_order_relaxed);
                 localHashCount = 0;
+                if (localStale > 0) {
+                    G.staleHashesObserved.fetch_add(localStale,
+                                                    std::memory_order_relaxed);
+                    localStale = 0;
+                }
             }
         }
     }
